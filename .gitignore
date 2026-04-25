@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtualenv / uv
+.venv/
+.uv/
+
+# Build artefacts
+build/
+dist/
+*.whl
+
+# claude-bus runtime
+claude-bus.db
+claude-bus.db-journal
+claude-bus.db-wal
+claude-bus.db-shm
+*.signal
+.claude-bus/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# Local agent / tooling state
+.claude/
+notes/
+
+# OS
+.DS_Store
+Thumbs.db
