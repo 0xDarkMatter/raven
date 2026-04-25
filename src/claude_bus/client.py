@@ -100,24 +100,61 @@ def _format_address(role: str, session_id: str) -> str:
     return f"{role}:{session_id}"
 
 
-def _to_public(internal: _core.Message, conn: sqlite3.Connection) -> Message:
+def _resolve_aliases_bulk(
+    conn: sqlite3.Connection, aliases: set[str]
+) -> dict[str, tuple[str, str]]:
+    """Resolve many aliases in one SQL round-trip.
+
+    Returns ``{alias: (role, session_id)}``. Aliases not found in the
+    table are simply absent from the result (callers fall back to
+    treating the raw alias as the address).
+    """
+    if not aliases:
+        return {}
+    placeholders = ",".join("?" for _ in aliases)
+    rows = conn.execute(
+        f"SELECT alias, role, session_id FROM aliases WHERE alias IN ({placeholders})",
+        tuple(aliases),
+    ).fetchall()
+    return {row["alias"]: (row["role"], row["session_id"]) for row in rows}
+
+
+def _to_public(
+    internal: _core.Message,
+    conn: sqlite3.Connection,
+    *,
+    alias_map: dict[str, tuple[str, str]] | None = None,
+) -> Message:
     """Convert internal Raven Message → public Message.
 
-    Looks up the sender + recipient roles by their aliases so the
-    public message can carry split (role, session_id) pairs as well as
-    the canonical "<role>:<session>" form.
+    Looks up the sender + recipient roles by their aliases. Pass
+    ``alias_map`` (from :func:`_resolve_aliases_bulk`) to skip the
+    per-message SQL round-trips when converting many messages at once.
     """
-    sender_alias = alias_mod.resolve(conn, internal.sender)
-    recipient_alias = alias_mod.resolve(conn, internal.recipient)
+    if alias_map is not None:
+        sender_pair = alias_map.get(internal.sender)
+        recipient_pair = alias_map.get(internal.recipient)
+    else:
+        sender_alias = alias_mod.resolve(conn, internal.sender)
+        recipient_alias = alias_mod.resolve(conn, internal.recipient)
+        sender_pair = (
+            (sender_alias.role, sender_alias.session_id)
+            if sender_alias is not None
+            else None
+        )
+        recipient_pair = (
+            (recipient_alias.role, recipient_alias.session_id)
+            if recipient_alias is not None
+            else None
+        )
 
-    if sender_alias is not None:
-        sender_str = _format_address(sender_alias.role, sender_alias.session_id)
+    if sender_pair is not None:
+        sender_str = _format_address(*sender_pair)
     else:
         sender_str = internal.sender
 
-    if recipient_alias is not None:
-        recipient_role = recipient_alias.role
-        recipient_session = recipient_alias.session_id
+    if recipient_pair is not None:
+        recipient_role, recipient_session = recipient_pair
         recipient_str = _format_address(recipient_role, recipient_session)
     else:
         recipient_role = ""
@@ -276,7 +313,14 @@ class BusClient:
                 limit=max,
                 mark_delivered=False,
             )
-            return [_to_public(m, conn) for m in internals]
+            # Batch the alias lookups: one SELECT covers every distinct
+            # sender + recipient across the inbox (typically a small set).
+            wanted: set[str] = set()
+            for m in internals:
+                wanted.add(m.sender)
+                wanted.add(m.recipient)
+            alias_map = _resolve_aliases_bulk(conn, wanted)
+            return [_to_public(m, conn, alias_map=alias_map) for m in internals]
 
     def read(self, message_id: int) -> Message:
         """Return a single message by id without changing its status."""

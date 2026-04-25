@@ -86,6 +86,43 @@ def test_session_isolation(db_path: Path) -> None:
     assert b2.inbox() == []
 
 
+def test_inbox_batches_alias_lookups(db_path: Path) -> None:
+    """A 20-message inbox should issue at most one alias SELECT, not 40."""
+    import sqlite3
+
+    a = BusClient(session_id="s", role="alice", db_path=db_path)
+    b = BusClient(session_id="s", role="bob", db_path=db_path)
+    for i in range(20):
+        a.send(to=b.address, type="ping", body={"i": i})
+
+    # Trace SQL executed against a fresh connection to the same DB.
+    # We can't trace the BusClient's internal connection directly because
+    # set_trace_callback is per-connection — but we can replicate the
+    # exact inbox path on a traced connection by calling list_unread +
+    # the batched resolve helper used by `inbox`.
+    from claude_bus import _core
+    from claude_bus.client import _resolve_aliases_bulk, _to_public
+
+    sqls: list[str] = []
+    conn = sqlite3.connect(db_path, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    conn.set_trace_callback(sqls.append)
+
+    internals = _core.list_unread(conn, b.alias, limit=100, mark_delivered=False)
+    wanted: set[str] = {m.sender for m in internals} | {m.recipient for m in internals}
+    alias_map = _resolve_aliases_bulk(conn, wanted)
+    msgs = [_to_public(m, conn, alias_map=alias_map) for m in internals]
+    conn.close()
+
+    assert len(msgs) == 20
+    alias_resolves = [s for s in sqls if "FROM aliases WHERE alias IN" in s
+                                   or ("FROM aliases" in s and "WHERE alias = ?" in s)]
+    assert len(alias_resolves) <= 1, (
+        f"expected ≤1 alias-resolution query for a 20-message inbox, "
+        f"got {len(alias_resolves)}: {alias_resolves}"
+    )
+
+
 def test_alias_register_is_process_cached(db_path: Path, monkeypatch) -> None:
     """Repeated BusClient() with same triple skips the SQLite round-trip."""
     from claude_bus import aliases as alias_mod
