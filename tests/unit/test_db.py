@@ -60,6 +60,55 @@ def test_connection_uses_wal(tmp_path: Path) -> None:
         assert mode.lower() == "wal"
 
 
+def test_teardown_session_deletes_session_rows(tmp_path: Path) -> None:
+    """teardown_session removes only the messages + aliases tagged with
+    ``session_id``, leaves other sessions and the bus_meta row intact."""
+    from claude_bus import _core, aliases as alias_mod
+    from claude_bus.db import connection, teardown_session
+
+    db = tmp_path / "claude-bus.db"
+    init_db(db)
+    with connection(db) as conn:
+        a = alias_mod.register(conn, "alice", "doomed")
+        b = alias_mod.register(conn, "bob", "doomed")
+        # Sender + recipient both register so cross-session alias persists.
+        alias_mod.register(conn, "alice", "kept")
+        alias_mod.register(conn, "bob", "kept")
+        _core.send(conn, sender=a, recipient=b, type="x", body={},
+                   validate=False)
+        # In session "kept" — should survive.
+        kept_a = alias_mod.register(conn, "alice", "kept")
+        kept_b = alias_mod.register(conn, "bob", "kept")
+        _core.send(conn, sender=kept_a, recipient=kept_b, type="x", body={},
+                   validate=False)
+
+        removed = teardown_session(conn, "doomed")
+        assert removed >= 3  # 1 message + 2 aliases at minimum
+
+        msg_count = conn.execute(
+            "SELECT count(*) FROM messages WHERE session_id='doomed'"
+        ).fetchone()[0]
+        assert msg_count == 0
+        kept_msgs = conn.execute(
+            "SELECT count(*) FROM messages WHERE session_id='kept'"
+        ).fetchone()[0]
+        assert kept_msgs == 1
+        meta_row = conn.execute(
+            "SELECT value FROM bus_meta WHERE key='schema_version'"
+        ).fetchone()
+        assert meta_row is not None  # schema_version untouched
+
+
+def test_teardown_empty_session_returns_zero(tmp_path: Path) -> None:
+    """Tearing down a session with no rows is a safe no-op."""
+    from claude_bus.db import connection, teardown_session
+
+    db = tmp_path / "claude-bus.db"
+    init_db(db)
+    with connection(db) as conn:
+        assert teardown_session(conn, "never-existed") == 0
+
+
 def test_connection_rolls_back_on_exception(tmp_path: Path) -> None:
     p = tmp_path / "claude-bus.db"
     init_db(p)
