@@ -86,6 +86,27 @@ def test_session_isolation(db_path: Path) -> None:
     assert b2.inbox() == []
 
 
+def test_alias_register_is_process_cached(db_path: Path, monkeypatch) -> None:
+    """Repeated BusClient() with same triple skips the SQLite round-trip."""
+    from claude_bus import aliases as alias_mod
+    from claude_bus.client import _reset_alias_register_cache
+
+    _reset_alias_register_cache()
+    calls: list[int] = []
+    real = alias_mod.register
+
+    def counting(conn, role, session_id):
+        calls.append(1)
+        return real(conn, role, session_id)
+
+    monkeypatch.setattr(alias_mod, "register", counting)
+
+    BusClient(session_id="s", role="alice", db_path=db_path)
+    BusClient(session_id="s", role="alice", db_path=db_path)
+    BusClient(session_id="s", role="alice", db_path=db_path)
+    assert sum(calls) == 1, f"alias_mod.register ran {sum(calls)} times, expected 1"
+
+
 def test_busclient_rejects_empty_session(db_path: Path) -> None:
     with pytest.raises(ValueError, match="session_id"):
         BusClient(session_id="", role="alice", db_path=db_path)

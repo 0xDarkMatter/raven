@@ -41,6 +41,16 @@ _PUBLIC_STATUS = {
     "expired": "read",
 }
 
+# Per-process memo of (db_path, role, session_id) tuples whose alias
+# row has already been INSERT'd. The DB-level INSERT OR IGNORE makes
+# repeat registration safe; this just spares the round-trip.
+_alias_register_cache: set[tuple[Path | None, str, str]] = set()
+
+
+def _reset_alias_register_cache() -> None:
+    """Test helper — drop the per-process register cache."""
+    _alias_register_cache.clear()
+
 
 class Message(BaseModel):
     """Public message shape returned by reads.
@@ -157,11 +167,19 @@ class BusClient:
         self.session_id = session_id
         self.role = role
         self.db_path = Path(db_path) if db_path is not None else None
-        # Ensure the schema exists. Idempotent.
+        # Ensure the schema exists. Idempotent (and process-cached).
         init_db(self.db_path)
         # Register our own identity so we can be addressed as a recipient.
-        with connection(self.db_path) as conn:
-            self._alias = alias_mod.register(conn, role, session_id)
+        # Skip the SQLite round-trip if we already registered this triple
+        # in the current process — the alias is deterministic, so the
+        # row is guaranteed present.
+        cache_key = (self.db_path, role, session_id)
+        if cache_key in _alias_register_cache:
+            self._alias = alias_mod.compute_alias(role, session_id)
+        else:
+            with connection(self.db_path) as conn:
+                self._alias = alias_mod.register(conn, role, session_id)
+            _alias_register_cache.add(cache_key)
 
     # ----- properties -------------------------------------------------
 
@@ -195,10 +213,17 @@ class BusClient:
         with connection(self.db_path) as conn:
             # Auto-register the recipient identity. claude-bus addresses
             # are deterministic given (role, session), so a producer can
-            # name a recipient that hasn't yet booted.
-            recipient_alias = alias_mod.register(
-                conn, recipient_role, recipient_session
-            )
+            # name a recipient that hasn't yet booted. Process-cached.
+            cache_key = (self.db_path, recipient_role, recipient_session)
+            if cache_key in _alias_register_cache:
+                recipient_alias = alias_mod.compute_alias(
+                    recipient_role, recipient_session
+                )
+            else:
+                recipient_alias = alias_mod.register(
+                    conn, recipient_role, recipient_session
+                )
+                _alias_register_cache.add(cache_key)
             result = _core.send(
                 conn,
                 sender=self._alias,
