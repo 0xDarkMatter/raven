@@ -4,6 +4,44 @@ All notable changes to **claude-bus** are recorded here.
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] — 2026-04-25
+
+Edge-case + QOL polish following the v0.1.0 ship. No public-API breakage.
+
+### Fixed
+
+- `claude-bus read` / `ack` and `GET /message/{id}` no longer add a
+  spurious `__cli__` / `__http__` / `reader` row to the `aliases`
+  table on every invocation.
+- `GET /inbox` now returns 400 on `role=a:` (empty session),
+  `role=:b` (empty role), and `max<1` — previously these produced a
+  silent empty array, masking caller bugs.
+- `BusClient(session_id="", role="alice")` and
+  `BusClient(session_id="s", role="bad:role")` now fail fast with a
+  clear `ValueError` instead of registering a useless alias.
+
+### Changed
+
+- "Unregistered message type" log demoted from WARNING to DEBUG.
+  Permissive mode is the *default* — it shouldn't nag on every send.
+  Strict-mode rejections still surface loudly via
+  `SchemaValidationError`.
+- `init_db()` is now cached per-process. Long-running subscribers and
+  bulk CLI usage no longer re-execute the migration script on every
+  `BusClient()` instantiation. Pass `force=True` to bypass.
+- `cli_main()` renders `ClaudeBusError`, missing-message, missing-file,
+  and permission-denied exceptions as one-line `error: ...` messages
+  with proper exit codes — no Python tracebacks for users.
+
+### Added
+
+- `claude-bus version` subcommand (mirrors `--version`).
+- Short flags: `inbox -r/--role -m/--max -j/--json`,
+  `send -t/--type`, `read -j/--json`.
+- `doctor` checks the bundled `0001_initial.sql` migration is present
+  on disk, catching broken installs early.
+- `_core.read_by_id()` — identity-free message fetch primitive.
+
 ## [0.1.0] — 2026-04-25
 
 The hackathon ship target — minimum viable bus that tells the
@@ -54,4 +92,5 @@ know what's intentionally deferred.
 - Extended docs: `SCHEMA_REGISTRATION.md`, `HTTP_BRIDGE.md`, `DEPLOYMENT.md`
 - Two more example projects (two-session coordination, HTTP bridge consumer)
 
+[0.1.1]: https://github.com/0xDarkMatter/claude-bus/releases/tag/v0.1.1
 [0.1.0]: https://github.com/0xDarkMatter/claude-bus/releases/tag/v0.1.0

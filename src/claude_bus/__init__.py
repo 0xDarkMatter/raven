@@ -31,7 +31,7 @@ Quickstart::
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 from claude_bus.client import BusClient, Message
 from claude_bus.db import init_db

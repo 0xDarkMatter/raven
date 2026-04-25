@@ -1,6 +1,6 @@
 [project]
 name = "claude-bus"
-version = "0.1.0"
+version = "0.1.1"
 description = "SQLite-backed role-addressable message bus for agent sessions"
 authors = [{ name = "0xDarkMatter" }]
 license = { text = "MIT" }
