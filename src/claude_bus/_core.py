@@ -562,6 +562,40 @@ def list_by_task(
     return [_row_to_message(r) for r in rows]
 
 
+def list_since(
+    conn: sqlite3.Connection,
+    after_id: int,
+    *,
+    limit: int = 100,
+    recipient: str | None = None,
+    sender: str | None = None,
+) -> list[Message]:
+    """Return up to ``limit`` messages with id > ``after_id``, oldest first.
+
+    Identity-free observation primitive — does not mutate status, does
+    not require a registered alias for the caller. Powers
+    ``claude-bus tail``.
+    """
+    where = ["id > ?"]
+    params: list[Any] = [after_id]
+    if recipient is not None:
+        where.append("recipient = ?")
+        params.append(recipient)
+    if sender is not None:
+        where.append("sender = ?")
+        params.append(sender)
+    sql = (
+        "SELECT id, session_id, sender, recipient, type, urgency, body, tags, "
+        "in_reply_to, conversation_id, ref_id, task_id, status, expires_at, "
+        "created_at, delivered_at, resolved_at "
+        f"FROM messages WHERE {' AND '.join(where)} "
+        "ORDER BY id ASC LIMIT ?"
+    )
+    params.append(limit)
+    rows = conn.execute(sql, tuple(params)).fetchall()
+    return [_row_to_message(r) for r in rows]
+
+
 def read_by_id(conn: sqlite3.Connection, message_id: int) -> Message:
     """Fetch a message by id without changing its status.
 
@@ -638,6 +672,7 @@ __all__ = [
     "SendResult",
     "list_by_task",
     "list_conversation",
+    "list_since",
     "list_unread",
     "read_by_id",
     "read_next",

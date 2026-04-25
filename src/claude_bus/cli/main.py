@@ -40,6 +40,7 @@ from claude_bus.cli import read as read_cmd
 from claude_bus.cli import send as send_cmd
 from claude_bus.cli import serve as serve_cmd
 from claude_bus.cli import session as session_cmd
+from claude_bus.cli import tail as tail_cmd
 
 app = typer.Typer(
     name="claude-bus",
@@ -64,6 +65,9 @@ app.command("read", help="Read a message by id without acking it.")(
     read_cmd.cmd_read
 )
 app.command("ack", help="Mark a message as read.")(ack_cmd.cmd_ack)
+app.command("tail", help="Stream new messages live (identity-free observer).")(
+    tail_cmd.cmd_tail
+)
 app.command("serve", help="Start the optional HTTP bridge.")(serve_cmd.cmd_serve)
 
 app.add_typer(
