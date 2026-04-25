@@ -158,6 +158,8 @@ A single SQLite file holds an `aliases` table (deterministic identities per `(ro
 - [`docs/QUICKSTART.md`](docs/QUICKSTART.md) — 5-minute walkthrough
 - [`examples/01-hello-world/`](examples/01-hello-world/) — single-process round-trip
 - [`examples/02-two-processes/`](examples/02-two-processes/) — live cross-process coordination
+- [`examples/03-news-desk/`](examples/03-news-desk/) — 5 agents, fan-out + fan-in editorial pipeline
+- [`examples/04-server-incident/`](examples/04-server-incident/) — 5 SRE agents diagnose & fix a flaky server
 - [`CHANGELOG.md`](CHANGELOG.md) — release notes + v0.2 roadmap
 
 ## Troubleshooting
