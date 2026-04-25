@@ -19,7 +19,7 @@ from claude_bus.exceptions import SchemaValidationError
 def cmd_send(
     from_: str = typer.Option(..., "--from", help='Sender address "<role>:<session>".'),
     to: str = typer.Option(..., "--to", help='Recipient address "<role>:<session>".'),
-    type: str = typer.Option(..., "--type", help="Message type / kind."),
+    type: str = typer.Option(..., "--type", "-t", help="Message type / kind."),
     body: str | None = typer.Option(
         None, "--body", help="JSON body string (mutually exclusive with --body-file)."
     ),

@@ -90,7 +90,10 @@ class SchemaRegistry:
                     f"strict mode requires a registered schema. "
                     f"Registered: {cls.types()}"
                 )
-            log.warning(
+            # Permissive mode is the *default* — accepting unregistered
+            # types is expected behaviour, not a problem worth a WARNING.
+            # Surface it at DEBUG for users who explicitly opt in.
+            log.debug(
                 "claude_bus.schema.unregistered_type",
                 message_type=message_type,
             )

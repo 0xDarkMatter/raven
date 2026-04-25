@@ -73,6 +73,11 @@ app.add_typer(
 )
 
 
+@app.command("version", help="Print claude-bus version and exit.")
+def cmd_version() -> None:
+    typer.echo(f"claude-bus {__version__}")
+
+
 def _version_callback(value: bool) -> None:
     if value:
         typer.echo(f"claude-bus {__version__}")

@@ -18,10 +18,17 @@ from claude_bus.cli._common import (
 
 def cmd_inbox(
     role: str = typer.Option(
-        ..., "--role", help='Role address "<role>:<session>" whose inbox to read.'
+        ...,
+        "--role",
+        "-r",
+        help='Role address "<role>:<session>" whose inbox to read.',
     ),
-    max: int = typer.Option(100, "--max", help="Maximum messages to return."),
-    json_out: bool = typer.Option(False, "--json", help="Emit JSON instead of text."),
+    max: int = typer.Option(
+        100, "--max", "-m", help="Maximum messages to return."
+    ),
+    json_out: bool = typer.Option(
+        False, "--json", "-j", help="Emit JSON instead of text."
+    ),
     db: Path | None = typer.Option(None, "--db", help="DB path override."),
 ) -> None:
     """List unread messages for ``--role``."""

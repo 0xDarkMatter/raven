@@ -21,7 +21,9 @@ from claude_bus.exceptions import UnknownMessageError
 
 def cmd_read(
     message_id: int = typer.Argument(..., help="Message id to fetch."),
-    json_out: bool = typer.Option(False, "--json", help="Emit JSON instead of text."),
+    json_out: bool = typer.Option(
+        False, "--json", "-j", help="Emit JSON instead of text."
+    ),
     db: Path | None = typer.Option(None, "--db", help="DB path override."),
 ) -> None:
     """Read a single message without changing its status.

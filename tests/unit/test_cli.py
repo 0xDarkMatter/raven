@@ -126,6 +126,31 @@ def test_read_and_ack_dont_pollute_aliases_table(tmp_path: Path) -> None:
     )
 
 
+def test_version_subcommand() -> None:
+    from claude_bus import __version__
+
+    result = runner.invoke(app, ["version"])
+    assert result.exit_code == 0
+    assert __version__ in result.stdout
+
+
+def test_short_flags_on_inbox(tmp_path: Path) -> None:
+    db = tmp_path / "bus.db"
+    _run("send", "--from", "a:s", "--to", "b:s", "--type", "x",
+         "--body", '{"k": 1}', db=db)
+    code, out = _run("inbox", "-r", "b:s", "-j", "-m", "10", db=db)
+    assert code == 0
+    payload = json.loads(out)
+    assert len(payload["messages"]) == 1
+
+
+def test_short_flags_on_send(tmp_path: Path) -> None:
+    db = tmp_path / "bus.db"
+    code, _ = _run("send", "--from", "a:s", "--to", "b:s", "-t", "x",
+                   "--body", "{}", db=db)
+    assert code == 0
+
+
 def test_help_lists_eight_commands() -> None:
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
