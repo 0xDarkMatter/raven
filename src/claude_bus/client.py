@@ -246,16 +246,7 @@ class BusClient:
     def read(self, message_id: int) -> Message:
         """Return a single message by id without changing its status."""
         with connection(self.db_path) as conn:
-            row = conn.execute(
-                "SELECT id, session_id, sender, recipient, type, urgency, body, "
-                "tags, in_reply_to, conversation_id, ref_id, task_id, status, "
-                "expires_at, created_at, delivered_at, resolved_at "
-                "FROM messages WHERE id = ?",
-                (message_id,),
-            ).fetchone()
-            if row is None:
-                raise UnknownMessageError(f"message id={message_id} does not exist")
-            internal = _core._row_to_message(row)
+            internal = _core.read_by_id(conn, message_id)
             return _to_public(internal, conn)
 
     def ack(self, message_id: int) -> None:

@@ -105,6 +105,27 @@ def test_doctor_runs(tmp_path: Path) -> None:
     assert "db" in out
 
 
+def test_read_and_ack_dont_pollute_aliases_table(tmp_path: Path) -> None:
+    """Read/ack must not create a spurious '__cli__' / 'reader' alias row."""
+    import sqlite3
+
+    db = tmp_path / "bus.db"
+    code, _ = _run("send", "--from", "a:s", "--to", "b:s", "--type", "x",
+                   "--body", "{}", db=db)
+    assert code == 0
+    aliases_before = sqlite3.connect(db).execute(
+        "SELECT alias, role FROM aliases ORDER BY alias"
+    ).fetchall()
+    _run("read", "1", db=db)
+    _run("ack", "1", db=db)
+    aliases_after = sqlite3.connect(db).execute(
+        "SELECT alias, role FROM aliases ORDER BY alias"
+    ).fetchall()
+    assert aliases_before == aliases_after, (
+        f"read/ack added spurious aliases: {set(aliases_after) - set(aliases_before)}"
+    )
+
+
 def test_help_lists_eight_commands() -> None:
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0

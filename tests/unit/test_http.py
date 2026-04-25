@@ -68,6 +68,27 @@ def test_message_by_id(client: TestClient, db_path: Path) -> None:
     assert resp.json()["id"] == sent.id
 
 
+def test_message_endpoint_does_not_pollute_aliases(
+    client: TestClient, db_path: Path
+) -> None:
+    """GET /message/{id} must not create a '__http__' / 'reader' alias row."""
+    import sqlite3
+
+    a = BusClient(session_id="s", role="a", db_path=db_path)
+    b = BusClient(session_id="s", role="b", db_path=db_path)
+    sent = a.send(to=b.address, type="ping", body={})
+
+    aliases_before = sqlite3.connect(db_path).execute(
+        "SELECT alias, role FROM aliases ORDER BY alias"
+    ).fetchall()
+    client.get(f"/message/{sent.id}")
+    client.get(f"/message/{sent.id}")
+    aliases_after = sqlite3.connect(db_path).execute(
+        "SELECT alias, role FROM aliases ORDER BY alias"
+    ).fetchall()
+    assert aliases_before == aliases_after
+
+
 def test_message_not_found_returns_404(client: TestClient) -> None:
     resp = client.get("/message/9999")
     assert resp.status_code == 404

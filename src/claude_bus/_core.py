@@ -563,6 +563,26 @@ def list_by_task(
     return [_row_to_message(r) for r in rows]
 
 
+def read_by_id(conn: sqlite3.Connection, message_id: int) -> Message:
+    """Fetch a message by id without changing its status.
+
+    Raises :class:`UnknownMessageError` if no such row exists. Identity-
+    free — useful for the CLI ``read`` / ``ack`` commands and the HTTP
+    bridge's ``GET /message/{id}`` endpoint, neither of which should
+    pollute the ``aliases`` table just to fetch a row.
+    """
+    row = conn.execute(
+        "SELECT id, session_id, sender, recipient, type, urgency, body, tags, "
+        "in_reply_to, conversation_id, ref_id, task_id, status, expires_at, "
+        "created_at, delivered_at, resolved_at "
+        "FROM messages WHERE id = ?",
+        (message_id,),
+    ).fetchone()
+    if row is None:
+        raise UnknownMessageError(f"message id={message_id} does not exist")
+    return _row_to_message(row)
+
+
 def resolve(conn: sqlite3.Connection, message_id: int) -> None:
     """Manually mark ``message_id`` as resolved.
 
@@ -598,6 +618,7 @@ __all__ = [
     "list_by_task",
     "list_conversation",
     "list_unread",
+    "read_by_id",
     "read_next",
     "reply",
     "resolve",

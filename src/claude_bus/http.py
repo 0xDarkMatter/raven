@@ -29,8 +29,9 @@ except ImportError as exc:  # pragma: no cover
         "Install with: pip install 'claude-bus[http]'"
     ) from exc
 
-from claude_bus import __version__
-from claude_bus.client import BusClient
+from claude_bus import __version__, _core
+from claude_bus.client import BusClient, _to_public
+from claude_bus.db import connection
 from claude_bus.exceptions import UnknownMessageError
 from claude_bus.paths import resolve_db_path
 
@@ -87,11 +88,10 @@ def create_app(db_path: str | Path | None = None) -> Starlette:
                 {"error": "bad_request", "detail": "message_id must be an integer"},
                 status_code=400,
             )
-        client = BusClient(
-            session_id="__http__", role="reader", db_path=resolved
-        )
         try:
-            msg = client.read(message_id)
+            with connection(resolved) as conn:
+                internal = _core.read_by_id(conn, message_id)
+                msg = _to_public(internal, conn)
         except UnknownMessageError:
             return JSONResponse(
                 {"error": "message_not_found", "id": message_id},
