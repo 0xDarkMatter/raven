@@ -48,6 +48,21 @@ def test_inbox_malformed_role_returns_400(client: TestClient) -> None:
     assert resp.status_code == 400
 
 
+def test_inbox_empty_role_part_returns_400(client: TestClient) -> None:
+    """`role=architect:` (empty session) should be a 400, not a silent empty list."""
+    resp = client.get("/inbox", params={"role": "architect:"})
+    assert resp.status_code == 400
+    resp = client.get("/inbox", params={"role": ":swarm-1"})
+    assert resp.status_code == 400
+
+
+def test_inbox_zero_max_returns_400(client: TestClient) -> None:
+    resp = client.get("/inbox", params={"role": "a:s", "max": "0"})
+    assert resp.status_code == 400
+    resp = client.get("/inbox", params={"role": "a:s", "max": "-3"})
+    assert resp.status_code == 400
+
+
 def test_inbox_max_param(client: TestClient, db_path: Path) -> None:
     a = BusClient(session_id="s", role="a", db_path=db_path)
     b = BusClient(session_id="s", role="b", db_path=db_path)

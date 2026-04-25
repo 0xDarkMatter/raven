@@ -65,6 +65,16 @@ def create_app(db_path: str | Path | None = None) -> Starlette:
                 },
                 status_code=400,
             )
+        role, session = role_param.split(":", 1)
+        if not role or not session:
+            return JSONResponse(
+                {
+                    "error": "bad_request",
+                    "detail": f"'role' query parameter has empty role or session: "
+                    f"{role_param!r}",
+                },
+                status_code=400,
+            )
         try:
             max_n = int(request.query_params.get("max", "100"))
         except ValueError:
@@ -72,8 +82,12 @@ def create_app(db_path: str | Path | None = None) -> Starlette:
                 {"error": "bad_request", "detail": "'max' must be an integer"},
                 status_code=400,
             )
+        if max_n < 1:
+            return JSONResponse(
+                {"error": "bad_request", "detail": "'max' must be a positive integer"},
+                status_code=400,
+            )
 
-        role, session = role_param.split(":", 1)
         client = BusClient(session_id=session, role=role, db_path=resolved)
         msgs = client.inbox(max=max_n)
         return JSONResponse(
