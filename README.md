@@ -156,8 +156,21 @@ A single SQLite file holds an `aliases` table (deterministic identities per `(ro
 ## Documentation
 
 - [`docs/QUICKSTART.md`](docs/QUICKSTART.md) — 5-minute walkthrough
-- [`examples/01-hello-world/`](examples/01-hello-world/) — runnable example
+- [`examples/01-hello-world/`](examples/01-hello-world/) — single-process round-trip
+- [`examples/02-two-processes/`](examples/02-two-processes/) — live cross-process coordination
 - [`CHANGELOG.md`](CHANGELOG.md) — release notes + v0.2 roadmap
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `claude-bus serve` exits with `failed to bind 127.0.0.1:7713` | Another process is on that port (often a stray previous run, or your real Axiom). | `claude-bus serve --port 7714`, or `lsof -i :7713` / `netstat -ano` to find and kill the holder. |
+| `claude-bus serve` exits with `DB preflight failed: cannot write` | The directory holding `claude-bus.db` is read-only or doesn't exist. | Create the dir, fix permissions, or pass `--db /writable/path/bus.db`. |
+| `claude-bus inbox` returns `(no messages)` but you just sent one | Address mismatch: producer used `--to alice:s1` but consumer asked for `--role Alice:s1` (case-sensitive) or a different session id. | Check casing and that both ends agree on `<role>:<session>`. |
+| `SchemaValidationError: body for type='X' failed validation` | You registered a Pydantic model for type `X` and the body doesn't match it. | Either fix the body, drop the schema (`SchemaRegistry.unregister("X")`), or send with `validate=False` at the `_core.send` layer. |
+| Send hangs for several seconds | Another writer holds a lock on the WAL. The default busy timeout is 5s; if a peer process has the file open in a long transaction it can stall. | Confirm peers commit promptly. As a workaround you can adjust `claude_bus.db.DEFAULT_BUSY_TIMEOUT_S`. |
+| `pip install 'claude-bus[http]'` fine but `claude-bus serve` says `starlette + uvicorn are required` | The CLI is resolving a different Python (system `claude-bus`, not the venv one). | Activate the venv first, or invoke `python -m claude_bus.cli.main serve`. |
+| Two subscribers see the same message | This shouldn't happen as of v0.1.1+ — `subscribe()` uses an atomic `UPDATE … WHERE status IN ('sent','delivered')` claim. If you see it on an older install, `pip install -U claude-bus`. | — |
 
 ## Acknowledgements
 
