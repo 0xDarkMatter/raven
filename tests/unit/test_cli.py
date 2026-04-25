@@ -96,6 +96,17 @@ def test_send_invalid_address_exits_2(tmp_path: Path) -> None:
     assert code == 2
 
 
+def test_serve_preflights_unwritable_db(tmp_path: Path) -> None:
+    """`claude-bus serve` must fail fast (exit 3) on an unwritable DB path,
+    rather than binding the port and dying on the first request."""
+    # Use a path we can't create — point inside a file (not a directory).
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a dir")
+    bad_db = blocker / "claude-bus.db"
+    code, _ = _run("serve", "--port", "0", db=bad_db)
+    assert code == 3, f"expected EXIT_DB (3), got {code}"
+
+
 def test_doctor_runs(tmp_path: Path) -> None:
     db = tmp_path / "bus.db"
     code, out = _run("doctor", db=db)

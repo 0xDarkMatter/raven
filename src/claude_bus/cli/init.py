@@ -14,19 +14,24 @@ CONFIG_FILENAME = "claude-bus.yaml"
 
 DEFAULT_CONFIG = """\
 # claude-bus configuration file.
-# Override values here or via environment variables (CLAUDE_BUS_DB, etc.).
+# Override values here or via environment variables.
+#
+# Environment overrides:
+#   CLAUDE_BUS_DB         — DB path
+#   CLAUDE_BUS_LOG_LEVEL  — log verbosity (DEBUG | INFO | WARNING | ERROR)
+#   CLAUDE_BUS_PORT       — HTTP port for `claude-bus serve`
 
 db_path: ./claude-bus.db
 
 http:
-  enabled: false
-  host: 127.0.0.1
+  enabled: false           # if true, future versions auto-start `serve`
+  host: 127.0.0.1          # loopback only — no auth assumed on the bridge
   port: 7713
 
 schema:
-  strict_mode: false      # reject unknown message types
+  strict_mode: false       # reject messages of unregistered types
 
-log_level: INFO           # DEBUG | INFO | WARN | ERROR
+log_level: WARNING         # DEBUG | INFO | WARNING | ERROR
 """
 
 

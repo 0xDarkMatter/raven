@@ -18,16 +18,43 @@ def cmd_serve(
     """Start the read-focused HTTP bridge (requires the ``[http]`` extra)."""
     try:
         import uvicorn  # noqa: F401  -- imported for availability check
-    except ImportError as exc:
+    except ImportError:
         die(
             "starlette + uvicorn are required. install with: "
             "pip install 'claude-bus[http]'",
         )
         return  # pragma: no cover
 
+    db_path = resolve_db_path(db)
+
+    # Preflight: prove the DB is reachable + writable BEFORE binding the
+    # port. Otherwise we'd happily start serving and fail on the first
+    # request — confusing for ops.
+    from claude_bus import init_db
+    from claude_bus.cli._common import EXIT_DB
+
+    try:
+        init_db(db_path)
+    except FileNotFoundError as exc:
+        die(
+            f"DB preflight failed: missing migration file ({exc.filename or exc}). "
+            "Reinstall claude-bus.",
+            code=EXIT_DB,
+        )
+        return  # pragma: no cover
+    except PermissionError as exc:
+        die(
+            f"DB preflight failed: cannot write to {db_path} ({exc}). "
+            "Check directory permissions.",
+            code=EXIT_DB,
+        )
+        return  # pragma: no cover
+    except OSError as exc:
+        die(f"DB preflight failed at {db_path}: {exc}", code=EXIT_DB)
+        return  # pragma: no cover
+
     from claude_bus.http import create_app
 
-    db_path = resolve_db_path(db)
     app = create_app(db_path)
     typer.echo(f"claude-bus serve -> {host}:{port} db={db_path}")
     try:
