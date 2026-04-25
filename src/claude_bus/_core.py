@@ -598,6 +598,28 @@ def resolve(conn: sqlite3.Connection, message_id: int) -> None:
     conn.commit()
 
 
+def try_claim(conn: sqlite3.Connection, message_id: int) -> bool:
+    """Atomically claim a message — UPDATE returns whether *we* won.
+
+    Returns True if this call transitioned the row from
+    ``sent``/``delivered`` to ``resolved`` (i.e. we are the consumer
+    that gets to handle it). Returns False if the row was already
+    resolved/expired or doesn't exist (someone else got there first).
+
+    This is the building block for race-safe consumer loops across
+    multiple processes — a plain ``inbox`` + ``ack`` pair is two
+    transactions and double-yields under contention.
+    """
+    now = _iso(_utc_now())
+    cursor = conn.execute(
+        "UPDATE messages SET status = 'resolved', resolved_at = ? "
+        "WHERE id = ? AND status IN ('sent', 'delivered')",
+        (now, message_id),
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
 def sweep_expired(conn: sqlite3.Connection) -> int:
     """Transition stale rows to ``expired`` status; return count."""
     now = _iso(_utc_now())
@@ -624,5 +646,6 @@ __all__ = [
     "resolve",
     "send",
     "sweep_expired",
+    "try_claim",
     "unread_count",
 ]

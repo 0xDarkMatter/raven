@@ -125,3 +125,39 @@ async def test_subscribe_at_most_once_between_two_subscribers(
 
     matching = [s for s in seen if s[1] == sent.id]
     assert len(matching) == 1, f"expected exactly one consumer to see #{sent.id}, got {seen}"
+
+
+@pytest.mark.asyncio
+async def test_subscribe_atomic_claim_under_high_contention(db_path: Path) -> None:
+    """50 messages, 4 concurrent subscribers — every id reaches exactly one."""
+    a = BusClient(session_id="s", role="a", db_path=db_path)
+    consumers = [BusClient(session_id="s", role="b", db_path=db_path) for _ in range(4)]
+    ids_sent = [a.send(to=consumers[0].address, type="ping", body={"i": i}).id
+                for i in range(50)]
+
+    seen: list[tuple[int, int]] = []  # (consumer_idx, message_id)
+
+    async def consume(idx: int, client: BusClient) -> None:
+        try:
+            async for msg in client.subscribe(poll_interval_s=0.01, max_per_poll=5):
+                seen.append((idx, msg.id))
+        except asyncio.CancelledError:
+            pass
+
+    tasks = [asyncio.create_task(consume(i, c)) for i, c in enumerate(consumers)]
+    # Wait for the queue to drain.
+    deadline = asyncio.get_event_loop().time() + 3.0
+    while asyncio.get_event_loop().time() < deadline:
+        if len({mid for _, mid in seen}) == len(ids_sent):
+            break
+        await asyncio.sleep(0.05)
+    for t in tasks:
+        t.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+    seen_ids = [mid for _, mid in seen]
+    assert sorted(seen_ids) == sorted(ids_sent), (
+        f"expected every message yielded exactly once: "
+        f"missing={set(ids_sent) - set(seen_ids)}, "
+        f"duplicates={[i for i in seen_ids if seen_ids.count(i) > 1]}"
+    )

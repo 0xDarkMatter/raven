@@ -363,16 +363,23 @@ class BusClient:
         try:
             while True:
                 msgs = self.inbox(max=max_per_poll)
+                claimed = 0
                 for msg in msgs:
-                    self.ack(msg.id)
-                    # Reflect the ack in the yielded copy.
-                    yielded = msg.model_copy(update={"status": "read"})
-                    yield yielded
-                # Skip the sleep when the last poll was saturated — there
-                # are almost certainly more messages queued. Drains a
-                # backlog at IO-bound speed instead of waiting out the
-                # full interval per batch.
-                if len(msgs) < max_per_poll:
+                    # Atomically claim — only one consumer wins per
+                    # message, so two competing subscribers never
+                    # double-yield even at high contention.
+                    with connection(self.db_path) as conn:
+                        won = _core.try_claim(conn, msg.id)
+                    if not won:
+                        continue
+                    claimed += 1
+                    yield msg.model_copy(update={"status": "read"})
+                # Sleep only when we definitively didn't drain a full
+                # batch we owned. (msgs may have been a full batch
+                # but mostly lost to another claimer — in that case
+                # we've spun the loop and should yield to the runtime
+                # before re-polling.)
+                if claimed < max_per_poll:
                     await asyncio.sleep(poll_interval_s)
         except asyncio.CancelledError:
             log.debug("claude_bus.subscribe.cancelled", role=self.address)
