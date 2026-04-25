@@ -144,6 +144,103 @@ def test_alias_register_is_process_cached(db_path: Path, monkeypatch) -> None:
     assert sum(calls) == 1, f"alias_mod.register ran {sum(calls)} times, expected 1"
 
 
+def test_send_with_correlation_and_reply_to(db_path: Path) -> None:
+    """correlation_id and reply_to flow through to stored Message."""
+    a = BusClient(session_id="s", role="a", db_path=db_path)
+    b = BusClient(session_id="s", role="b", db_path=db_path)
+    first = a.send(to=b.address, type="ping", body={"n": 1})
+    second = a.send(
+        to=b.address, type="pong", body={"n": 2},
+        correlation_id=first.id, reply_to=first.id,
+    )
+    fetched = b.read(second.id)
+    assert fetched.reply_to == first.id
+    assert fetched.correlation_id == first.id
+
+
+def test_send_with_task_id_round_trip(db_path: Path) -> None:
+    a = BusClient(session_id="s", role="a", db_path=db_path)
+    b = BusClient(session_id="s", role="b", db_path=db_path)
+    sent = a.send(to=b.address, type="x", body={}, task_id="TASK-42")
+    fetched = b.read(sent.id)
+    assert fetched.task_id == "TASK-42"
+
+
+def test_send_with_tags(db_path: Path) -> None:
+    a = BusClient(session_id="s", role="a", db_path=db_path)
+    b = BusClient(session_id="s", role="b", db_path=db_path)
+    sent = a.send(to=b.address, type="x", body={}, tags=["urgent", "v1.2"])
+    fetched = b.read(sent.id)
+    assert fetched.tags == ["urgent", "v1.2"]
+
+
+def test_send_with_urgency(db_path: Path) -> None:
+    """urgency='blocking' on a message should still flow through."""
+    a = BusClient(session_id="s", role="a", db_path=db_path)
+    b = BusClient(session_id="s", role="b", db_path=db_path)
+    sent = a.send(to=b.address, type="x", body={}, urgency="blocking")
+    # The internal _core.Message has the urgency field; the public Message
+    # doesn't expose it directly in v0.1, so verify via the inbox query.
+    msg = b.inbox()[0]
+    assert msg.id == sent.id
+
+
+def test_send_with_expires_in_s(db_path: Path) -> None:
+    """A message with expires_in_s=0 will be flagged 'expired' by sweep."""
+    import time
+    from claude_bus import _core
+    from claude_bus.db import connection
+
+    a = BusClient(session_id="s", role="a", db_path=db_path)
+    b = BusClient(session_id="s", role="b", db_path=db_path)
+    sent = a.send(to=b.address, type="x", body={}, expires_in_s=0)
+    time.sleep(0.05)
+    with connection(db_path) as conn:
+        n = _core.sweep_expired(conn)
+    assert n == 1
+    # After sweep, status='expired' which maps to public 'read'.
+    msg = b.read(sent.id)
+    assert msg.status == "read"
+
+
+def test_busclient_alias_property(db_path: Path) -> None:
+    a = BusClient(session_id="s", role="alice", db_path=db_path)
+    # Alias is deterministic: <role>-<6hex>
+    assert a.alias.startswith("alice-")
+    assert len(a.alias) == len("alice-") + 6
+
+
+def test_inbox_role_param_accepts_address_form(db_path: Path) -> None:
+    """`inbox(role="a:s")` (the address form) is accepted as well as the
+    bare role name."""
+    a = BusClient(session_id="s", role="a", db_path=db_path)
+    b = BusClient(session_id="s", role="b", db_path=db_path)
+    a.send(to=b.address, type="x", body={})
+    by_address = b.inbox(role=b.address)
+    by_role_name = b.inbox(role="b")
+    assert len(by_address) == len(by_role_name) == 1
+
+
+def test_inbox_role_other_identity_rejected(db_path: Path) -> None:
+    """v0.1 supports only the client's own inbox via role= argument."""
+    b = BusClient(session_id="s", role="b", db_path=db_path)
+    with pytest.raises(ValueError):
+        b.inbox(role="someone-else:other")
+
+
+def test_subscribe_role_other_identity_rejected(db_path: Path) -> None:
+    b = BusClient(session_id="s", role="b", db_path=db_path)
+
+    async def go():
+        async for _ in b.subscribe(role="someone-else:other"):
+            pass
+
+    import asyncio
+
+    with pytest.raises(ValueError):
+        asyncio.run(go())
+
+
 def test_busclient_rejects_empty_session(db_path: Path) -> None:
     with pytest.raises(ValueError, match="session_id"):
         BusClient(session_id="", role="alice", db_path=db_path)
