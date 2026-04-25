@@ -281,7 +281,7 @@ class BusClient:
                 "FROM messages WHERE id = ?",
                 (result.id,),
             ).fetchone()
-            if row is None:
+            if row is None:  # pragma: no cover -- INSERT then SELECT in same conn
                 raise RuntimeError(
                     f"message id={result.id} disappeared between insert and read"
                 )

@@ -59,6 +59,44 @@ def test_doctor_reports_unbindable_port(tmp_path: Path) -> None:
     assert "not bindable" in result.stdout
 
 
+def test_doctor_reports_db_oserror(tmp_path: Path, monkeypatch) -> None:
+    """If init_db raises OSError, _check_db reports the unreachable DB."""
+    from claude_bus.cli import doctor as doctor_mod
+
+    def boom(*_a, **_kw):
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(doctor_mod, "init_db", boom)
+    result = runner.invoke(app, ["doctor", "--db", str(tmp_path / "bus.db")])
+    assert result.exit_code == 1
+    assert "unreachable" in result.stdout
+
+
+def test_doctor_reports_db_missing_schema_version_row(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """If init_db succeeds but bus_meta has no schema_version row, fail."""
+    from claude_bus.cli import doctor as doctor_mod
+
+    db = tmp_path / "bus.db"
+
+    def init_then_wipe(*_a, **_kw):
+        # Create the schema then delete the version row to simulate it.
+        from claude_bus import init_db as real_init
+
+        real_init(db)
+        import sqlite3
+        with sqlite3.connect(db) as conn:
+            conn.execute("DELETE FROM bus_meta WHERE key='schema_version'")
+            conn.commit()
+        return db
+
+    monkeypatch.setattr(doctor_mod, "init_db", init_then_wipe)
+    result = runner.invoke(app, ["doctor", "--db", str(db)])
+    assert result.exit_code == 1
+    assert "no schema_version row" in result.stdout
+
+
 def test_doctor_reports_missing_http_extra(tmp_path: Path, monkeypatch) -> None:
     """Stub out starlette/uvicorn imports and confirm doctor flags it."""
     import importlib.util

@@ -56,6 +56,13 @@ def test_inbox_empty_role_part_returns_400(client: TestClient) -> None:
     assert resp.status_code == 400
 
 
+def test_inbox_non_integer_max_returns_400(client: TestClient) -> None:
+    """`max=abc` should be a 400 (ValueError on int())."""
+    resp = client.get("/inbox", params={"role": "a:s", "max": "abc"})
+    assert resp.status_code == 400
+    assert resp.json()["detail"].endswith("must be an integer")
+
+
 def test_inbox_zero_max_returns_400(client: TestClient) -> None:
     resp = client.get("/inbox", params={"role": "a:s", "max": "0"})
     assert resp.status_code == 400

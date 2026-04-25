@@ -67,7 +67,7 @@ def _check_disk(path: Path) -> tuple[bool, str]:
     parent = path.parent if path.parent.exists() else Path.cwd()
     usage = shutil.disk_usage(parent)
     free_mb = usage.free / (1024 * 1024)
-    if free_mb < 100:
+    if free_mb < 100:  # pragma: no cover -- assertable only with a near-full disk
         return False, f"only {free_mb:.0f}MiB free at {parent}"
     return True, f"{free_mb:.0f}MiB free at {parent}"
 

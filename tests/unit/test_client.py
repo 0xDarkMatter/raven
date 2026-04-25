@@ -259,6 +259,110 @@ def test_busclient_rejects_role_with_colon(db_path: Path) -> None:
         BusClient(session_id="s1", role="bad:role", db_path=db_path)
 
 
+def test_send_to_address_with_empty_role_raises_valueerror(
+    db_path: Path,
+) -> None:
+    """`to='a:'` (empty session) and `to=':b'` (empty role) hit the second
+    branch of _parse_address and raise ValueError."""
+    a = BusClient(session_id="s", role="alice", db_path=db_path)
+    with pytest.raises(ValueError, match="empty role or session"):
+        a.send(to="alice:", type="x", body={})
+    with pytest.raises(ValueError, match="empty role or session"):
+        a.send(to=":session", type="x", body={})
+
+
+def test_subscribe_lost_claim_continues_silently(db_path: Path) -> None:
+    """If try_claim returns False (a competing consumer beat us between
+    inbox() and the claim), subscribe must skip the message — no crash,
+    no double yield. Patch try_claim to lose once."""
+    import asyncio
+    from claude_bus import _core
+
+    a = BusClient(session_id="s", role="a", db_path=db_path)
+    b = BusClient(session_id="s", role="b", db_path=db_path)
+    sent_first = a.send(to=b.address, type="x", body={"i": 0})
+    sent_second = a.send(to=b.address, type="x", body={"i": 1})
+
+    real_try_claim = _core.try_claim
+    losses: list[int] = []
+
+    def lose_first_then_real(conn, message_id):
+        if message_id == sent_first.id and not losses:
+            losses.append(message_id)
+            return False  # we lost the race
+        return real_try_claim(conn, message_id)
+
+    async def consume() -> list[int]:
+        seen: list[int] = []
+        # Patch in-place so subscribe's _core.try_claim call uses our shim.
+        original = _core.try_claim
+        _core.try_claim = lose_first_then_real
+        try:
+            async for msg in b.subscribe(poll_interval_s=0.05):
+                seen.append(msg.id)
+                if len(seen) >= 1:
+                    break
+        finally:
+            _core.try_claim = original
+        return seen
+
+    seen = asyncio.run(asyncio.wait_for(consume(), 2.0))
+    assert losses == [sent_first.id]  # we lost the first
+    assert seen == [sent_second.id]   # the second won and was yielded
+
+
+def test_to_public_falls_back_when_alias_row_missing(db_path: Path) -> None:
+    """If the aliases row gets wiped between insert and read, the public
+    Message exposes the raw alias string with empty role/session — never
+    crashes."""
+    import sqlite3
+
+    a = BusClient(session_id="s", role="alice", db_path=db_path)
+    b = BusClient(session_id="s", role="bob", db_path=db_path)
+    sent = a.send(to=b.address, type="x", body={})
+    # Wipe both alias rows after the message is recorded.
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DELETE FROM aliases")
+        conn.commit()
+    msg = b.read(sent.id)
+    # No crash. Empty role/session, raw alias as recipient/sender str.
+    assert msg.recipient_role == ""
+    assert msg.recipient_session == ""
+    assert msg.sender.startswith("alice-")
+    assert msg.recipient.startswith("bob-")
+
+
+def test_subscribe_handles_lost_claim(db_path: Path) -> None:
+    """If something resolves a message between inbox() and the atomic
+    claim, subscribe() silently skips it — no crash, no double yield."""
+    import asyncio
+    import sqlite3
+
+    a = BusClient(session_id="s", role="a", db_path=db_path)
+    b = BusClient(session_id="s", role="b", db_path=db_path)
+
+    sent_first = a.send(to=b.address, type="x", body={"i": 0})
+    a.send(to=b.address, type="x", body={"i": 1})
+    # Pre-resolve the first message so the claim loses.
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE messages SET status='resolved' WHERE id=?", (sent_first.id,)
+        )
+        conn.commit()
+
+    async def consume() -> list[int]:
+        seen: list[int] = []
+        async for msg in b.subscribe(poll_interval_s=0.05):
+            seen.append(msg.id)
+            if len(seen) >= 1:
+                break
+        return seen
+
+    seen = asyncio.run(asyncio.wait_for(consume(), 2.0))
+    # The lost-claim message is silently skipped; only the second yields.
+    assert sent_first.id not in seen
+
+
 def test_send_invalid_address_raises(db_path: Path) -> None:
     a = BusClient(session_id="s", role="a", db_path=db_path)
     with pytest.raises(ValueError):

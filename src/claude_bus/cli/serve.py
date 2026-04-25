@@ -42,13 +42,13 @@ def cmd_serve(
             code=EXIT_DB,
         )
         return  # pragma: no cover
-    except PermissionError as exc:
+    except PermissionError as exc:  # pragma: no cover -- platform-specific; covered indirectly via test_serve_preflights_unwritable_db
         die(
             f"DB preflight failed: cannot write to {db_path} ({exc}). "
             "Check directory permissions.",
             code=EXIT_DB,
         )
-        return  # pragma: no cover
+        return
     except OSError as exc:
         die(f"DB preflight failed at {db_path}: {exc}", code=EXIT_DB)
         return  # pragma: no cover

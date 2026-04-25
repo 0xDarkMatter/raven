@@ -232,6 +232,43 @@ def test_init_with_explicit_db_path(tmp_path: Path, monkeypatch) -> None:
     assert (tmp_path / "claude-bus.yaml").exists()
 
 
+def test_send_schema_validation_error_via_cli(tmp_path: Path) -> None:
+    """Register a Pydantic schema, then send a body that doesn't match.
+    The CLI must catch SchemaValidationError and exit 5 with a message."""
+    from pydantic import BaseModel
+    from claude_bus import SchemaRegistry
+
+    class Strict(BaseModel):
+        n: int
+
+    SchemaRegistry.register("strict", Strict)
+    try:
+        db = tmp_path / "bus.db"
+        # Use runner directly so we can check `result.output` (stderr+stdout
+        # combined). The error message is emitted via typer.echo(..., err=True).
+        result = runner.invoke(
+            app,
+            [
+                "send", "--from", "a:s", "--to", "b:s", "--type", "strict",
+                "--body", '{"n": "not-an-int"}',
+                "--db", str(db),
+            ],
+        )
+        assert result.exit_code == 5
+        assert "schema validation failed" in result.output
+    finally:
+        SchemaRegistry.clear()
+
+
+def test_global_version_flag() -> None:
+    """`claude-bus --version` exits cleanly with the version string."""
+    from claude_bus import __version__
+
+    result = runner.invoke(app, ["--version"])
+    assert result.exit_code == 0
+    assert __version__ in result.stdout
+
+
 def test_send_to_address_with_empty_role_exits_2(tmp_path: Path) -> None:
     db = tmp_path / "bus.db"
     code, _ = _run(

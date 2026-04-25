@@ -152,7 +152,7 @@ def _expand_recipients(
     """
     if recipient == _ALL_WILDCARD:
         rows = alias_mod.list_by_session(conn, sender_session_id)
-        if not rows:
+        if not rows:  # pragma: no cover -- sender's own row guarantees ≥1
             raise UnknownRoleError(
                 f"no aliases registered in session {sender_session_id!r}"
             )
@@ -185,12 +185,11 @@ def _row_to_message(row: sqlite3.Row) -> Message:
     body: dict[str, Any]
     try:
         body = json.loads(raw_body) if raw_body else {}
-    except json.JSONDecodeError:
+    except json.JSONDecodeError:  # pragma: no cover -- defensive; we always JSON-encode
         body = {"_raw": raw_body}
 
     created = _parse_sqlite_ts(row["created_at"])
-    if created is None:
-        # Messages always carry a default; treat as defensive programming.
+    if created is None:  # pragma: no cover -- schema NOT NULL DEFAULT
         created = _utc_now()
 
     return Message(
@@ -297,7 +296,7 @@ def send(
             ),
         )
         row_id = cursor.lastrowid
-        if row_id is None:
+        if row_id is None:  # pragma: no cover -- sqlite always returns id on INSERT
             raise RuntimeError("sqlite lastrowid was None after INSERT")
         inserted.append(int(row_id))
 
@@ -501,7 +500,7 @@ def _inbox_query(
     urgency_exact: str | None = None,
     statuses: tuple[str, ...] = ("sent", "delivered"),
 ) -> tuple[str, tuple[Any, ...]]:
-    if not statuses:
+    if not statuses:  # pragma: no cover -- defensive guard; all internal callers pass a tuple
         raise SchemaValidationError("statuses must be a non-empty tuple")
     placeholders = ",".join("?" for _ in statuses)
     params: list[Any] = [recipient, *statuses]
