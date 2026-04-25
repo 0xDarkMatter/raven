@@ -86,6 +86,24 @@ def test_session_isolation(db_path: Path) -> None:
     assert b2.inbox() == []
 
 
+def test_busclient_rejects_empty_session(db_path: Path) -> None:
+    with pytest.raises(ValueError, match="session_id"):
+        BusClient(session_id="", role="alice", db_path=db_path)
+    with pytest.raises(ValueError, match="session_id"):
+        BusClient(session_id="   ", role="alice", db_path=db_path)
+
+
+def test_busclient_rejects_empty_role(db_path: Path) -> None:
+    with pytest.raises(ValueError, match="role"):
+        BusClient(session_id="s1", role="", db_path=db_path)
+
+
+def test_busclient_rejects_role_with_colon(db_path: Path) -> None:
+    """':' is the address separator — a role containing it would break parsing."""
+    with pytest.raises(ValueError, match="':'"):
+        BusClient(session_id="s1", role="bad:role", db_path=db_path)
+
+
 def test_send_invalid_address_raises(db_path: Path) -> None:
     a = BusClient(session_id="s", role="a", db_path=db_path)
     with pytest.raises(ValueError):

@@ -144,6 +144,16 @@ class BusClient:
         role: str,
         db_path: str | Path | None = None,
     ) -> None:
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ValueError(
+                f"session_id must be a non-empty string, got {session_id!r}"
+            )
+        if not isinstance(role, str) or not role.strip():
+            raise ValueError(f"role must be a non-empty string, got {role!r}")
+        if ":" in role:
+            raise ValueError(
+                f"role {role!r} must not contain ':' (it's the address separator)"
+            )
         self.session_id = session_id
         self.role = role
         self.db_path = Path(db_path) if db_path is not None else None
