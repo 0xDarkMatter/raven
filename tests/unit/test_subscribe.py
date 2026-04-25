@@ -68,6 +68,31 @@ async def test_subscribe_cancellation_propagates(db_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_subscribe_drains_backlog_without_sleeping(db_path: Path) -> None:
+    """A 50-message backlog with poll_interval_s=10 should drain immediately
+    when max_per_poll lets us batch it (saturated polls skip the sleep)."""
+    a = BusClient(session_id="s", role="a", db_path=db_path)
+    b = BusClient(session_id="s", role="b", db_path=db_path)
+    for i in range(50):
+        a.send(to=b.address, type="ping", body={"i": i})
+
+    received: list[int] = []
+
+    async def consume() -> None:
+        # max_per_poll=10 → 5 saturated batches drain without sleeping
+        async for msg in b.subscribe(poll_interval_s=10.0, max_per_poll=10):
+            received.append(msg.id)
+            if len(received) == 50:
+                break
+
+    # If saturation didn't skip the sleep, draining 50 with batch=10 + 10s
+    # interval would take 40+ seconds. We give it 5s — pure backlog drain
+    # is bounded by IO, not the interval.
+    await asyncio.wait_for(consume(), timeout=5.0)
+    assert len(received) == 50
+
+
+@pytest.mark.asyncio
 async def test_subscribe_at_most_once_between_two_subscribers(
     db_path: Path,
 ) -> None:

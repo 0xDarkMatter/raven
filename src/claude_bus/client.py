@@ -368,7 +368,11 @@ class BusClient:
                     # Reflect the ack in the yielded copy.
                     yielded = msg.model_copy(update={"status": "read"})
                     yield yielded
-                if not msgs:
+                # Skip the sleep when the last poll was saturated — there
+                # are almost certainly more messages queued. Drains a
+                # backlog at IO-bound speed instead of waiting out the
+                # full interval per batch.
+                if len(msgs) < max_per_poll:
                     await asyncio.sleep(poll_interval_s)
         except asyncio.CancelledError:
             log.debug("claude_bus.subscribe.cancelled", role=self.address)
