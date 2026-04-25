@@ -16,6 +16,31 @@ def test_init_db_is_idempotent(tmp_path: Path) -> None:
     assert p.exists()
 
 
+def test_init_db_caches_per_process(tmp_path: Path, monkeypatch) -> None:
+    """Second call should not re-execute the migration script."""
+    from claude_bus import db as db_mod
+
+    p = tmp_path / "claude-bus.db"
+    calls: list[int] = []
+
+    real_load = db_mod._load_schema_sql
+
+    def counting_load() -> str:
+        calls.append(1)
+        return real_load()
+
+    monkeypatch.setattr(db_mod, "_load_schema_sql", counting_load)
+    db_mod._reset_init_cache()
+    init_db(p)
+    init_db(p)
+    init_db(p)
+    assert sum(calls) == 1, f"_load_schema_sql ran {sum(calls)} times, expected 1"
+
+    # `force=True` bypasses the cache.
+    init_db(p, force=True)
+    assert sum(calls) == 2
+
+
 def test_init_db_records_schema_version(tmp_path: Path) -> None:
     p = tmp_path / "claude-bus.db"
     init_db(p)

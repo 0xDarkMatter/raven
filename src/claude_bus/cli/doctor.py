@@ -12,7 +12,19 @@ import typer
 
 from claude_bus import init_db
 from claude_bus.cli._common import EXIT_GENERIC, EXIT_OK
+from claude_bus.db import _INITIAL_MIGRATION
 from claude_bus.paths import DEFAULT_HTTP_HOST, DEFAULT_HTTP_PORT, resolve_db_path
+
+
+def _check_migration_bundle() -> tuple[bool, str]:
+    """The 0001 migration must ship with the package install."""
+    if not _INITIAL_MIGRATION.exists():
+        return (
+            False,
+            f"migration file missing at {_INITIAL_MIGRATION} — "
+            "the package install is incomplete; reinstall claude-bus",
+        )
+    return True, f"migration bundled at {_INITIAL_MIGRATION.name}"
 
 
 def _check_db(path: Path) -> tuple[bool, str]:
@@ -71,6 +83,7 @@ def cmd_doctor(
     db_path = resolve_db_path(db)
 
     checks = [
+        ("install", _check_migration_bundle()),
         ("db", _check_db(db_path)),
         ("disk", _check_disk(db_path)),
         ("port", _check_port(host, port)),

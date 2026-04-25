@@ -31,20 +31,31 @@ _INITIAL_MIGRATION = _MIGRATIONS_DIR / "0001_initial.sql"
 
 DEFAULT_BUSY_TIMEOUT_S: float = 5.0
 
+# DB paths whose schema this process has already applied. init_db() is
+# idempotent at the SQL layer; this cache short-circuits the redundant
+# round-trips that long-running subscribers + bulk CLI usage would
+# otherwise cause (and reduces write-lock contention with peers).
+_init_cache: set[Path] = set()
+
 
 def _load_schema_sql() -> str:
     """Read the initial migration once per call."""
     return _INITIAL_MIGRATION.read_text(encoding="utf-8")
 
 
-def init_db(db_path: str | Path | None = None) -> Path:
+def init_db(db_path: str | Path | None = None, *, force: bool = False) -> Path:
     """Create the claude-bus DB if missing and apply the schema.
 
-    Idempotent: safe to call on every session startup. Parent
-    directories are created if they don't exist. Returns the resolved
-    absolute path of the DB file.
+    Idempotent and process-cached: re-calls within the same process
+    return immediately after the first apply. Pass ``force=True`` to
+    re-run the migration regardless (useful for tests).
+
+    Parent directories are created if missing. Returns the resolved
+    absolute DB path.
     """
     path = resolve_db_path(db_path)
+    if not force and path in _init_cache:
+        return path
     path.parent.mkdir(parents=True, exist_ok=True)
     schema_sql = _load_schema_sql()
 
@@ -57,8 +68,14 @@ def init_db(db_path: str | Path | None = None) -> Path:
         )
         conn.commit()
 
+    _init_cache.add(path)
     log.debug("claude_bus.db.init", path=str(path), version=SCHEMA_VERSION)
     return path
+
+
+def _reset_init_cache() -> None:
+    """Test helper — drop the per-process init cache."""
+    _init_cache.clear()
 
 
 @contextmanager

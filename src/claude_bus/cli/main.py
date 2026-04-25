@@ -98,11 +98,45 @@ def _global(
 
 
 def cli_main() -> None:
-    """Entry point referenced by ``[project.scripts]`` in pyproject.toml."""
+    """Entry point referenced by ``[project.scripts]`` in pyproject.toml.
+
+    Catches the broad classes of error users actually hit — bad config,
+    DB issues, schema validation, missing messages — and renders them
+    as one-line errors instead of a Python traceback. Unexpected
+    exceptions still raise so they're visible during development.
+    """
+    from claude_bus.cli._common import (
+        EXIT_CONFIG,
+        EXIT_DB,
+        EXIT_GENERIC,
+        EXIT_MESSAGE_NOT_FOUND,
+        EXIT_SCHEMA_VALIDATION,
+    )
+    from claude_bus.exceptions import (
+        ClaudeBusError,
+        SchemaValidationError,
+        UnknownMessageError,
+    )
+
     try:
         app()
     except KeyboardInterrupt:
         sys.exit(130)
+    except SchemaValidationError as exc:
+        typer.echo(f"error: schema validation failed: {exc}", err=True)
+        sys.exit(EXIT_SCHEMA_VALIDATION)
+    except UnknownMessageError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        sys.exit(EXIT_MESSAGE_NOT_FOUND)
+    except ClaudeBusError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        sys.exit(EXIT_GENERIC)
+    except FileNotFoundError as exc:
+        typer.echo(f"error: file not found: {exc.filename or exc}", err=True)
+        sys.exit(EXIT_CONFIG)
+    except PermissionError as exc:
+        typer.echo(f"error: permission denied: {exc.filename or exc}", err=True)
+        sys.exit(EXIT_DB)
 
 
 if __name__ == "__main__":  # pragma: no cover

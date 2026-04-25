@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from claude_bus import init_db
+from claude_bus.db import _reset_init_cache
 from claude_bus.schemas import SchemaRegistry
 
 
@@ -21,7 +22,8 @@ def db_path(tmp_path: Path) -> Path:
 
 @pytest.fixture(autouse=True)
 def _reset_schema_registry() -> Iterator[None]:
-    """Keep tests independent — clear registered schemas between tests."""
+    """Keep tests independent — clear registered schemas + init cache."""
     yield
     SchemaRegistry.clear()
     SchemaRegistry.strict_mode(False)
+    _reset_init_cache()
