@@ -69,6 +69,22 @@ acked #1
 
 The full Phase-1 CLI surface is **8 commands**: `init`, `doctor`, `session init`, `send`, `inbox`, `read`, `ack`, `serve`.
 
+## Recent Updates
+
+**v0.1.1** (April 2026)
+
+*   🐛 **Identity hygiene** - `read` / `ack` and `GET /message/{id}` no longer add spurious `__cli__` / `__http__` / `reader` rows to the `aliases` table on every invocation. `BusClient("", "alice")` and `BusClient("s", "bad:role")` now fail fast with a clear `ValueError`.
+*   🛡️ **Stricter HTTP validation** - `GET /inbox` returns 400 on `role=a:` (empty session), `role=:b` (empty role), and `max<1` — previously these silently returned an empty array, masking caller bugs.
+*   ⚡ **Cached `init_db()`** - Long-running subscribers and bulk CLI usage no longer re-execute the migration script on every `BusClient()` instantiation. Pass `force=True` to bypass.
+*   🔧 **Cleaner CLI errors** - `cli_main()` renders `ClaudeBusError`, missing-message, missing-file, and permission-denied exceptions as one-line `error: ...` messages with proper exit codes — no Python tracebacks for users.
+*   🆕 **Quality-of-life additions** - `claude-bus version` subcommand, short flags (`inbox -r/-m/-j`, `send -t`, `read -j`), `doctor` checks the bundled `0001_initial.sql` migration is present, and `_core.read_by_id()` identity-free fetch primitive.
+
+**v0.1.0** (April 2026)
+
+*   🚀 **Initial release** - Phase-1 ship of the role-addressable message bus extracted from Axiom (internal codename *Raven*). Core `BusClient` API with `send`/`inbox`/`ack`/`subscribe`, 8-command CLI (`init`, `doctor`, `session init`, `send`, `inbox`, `read`, `ack`, `serve`), optional Starlette HTTP bridge with read endpoints (`GET /health`, `GET /inbox`, `GET /message/{id}`), pluggable Pydantic schema registry, and a single-file SQLite store with WAL mode for multi-producer/multi-consumer use. Five worked examples included, from single-process round-trips to a 5-agent SRE incident-response pipeline.
+
+[View full changelog →](https://github.com/0xDarkMatter/claude-bus/commits/main)
+
 ## Async subscribe
 
 ```python
