@@ -1,5 +1,5 @@
 [project]
-name = "claude-bus"
+name = "raven"
 version = "0.1.1"
 description = "SQLite-backed role-addressable message bus for agent sessions"
 authors = [{ name = "0xDarkMatter" }]
@@ -34,10 +34,10 @@ dev = [
 ]
 
 [project.scripts]
-claude-bus = "claude_bus.cli.main:cli_main"
+raven = "claude_bus.cli.main:cli_main"
 
 [project.urls]
-Homepage = "https://github.com/0xDarkMatter/claude-bus"
+Homepage = "https://github.com/0xDarkMatter/raven"
 
 [build-system]
 requires = ["hatchling"]

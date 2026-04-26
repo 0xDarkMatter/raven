@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to **claude-bus** are recorded here.
+All notable changes to **raven** are recorded here.
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 

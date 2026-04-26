@@ -1,6 +1,6 @@
-# claude-bus
+# raven
 
-![claude-bus](docs/assets/hackathon.gif)
+![raven](docs/assets/hackathon.gif)
 
 **Built for the Claude Opus 4.7 Hackathon.**
 
@@ -11,9 +11,9 @@
 
 > *A SQLite-backed, role-addressable message bus for live coordination between agent sessions.*
 
-**claude-bus** is the messaging primitive that lets agents in the same swarm coordinate while they're running. One process publishes a `plan`, another subscribes as `architect:swarm-1`, a third rolls in as `verifier:swarm-1` — all sharing a single SQLite file with WAL mode, no broker, no daemon, no Redis. It's the lower-level reusable substrate extracted from [Axiom](https://github.com/0xDarkMatter/axiom) (internal codename: *Raven*).
+**raven** is the messaging primitive that lets agents in the same swarm coordinate while they're running. One process publishes a `plan`, another subscribes as `architect:swarm-1`, a third rolls in as `verifier:swarm-1` — all sharing a single SQLite file with WAL mode, no broker, no daemon, no Redis. It's the lower-level reusable substrate extracted from [Axiom](https://github.com/0xDarkMatter/axiom) (internal codename: *Raven*).
 
-Where [Pigeon](https://github.com/0xDarkMatter/pigeon) is **email** — async notes you leave for a project that may not boot for hours — claude-bus is **Slack**: live, in-swarm, sub-second, role-addressable. Both ship together because both shapes are needed for serious agent systems.
+Where [Pigeon](https://github.com/0xDarkMatter/pigeon) is **email** — async notes you leave for a project that may not boot for hours — raven is **Slack**: live, in-swarm, sub-second, role-addressable. Both ship together because both shapes are needed for serious agent systems.
 
 **8 CLI commands. 5 worked examples. Optional HTTP bridge. One SQLite file. Zero infrastructure.**
 
@@ -25,17 +25,17 @@ Where [Pigeon](https://github.com/0xDarkMatter/pigeon) is **email** — async no
 *   🛡️ **Stricter HTTP validation** - `GET /inbox` returns 400 on `role=a:` (empty session), `role=:b` (empty role), and `max<1` — previously these silently returned an empty array, masking caller bugs.
 *   ⚡ **Cached `init_db()`** - Long-running subscribers and bulk CLI usage no longer re-execute the migration script on every `BusClient()` instantiation. Pass `force=True` to bypass.
 *   🔧 **Cleaner CLI errors** - `cli_main()` renders `ClaudeBusError`, missing-message, missing-file, and permission-denied exceptions as one-line `error: ...` messages with proper exit codes — no Python tracebacks for users.
-*   🆕 **Quality-of-life additions** - `claude-bus version` subcommand, short flags (`inbox -r/-m/-j`, `send -t`, `read -j`), `doctor` checks the bundled `0001_initial.sql` migration is present, and `_core.read_by_id()` identity-free fetch primitive.
+*   🆕 **Quality-of-life additions** - `raven version` subcommand, short flags (`inbox -r/-m/-j`, `send -t`, `read -j`), `doctor` checks the bundled `0001_initial.sql` migration is present, and `_core.read_by_id()` identity-free fetch primitive.
 
 **v0.1.0** (April 2026)
 
 *   🚀 **Initial release** - Phase-1 ship of the role-addressable message bus extracted from Axiom. Core `BusClient` API with `send`/`inbox`/`ack`/`subscribe`, 8-command CLI (`init`, `doctor`, `session init`, `send`, `inbox`, `read`, `ack`, `serve`), optional Starlette HTTP bridge with read endpoints, pluggable Pydantic schema registry, and a single-file SQLite store with WAL mode for multi-producer/multi-consumer use. Five worked examples included, from single-process round-trips to a 5-agent SRE incident-response pipeline.
 
-[View full changelog →](https://github.com/0xDarkMatter/claude-bus/commits/main)
+[View full changelog →](https://github.com/0xDarkMatter/raven/commits/main)
 
-## Mailbox vs bus — where claude-bus fits
+## Mailbox vs bus — where raven fits
 
-| | [Pigeon](https://github.com/0xDarkMatter/pigeon) (mailbox) | **claude-bus** (bus) |
+| | [Pigeon](https://github.com/0xDarkMatter/pigeon) (mailbox) | **raven** (bus) |
 |---|---|---|
 | Concurrency | Async, eventually consistent | Live, session-active |
 | Recipient state | Probably **not running** when you write | **Running and waiting** for messages |
@@ -46,9 +46,9 @@ Where [Pigeon](https://github.com/0xDarkMatter/pigeon) is **email** — async no
 | Shape | Go CLI binary | Python in-process + optional HTTP bridge |
 
 **Use Pigeon** when one session needs to leave a note for another project, possibly across days.
-**Use claude-bus** when agent roles in the same swarm need to coordinate while running.
+**Use raven** when agent roles in the same swarm need to coordinate while running.
 
-## Why claude-bus?
+## Why raven?
 
 Multi-agent systems hit a coordination wall fast. The naïve options all break:
 
@@ -57,7 +57,7 @@ Multi-agent systems hit a coordination wall fast. The naïve options all break:
 - **HTTP between processes** — Every consumer needs its own server, no persistence on crash, no inbox semantics, and now you're writing routing yourself.
 - **Anthropic's tool-call channel** — Works inside one session. Useless across sessions, processes, or hosts.
 
-claude-bus picks the smallest shape that actually solves the problem: **one SQLite file in WAL mode**, addressed by `<role>:<session>`, with `send` / `inbox` / `ack` / `subscribe` semantics and an optional HTTP bridge for non-Python consumers. No broker, no daemon, no port — just a file path that any process on the host can open.
+raven picks the smallest shape that actually solves the problem: **one SQLite file in WAL mode**, addressed by `<role>:<session>`, with `send` / `inbox` / `ack` / `subscribe` semantics and an optional HTTP bridge for non-Python consumers. No broker, no daemon, no port — just a file path that any process on the host can open.
 
 ## Key Benefits
 
@@ -73,7 +73,7 @@ claude-bus picks the smallest shape that actually solves the problem: **one SQLi
 ## Structure
 
 ```
-claude-bus/
+raven/
 ├── src/claude_bus/
 │   ├── _core.py          # send / inbox / ack / read_by_id
 │   ├── client.py         # BusClient — high-level API
@@ -98,9 +98,9 @@ claude-bus/
 ## Installation
 
 ```bash
-pip install claude-bus              # core
-pip install 'claude-bus[http]'      # + optional HTTP bridge (Starlette + uvicorn)
-pip install 'claude-bus[dev]'       # + pytest, pytest-asyncio, httpx, coverage
+pip install raven              # core
+pip install 'raven[http]'      # + optional HTTP bridge (Starlette + uvicorn)
+pip install 'raven[dev]'       # + pytest, pytest-asyncio, httpx, coverage
 ```
 
 Requires **Python 3.12+**.
@@ -110,7 +110,7 @@ Requires **Python 3.12+**.
 ### Five lines of Python
 
 ```python
-from claude_bus import BusClient
+from raven import BusClient
 
 a = BusClient(session_id="swarm-1", role="conductor", db_path="bus.db")
 b = BusClient(session_id="swarm-1", role="architect", db_path="bus.db")
@@ -125,23 +125,23 @@ for msg in b.inbox():
 ### CLI quickstart
 
 ```bash
-$ claude-bus init
-wrote claude-bus.yaml
-initialised .../claude-bus.db
-ready. try: claude-bus doctor
+$ raven init
+wrote raven.yaml
+initialised .../raven.db
+ready. try: raven doctor
 
-$ claude-bus send --from conductor:swarm-1 --to architect:swarm-1 \
+$ raven send --from conductor:swarm-1 --to architect:swarm-1 \
     --type plan --body '{"step": 1}'
 sent #1 conductor:swarm-1 -> architect:swarm-1 type=plan
 
-$ claude-bus inbox --role architect:swarm-1 --json
+$ raven inbox --role architect:swarm-1 --json
 {
   "messages": [
     {"id": 1, "sender": "conductor:swarm-1", "body": {"step": 1}, ...}
   ]
 }
 
-$ claude-bus ack 1
+$ raven ack 1
 acked #1
 ```
 
@@ -151,7 +151,7 @@ acked #1
 
 | Command | Purpose |
 |---|---|
-| `init` | Write `claude-bus.yaml` + initialise the SQLite DB at the configured path |
+| `init` | Write `raven.yaml` + initialise the SQLite DB at the configured path |
 | `doctor` | Health check — DB writable, migration present, schema valid |
 | `session init` | Pre-register a `<role>:<session>` identity without sending |
 | `send` | Publish a message: `--from`, `--to`, `--type`, `--body` (JSON) |
@@ -173,7 +173,7 @@ acked #1
 
 ```python
 import asyncio
-from claude_bus import BusClient
+from raven import BusClient
 
 async def consume():
     b = BusClient(session_id="swarm-1", role="architect", db_path="bus.db")
@@ -192,7 +192,7 @@ By default any JSON body is accepted. Register a Pydantic model to start enforci
 
 ```python
 from pydantic import BaseModel
-from claude_bus import SchemaRegistry
+from raven import SchemaRegistry
 
 class PlanBody(BaseModel):
     step: int
@@ -211,8 +211,8 @@ Validation failures raise `SchemaValidationError`. Strict mode (off by default) 
 The `[http]` extra ships a small Starlette app for non-Python consumers (e.g. an agent inside a Docker container that can't share the host's filesystem):
 
 ```bash
-$ pip install 'claude-bus[http]'
-$ claude-bus serve --port 7713 &
+$ pip install 'raven[http]'
+$ raven serve --port 7713 &
 
 $ curl http://127.0.0.1:7713/health
 {"status": "ok", "db": "...", "version": "0.1.0"}
@@ -226,7 +226,7 @@ $ curl http://127.0.0.1:7713/message/1
 
 Phase 1 ships **read endpoints only** (`GET /health`, `GET /inbox`, `GET /message/{id}`). The write path stays on the CLI / Python API in v0.1.x. `POST /send` and `POST /ack` are planned for **v0.2.0**.
 
-The bridge binds to `127.0.0.1` by default — there is no built-in auth. For multi-host or untrusted-network deployments, terminate TLS + auth at a reverse proxy in front of `claude-bus serve`.
+The bridge binds to `127.0.0.1` by default — there is no built-in auth. For multi-host or untrusted-network deployments, terminate TLS + auth at a reverse proxy in front of `raven serve`.
 
 ## Architecture
 
@@ -284,23 +284,23 @@ A message is **at-most-once** under `subscribe()` (claim-before-yield) and **at-
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `claude-bus serve` exits with `failed to bind 127.0.0.1:7713` | Another process is on that port (often a stray previous run, or your real Axiom). | `claude-bus serve --port 7714`, or `lsof -i :7713` / `netstat -ano` to find and kill the holder. |
-| `claude-bus serve` exits with `DB preflight failed: cannot write` | The directory holding `claude-bus.db` is read-only or doesn't exist. | Create the dir, fix permissions, or pass `--db /writable/path/bus.db`. |
-| `claude-bus inbox` returns `(no messages)` but you just sent one | Address mismatch: producer used `--to alice:s1` but consumer asked for `--role Alice:s1` (case-sensitive) or a different session id. | Check casing and that both ends agree on `<role>:<session>`. |
+| `raven serve` exits with `failed to bind 127.0.0.1:7713` | Another process is on that port (often a stray previous run, or your real Axiom). | `raven serve --port 7714`, or `lsof -i :7713` / `netstat -ano` to find and kill the holder. |
+| `raven serve` exits with `DB preflight failed: cannot write` | The directory holding `raven.db` is read-only or doesn't exist. | Create the dir, fix permissions, or pass `--db /writable/path/bus.db`. |
+| `raven inbox` returns `(no messages)` but you just sent one | Address mismatch: producer used `--to alice:s1` but consumer asked for `--role Alice:s1` (case-sensitive) or a different session id. | Check casing and that both ends agree on `<role>:<session>`. |
 | `SchemaValidationError: body for type='X' failed validation` | You registered a Pydantic model for type `X` and the body doesn't match it. | Either fix the body, drop the schema (`SchemaRegistry.unregister("X")`), or send with `validate=False` at the `_core.send` layer. |
 | Send hangs for several seconds | Another writer holds a lock on the WAL. Default busy timeout is 5s; if a peer process has the file open in a long transaction it can stall. | Confirm peers commit promptly. As a workaround you can adjust `claude_bus.db.DEFAULT_BUSY_TIMEOUT_S`. |
-| `pip install 'claude-bus[http]'` fine but `claude-bus serve` says `starlette + uvicorn are required` | The CLI is resolving a different Python (system `claude-bus`, not the venv one). | Activate the venv first, or invoke `python -m claude_bus.cli.main serve`. |
-| Two subscribers see the same message | Shouldn't happen as of v0.1.1+ — `subscribe()` uses an atomic claim. If you see it on an older install, `pip install -U claude-bus`. | — |
+| `pip install 'raven[http]'` fine but `raven serve` says `starlette + uvicorn are required` | The CLI is resolving a different Python (system `raven`, not the venv one). | Activate the venv first, or invoke `python -m raven.cli.main serve`. |
+| Two subscribers see the same message | Shouldn't happen as of v0.1.1+ — `subscribe()` uses an atomic claim. If you see it on an older install, `pip install -U raven`. | — |
 
 ## Acknowledgements
 
-claude-bus is the messaging primitive extracted from [Axiom](https://github.com/0xDarkMatter/axiom) (internal codename: *Raven*). Axiom keeps its own role-aware adapter layer; this project is the lower-level reusable substrate, sized for any single-host multi-session agent system.
+raven is the messaging primitive extracted from [Axiom](https://github.com/0xDarkMatter/axiom) (internal codename: *Raven*). Axiom keeps its own role-aware adapter layer; this project is the lower-level reusable substrate, sized for any single-host multi-session agent system.
 
 Sibling projects in the same ecosystem:
 
 - [**Pigeon**](https://github.com/0xDarkMatter/pigeon) — Async mailbox between projects (the email half of this story)
 - [**claude-mods**](https://github.com/0xDarkMatter/claude-mods) — Claude Code extension toolkit (where the swarms run)
-- [**Axiom**](https://github.com/0xDarkMatter/axiom) — Multi-lane agent orchestrator (the system claude-bus was extracted from)
+- [**Axiom**](https://github.com/0xDarkMatter/axiom) — Multi-lane agent orchestrator (the system raven was extracted from)
 
 ## License
 
