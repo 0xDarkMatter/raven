@@ -1,8 +1,13 @@
 # claude-bus
 
+![claude-bus](docs/assets/hackathon.gif)
+
+**Built for the Claude Opus 4.7 Hackathon.**
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![Status: Alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#status)
+[![Hackathon](https://img.shields.io/badge/Claude%20Opus%204.7-Hackathon-blueviolet?logo=anthropic)](https://www.anthropic.com/)
 
 > *A SQLite-backed, role-addressable message bus for live coordination between agent sessions.*
 
