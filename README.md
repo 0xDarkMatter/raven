@@ -1,7 +1,5 @@
 ![raven](docs/assets/raven-banner.png)
 
-![raven](docs/assets/hackathon.gif)
-
 **Built for the Claude Opus 4.7 Hackathon.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -16,6 +14,8 @@
 Where [Pigeon](https://github.com/0xDarkMatter/pigeon) is **email** — async notes you leave for a project that may not boot for hours — raven is **Slack**: live, in-swarm, sub-second, role-addressable. Both ship together because both shapes are needed for serious agent systems.
 
 **8 CLI commands. 5 worked examples. Optional HTTP bridge. One SQLite file. Zero infrastructure.**
+
+![raven](docs/assets/hackathon.gif)
 
 ## Recent Updates
 
