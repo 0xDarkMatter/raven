@@ -1,4 +1,4 @@
-# raven
+![raven](docs/assets/raven-banner.png)
 
 ![raven](docs/assets/hackathon.gif)
 
