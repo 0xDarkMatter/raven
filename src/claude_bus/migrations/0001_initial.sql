@@ -1,4 +1,4 @@
--- claude-bus initial schema.
+-- raven initial schema.
 -- Applied idempotently by claude_bus.db.init_db.
 -- Schema version recorded in bus_meta under key "schema_version".
 

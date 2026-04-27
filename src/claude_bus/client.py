@@ -61,7 +61,7 @@ class Message(BaseModel):
 
     Note: ``id`` is an integer in v0.1.x — this is a pragmatic
     deviation from the original spec's UUID intention. Integers play
-    nicer with shells and humans (``claude-bus read 42``).
+    nicer with shells and humans (``raven read 42``).
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -248,7 +248,7 @@ class BusClient:
         """Send a message to ``to`` (an ``"<role>:<session_id>"`` address)."""
         recipient_role, recipient_session = _parse_address(to)
         with connection(self.db_path) as conn:
-            # Auto-register the recipient identity. claude-bus addresses
+            # Auto-register the recipient identity. raven addresses
             # are deterministic given (role, session), so a producer can
             # name a recipient that hasn't yet booted. Process-cached.
             cache_key = (self.db_path, recipient_role, recipient_session)

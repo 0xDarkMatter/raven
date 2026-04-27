@@ -1,4 +1,4 @@
-"""Optional read-only HTTP bridge for claude-bus.
+"""Optional read-only HTTP bridge for raven.
 
 Phase 1 surface (read-only)::
 
@@ -9,7 +9,7 @@ Phase 1 surface (read-only)::
 Write endpoints (``POST /send``, ``POST /ack``) are deferred to Phase 2
 — for now the write path lives on the CLI/Python API only.
 
-The bridge is opt-in: install with ``pip install 'claude-bus[http]'``
+The bridge is opt-in: install with ``pip install 'raven[http]'``
 to pull in starlette + uvicorn. Without those extras, importing this
 module raises immediately.
 """
@@ -26,7 +26,7 @@ try:
 except ImportError as exc:  # pragma: no cover
     raise ImportError(
         "claude_bus.http requires the [http] extra. "
-        "Install with: pip install 'claude-bus[http]'"
+        "Install with: pip install 'raven[http]'"
     ) from exc
 
 from claude_bus import __version__, _core

@@ -18,7 +18,7 @@ runner = CliRunner()
 
 
 def test_doctor_passes_with_writable_db(tmp_path: Path) -> None:
-    db = tmp_path / "claude-bus.db"
+    db = tmp_path / "raven.db"
     result = runner.invoke(app, ["doctor", "--db", str(db)])
     # Port may or may not be free on the test host; tolerate either.
     assert result.exit_code in (0, 1)

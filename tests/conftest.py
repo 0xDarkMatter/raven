@@ -15,8 +15,8 @@ from claude_bus.schemas import SchemaRegistry
 
 @pytest.fixture
 def db_path(tmp_path: Path) -> Path:
-    """Initialised, empty claude-bus DB at a per-test path."""
-    target = tmp_path / "claude-bus.db"
+    """Initialised, empty raven DB at a per-test path."""
+    target = tmp_path / "raven.db"
     init_db(target)
     return target
 

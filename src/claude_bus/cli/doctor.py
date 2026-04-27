@@ -1,4 +1,4 @@
-"""``claude-bus doctor`` — environment health checks."""
+"""``raven doctor`` — environment health checks."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ def _check_migration_bundle() -> tuple[bool, str]:
         return (
             False,
             f"migration file missing at {_INITIAL_MIGRATION} — "
-            "the package install is incomplete; reinstall claude-bus",
+            "the package install is incomplete; reinstall raven",
         )
     return True, f"migration bundled at {_INITIAL_MIGRATION.name}"
 
@@ -58,7 +58,7 @@ def _check_http_extra() -> tuple[bool, str]:
         return (
             False,
             "starlette + uvicorn not installed (install with `pip install "
-            "claude-bus[http]` to use `claude-bus serve`)",
+            "raven[http]` to use `raven serve`)",
         )
     return True, "[http] extra installed"
 

@@ -70,7 +70,7 @@ def test_serve_reports_missing_http_extra(
     db = tmp_path / "bus.db"
     result = runner.invoke(app, ["serve", "--db", str(db)])
     assert result.exit_code != 0
-    assert "claude-bus[http]" in result.output
+    assert "raven[http]" in result.output
 
 
 def test_serve_preflight_catches_missing_migration(

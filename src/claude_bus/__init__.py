@@ -1,4 +1,4 @@
-"""claude-bus — SQLite-backed role-addressable message bus.
+"""raven — SQLite-backed role-addressable message bus.
 
 Public surface (Phase 1, v0.1.x)::
 

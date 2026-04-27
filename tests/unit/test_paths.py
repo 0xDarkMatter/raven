@@ -21,14 +21,14 @@ def test_explicit_argument_wins(monkeypatch, tmp_path: Path) -> None:
 
 
 def test_env_var_overrides_default(monkeypatch, tmp_path: Path) -> None:
-    """CLAUDE_BUS_DB picks the path when no explicit argument given."""
+    """RAVEN_DB picks the path when no explicit argument given."""
     target = tmp_path / "from-env.db"
     monkeypatch.setenv(ENV_DB_PATH, str(target))
     assert resolve_db_path() == target.resolve()
 
 
 def test_cwd_default_when_no_arg_no_env(monkeypatch, tmp_path: Path) -> None:
-    """Default is `<cwd>/claude-bus.db` when neither arg nor env set."""
+    """Default is `<cwd>/raven.db` when neither arg nor env set."""
     monkeypatch.delenv(ENV_DB_PATH, raising=False)
     monkeypatch.chdir(tmp_path)
     assert resolve_db_path() == (tmp_path / DB_FILENAME).resolve()

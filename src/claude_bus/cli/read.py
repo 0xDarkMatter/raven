@@ -1,4 +1,4 @@
-"""``claude-bus read`` — fetch one message by id."""
+"""``raven read`` — fetch one message by id."""
 
 from __future__ import annotations
 

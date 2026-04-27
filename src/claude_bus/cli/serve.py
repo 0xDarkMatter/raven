@@ -1,4 +1,4 @@
-"""``claude-bus serve`` — run the optional HTTP bridge."""
+"""``raven serve`` — run the optional HTTP bridge."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ def cmd_serve(
     except ImportError:
         die(
             "starlette + uvicorn are required. install with: "
-            "pip install 'claude-bus[http]'",
+            "pip install 'raven[http]'",
         )
         return  # pragma: no cover
 
@@ -38,7 +38,7 @@ def cmd_serve(
     except FileNotFoundError as exc:
         die(
             f"DB preflight failed: missing migration file ({exc.filename or exc}). "
-            "Reinstall claude-bus.",
+            "Reinstall raven.",
             code=EXIT_DB,
         )
         return  # pragma: no cover
@@ -56,7 +56,7 @@ def cmd_serve(
     from claude_bus.http import create_app
 
     app = create_app(db_path)
-    typer.echo(f"claude-bus serve -> {host}:{port} db={db_path}")
+    typer.echo(f"raven serve -> {host}:{port} db={db_path}")
     try:
         import uvicorn
 

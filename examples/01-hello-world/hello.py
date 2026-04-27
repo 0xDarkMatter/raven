@@ -1,4 +1,4 @@
-"""Smallest possible claude-bus round-trip — see ./README.md."""
+"""Smallest possible raven round-trip — see ./README.md."""
 
 from __future__ import annotations
 

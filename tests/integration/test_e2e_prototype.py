@@ -1,4 +1,4 @@
-"""End-to-end prototype demonstrating claude-bus exercising every Phase-1 surface.
+"""End-to-end prototype demonstrating raven exercising every Phase-1 surface.
 
 Scenario: a small swarm of three roles coordinating live.
 

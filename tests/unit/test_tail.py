@@ -1,4 +1,4 @@
-"""Cover the `claude-bus tail` command."""
+"""Cover the `raven tail` command."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Session helpers for claude-bus.
+"""Session helpers for raven.
 
 Phase 1 keeps the session model deliberately minimal: a session is
 just an opaque string used as part of the address (``"<role>:<sid>"``).

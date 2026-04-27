@@ -1,4 +1,4 @@
-"""``claude-bus inbox`` — list unread messages for a role."""
+"""``raven inbox`` — list unread messages for a role."""
 
 from __future__ import annotations
 

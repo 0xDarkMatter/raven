@@ -1,4 +1,4 @@
-"""SQLite lifecycle helpers for claude-bus.
+"""SQLite lifecycle helpers for raven.
 
 The DB is opened in WAL mode with a 5-second busy timeout so concurrent
 producers and consumers can safely share a single SQLite file.
@@ -44,7 +44,7 @@ def _load_schema_sql() -> str:
 
 
 def init_db(db_path: str | Path | None = None, *, force: bool = False) -> Path:
-    """Create the claude-bus DB if missing and apply the schema.
+    """Create the raven DB if missing and apply the schema.
 
     Idempotent and process-cached: re-calls within the same process
     return immediately after the first apply. Pass ``force=True`` to

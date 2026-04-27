@@ -34,7 +34,7 @@ process.
   references the upstream message id, so you can read the audit
   trail in either direction.
 - **Live subscribe**: every agent runs `async for msg in subscribe()`.
-  No polling code anywhere except inside `claude-bus` itself.
+  No polling code anywhere except inside `raven` itself.
 - **Schema validation**: each message type has a Pydantic body
   schema registered. Try editing one of the bodies in `agents.py`
   to see strict mode catch it.

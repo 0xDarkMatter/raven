@@ -1,4 +1,4 @@
-"""``claude-bus tail`` — stream new messages as they arrive.
+"""``raven tail`` — stream new messages as they arrive.
 
 Identity-free observer. Does not consume messages — multiple tailers
 can run side-by-side without stealing from each other. Useful for

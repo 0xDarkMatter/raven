@@ -9,7 +9,7 @@ from claude_bus.db import connection, init_db
 
 
 def test_init_db_is_idempotent(tmp_path: Path) -> None:
-    p = tmp_path / "claude-bus.db"
+    p = tmp_path / "raven.db"
     init_db(p)
     init_db(p)
     init_db(p)
@@ -20,7 +20,7 @@ def test_init_db_caches_per_process(tmp_path: Path, monkeypatch) -> None:
     """Second call should not re-execute the migration script."""
     from claude_bus import db as db_mod
 
-    p = tmp_path / "claude-bus.db"
+    p = tmp_path / "raven.db"
     calls: list[int] = []
 
     real_load = db_mod._load_schema_sql
@@ -42,7 +42,7 @@ def test_init_db_caches_per_process(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_init_db_records_schema_version(tmp_path: Path) -> None:
-    p = tmp_path / "claude-bus.db"
+    p = tmp_path / "raven.db"
     init_db(p)
     with sqlite3.connect(p) as conn:
         row = conn.execute(
@@ -53,7 +53,7 @@ def test_init_db_records_schema_version(tmp_path: Path) -> None:
 
 
 def test_connection_uses_wal(tmp_path: Path) -> None:
-    p = tmp_path / "claude-bus.db"
+    p = tmp_path / "raven.db"
     init_db(p)
     with connection(p) as conn:
         mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
@@ -66,7 +66,7 @@ def test_teardown_session_deletes_session_rows(tmp_path: Path) -> None:
     from claude_bus import _core, aliases as alias_mod
     from claude_bus.db import connection, teardown_session
 
-    db = tmp_path / "claude-bus.db"
+    db = tmp_path / "raven.db"
     init_db(db)
     with connection(db) as conn:
         a = alias_mod.register(conn, "alice", "doomed")
@@ -103,14 +103,14 @@ def test_teardown_empty_session_returns_zero(tmp_path: Path) -> None:
     """Tearing down a session with no rows is a safe no-op."""
     from claude_bus.db import connection, teardown_session
 
-    db = tmp_path / "claude-bus.db"
+    db = tmp_path / "raven.db"
     init_db(db)
     with connection(db) as conn:
         assert teardown_session(conn, "never-existed") == 0
 
 
 def test_connection_rolls_back_on_exception(tmp_path: Path) -> None:
-    p = tmp_path / "claude-bus.db"
+    p = tmp_path / "raven.db"
     init_db(p)
     try:
         with connection(p) as conn:

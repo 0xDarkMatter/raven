@@ -22,7 +22,7 @@ resolved so every `subscribe()` loop exits cleanly.
 | Pattern | Where you see it |
 |---|---|
 | **Pipeline routing** | Each role only knows its upstream/downstream addresses, not the whole graph. |
-| **Correlation IDs** | The original incident's id flows through every downstream message, so `claude-bus inbox --json` gives you the full audit trail per fault. |
+| **Correlation IDs** | The original incident's id flows through every downstream message, so `raven inbox --json` gives you the full audit trail per fault. |
 | **`reply_to` chain** | Each step references its parent, so you can walk backward from a fix to the symptom that prompted it. |
 | **Shared mutable state outside the bus** | The `FlakyServer` instance is passed in-process to every agent; the bus carries *coordination*, not *state*. (For multi-process deployments you'd serialize state into messages or share a DB — both fine, but separate concerns from the messaging primitive.) |
 | **Strict schemas** | Each message type has a Pydantic body schema registered. Try changing one of the `body=` dicts in `agents.py` to see strict validation reject it. |

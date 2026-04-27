@@ -10,7 +10,7 @@ Edge-case + QOL polish following the v0.1.0 ship. No public-API breakage.
 
 ### Fixed
 
-- `claude-bus read` / `ack` and `GET /message/{id}` no longer add a
+- `raven read` / `ack` and `GET /message/{id}` no longer add a
   spurious `__cli__` / `__http__` / `reader` row to the `aliases`
   table on every invocation.
 - `GET /inbox` now returns 400 on `role=a:` (empty session),
@@ -35,7 +35,7 @@ Edge-case + QOL polish following the v0.1.0 ship. No public-API breakage.
 
 ### Added
 
-- `claude-bus version` subcommand (mirrors `--version`).
+- `raven version` subcommand (mirrors `--version`).
 - Short flags: `inbox -r/--role -m/--max -j/--json`,
   `send -t/--type`, `read -j/--json`.
 - `doctor` checks the bundled `0001_initial.sql` migration is present
@@ -57,7 +57,7 @@ The hackathon ship target — minimum viable bus that tells the
   permissive by default, switch to strict mode to reject unregistered types.
 - **CLI (8 commands)** — `init`, `doctor`, `session init`, `send`, `inbox`,
   `read`, `ack`, `serve`. JSON output mode on read commands.
-- **Optional HTTP bridge** (`pip install 'claude-bus[http]'`) — read-only
+- **Optional HTTP bridge** (`pip install 'raven[http]'`) — read-only
   Starlette app exposing `GET /health`, `GET /inbox`, `GET /message/{id}`.
 - **Async subscribe iterator** — `async for msg in client.subscribe()`
   yields each new unread message exactly once with at-most-once semantics.
@@ -70,7 +70,7 @@ The hackathon ship target — minimum viable bus that tells the
 ### Phase 1 deviations from the original spec
 
 - **Message ids are integers** rather than UUIDs. Integers play better with
-  shells (`claude-bus read 42`) and SQLite autoincrement is the simplest
+  shells (`raven read 42`) and SQLite autoincrement is the simplest
   store. Wire-stable for v0.1.x.
 - **Status enum is `unread` / `read`** at the public API surface; the
   internal store still uses Raven's four-state model (`sent`, `delivered`,
@@ -81,13 +81,13 @@ The hackathon ship target — minimum viable bus that tells the
 Phase 2 is **not** built into v0.1.0 — it is documented here so callers
 know what's intentionally deferred.
 
-- `claude-bus archive <id>` + `archived` status; `BusClient.archive()`
-- `claude-bus search` + `BusClient.search()` (filter by type, sender,
+- `raven archive <id>` + `archived` status; `BusClient.archive()`
+- `raven search` + `BusClient.search()` (filter by type, sender,
   recipient, since, status)
-- Persistent role aliases (`role_aliases` table) + `claude-bus alias add/list/remove`
-- `sessions` table + `claude-bus session close/list`,
+- Persistent role aliases (`role_aliases` table) + `raven alias add/list/remove`
+- `sessions` table + `raven session close/list`,
   `init_session()` / `teardown_session()` Python API
-- `claude-bus schemas list/validate` + entry-point schema discovery
+- `raven schemas list/validate` + entry-point schema discovery
 - HTTP write path: `POST /send`, `POST /ack`
 - Extended docs: `SCHEMA_REGISTRATION.md`, `HTTP_BRIDGE.md`, `DEPLOYMENT.md`
 - Two more example projects (two-session coordination, HTTP bridge consumer)

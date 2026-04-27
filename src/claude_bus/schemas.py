@@ -1,4 +1,4 @@
-"""Pluggable schema registry for claude-bus message bodies.
+"""Pluggable schema registry for raven message bodies.
 
 By default the registry is empty and validation is permissive — you
 can send messages of any string-typed kind with any JSON-serialisable

@@ -1,4 +1,4 @@
-"""``claude-bus init`` — scaffold a project directory."""
+"""``raven init`` — scaffold a project directory."""
 
 from __future__ import annotations
 
@@ -10,18 +10,18 @@ from claude_bus import init_db
 from claude_bus.cli._common import EXIT_OK, die
 from claude_bus.paths import DB_FILENAME
 
-CONFIG_FILENAME = "claude-bus.yaml"
+CONFIG_FILENAME = "raven.yaml"
 
 DEFAULT_CONFIG = """\
-# claude-bus configuration file.
+# raven configuration file.
 # Override values here or via environment variables.
 #
 # Environment overrides:
-#   CLAUDE_BUS_DB         — DB path
-#   CLAUDE_BUS_LOG_LEVEL  — log verbosity (DEBUG | INFO | WARNING | ERROR)
-#   CLAUDE_BUS_PORT       — HTTP port for `claude-bus serve`
+#   RAVEN_DB         — DB path
+#   RAVEN_LOG_LEVEL  — log verbosity (DEBUG | INFO | WARNING | ERROR)
+#   RAVEN_PORT       — HTTP port for `raven serve`
 
-db_path: ./claude-bus.db
+db_path: ./raven.db
 
 http:
   enabled: false           # if true, future versions auto-start `serve`
@@ -40,10 +40,10 @@ def cmd_init(
         False, "--force", "-f", help="Overwrite an existing config file."
     ),
     db: Path | None = typer.Option(
-        None, "--db", help="Override db path; defaults to ./claude-bus.db."
+        None, "--db", help="Override db path; defaults to ./raven.db."
     ),
 ) -> None:
-    """Scaffold ``claude-bus.yaml`` and the SQLite DB in the current directory."""
+    """Scaffold ``raven.yaml`` and the SQLite DB in the current directory."""
     config_path = Path(CONFIG_FILENAME)
     if config_path.exists() and not force:
         die(
@@ -56,5 +56,5 @@ def cmd_init(
 
     typer.echo(f"wrote {config_path}")
     typer.echo(f"initialised {resolved}")
-    typer.echo("ready. try: claude-bus doctor")
+    typer.echo("ready. try: raven doctor")
     raise typer.Exit(code=EXIT_OK)

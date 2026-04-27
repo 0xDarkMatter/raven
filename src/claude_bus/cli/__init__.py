@@ -1,3 +1,3 @@
-"""Typer CLI for claude-bus."""
+"""Typer CLI for raven."""
 
 from __future__ import annotations

@@ -1,8 +1,8 @@
-"""Exception hierarchy for claude-bus.
+"""Exception hierarchy for raven.
 
-All claude-bus errors inherit from :class:`ClaudeBusError`. Validation
+All raven errors inherit from :class:`ClaudeBusError`. Validation
 errors also subclass :class:`ValueError`, lookup errors subclass
-:class:`KeyError`, so callers that don't want to import claude-bus
+:class:`KeyError`, so callers that don't want to import raven
 errors can catch the stdlib parent.
 """
 
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 
 class ClaudeBusError(Exception):
-    """Root of all claude-bus-raised exceptions."""
+    """Root of all raven-raised exceptions."""
 
 
 class SchemaValidationError(ClaudeBusError, ValueError):

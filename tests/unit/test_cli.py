@@ -24,8 +24,8 @@ def test_init_creates_config_and_db(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     result = runner.invoke(app, ["init"])
     assert result.exit_code == 0
-    assert (tmp_path / "claude-bus.yaml").exists()
-    assert (tmp_path / "claude-bus.db").exists()
+    assert (tmp_path / "raven.yaml").exists()
+    assert (tmp_path / "raven.db").exists()
 
 
 def test_init_refuses_overwrite_without_force(tmp_path: Path, monkeypatch) -> None:
@@ -97,12 +97,12 @@ def test_send_invalid_address_exits_2(tmp_path: Path) -> None:
 
 
 def test_serve_preflights_unwritable_db(tmp_path: Path) -> None:
-    """`claude-bus serve` must fail fast (exit 3) on an unwritable DB path,
+    """`raven serve` must fail fast (exit 3) on an unwritable DB path,
     rather than binding the port and dying on the first request."""
     # Use a path we can't create — point inside a file (not a directory).
     blocker = tmp_path / "blocker"
     blocker.write_text("not a dir")
-    bad_db = blocker / "claude-bus.db"
+    bad_db = blocker / "raven.db"
     code, _ = _run("serve", "--port", "0", db=bad_db)
     assert code == 3, f"expected EXIT_DB (3), got {code}"
 
@@ -229,7 +229,7 @@ def test_init_with_explicit_db_path(tmp_path: Path, monkeypatch) -> None:
     code, out = _run("init", db=custom_db)
     assert code == 0
     assert custom_db.exists()
-    assert (tmp_path / "claude-bus.yaml").exists()
+    assert (tmp_path / "raven.yaml").exists()
 
 
 def test_send_schema_validation_error_via_cli(tmp_path: Path) -> None:
@@ -261,7 +261,7 @@ def test_send_schema_validation_error_via_cli(tmp_path: Path) -> None:
 
 
 def test_global_version_flag() -> None:
-    """`claude-bus --version` exits cleanly with the version string."""
+    """`raven --version` exits cleanly with the version string."""
     from claude_bus import __version__
 
     result = runner.invoke(app, ["--version"])

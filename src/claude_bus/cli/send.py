@@ -1,4 +1,4 @@
-"""``claude-bus send`` — send a typed message between two role addresses."""
+"""``raven send`` — send a typed message between two role addresses."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""``claude-bus ack`` — mark a message as read."""
+"""``raven ack`` — mark a message as read."""
 
 from __future__ import annotations
 

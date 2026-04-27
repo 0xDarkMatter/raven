@@ -1,4 +1,4 @@
-"""Low-level send / read / query primitives for the claude-bus store.
+"""Low-level send / read / query primitives for the raven store.
 
 This module is the functional core. Callers typically work against a
 connection obtained from :func:`claude_bus.db.connection`. The
@@ -574,7 +574,7 @@ def list_since(
 
     Identity-free observation primitive — does not mutate status, does
     not require a registered alias for the caller. Powers
-    ``claude-bus tail``.
+    ``raven tail``.
     """
     where = ["id > ?"]
     params: list[Any] = [after_id]

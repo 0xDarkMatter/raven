@@ -1,4 +1,4 @@
-"""``claude-bus session ...`` — Phase-1 has only ``init``."""
+"""``raven session ...`` — Phase-1 has only ``init``."""
 
 from __future__ import annotations
 

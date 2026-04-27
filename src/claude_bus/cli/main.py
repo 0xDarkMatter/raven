@@ -1,15 +1,15 @@
-"""``claude-bus`` CLI entry point.
+"""``raven`` CLI entry point.
 
 The 8 Phase-1 commands wired here are::
 
-    claude-bus init
-    claude-bus doctor
-    claude-bus session init <id>
-    claude-bus send --from <r:s> --to <r:s> --type <t> --body <json>
-    claude-bus inbox --role <r:s> [--max N] [--json]
-    claude-bus read <id> [--json]
-    claude-bus ack <id>
-    claude-bus serve [--port 7713] [--host 127.0.0.1]
+    raven init
+    raven doctor
+    raven session init <id>
+    raven send --from <r:s> --to <r:s> --type <t> --body <json>
+    raven inbox --role <r:s> [--max N] [--json]
+    raven read <id> [--json]
+    raven ack <id>
+    raven serve [--port 7713] [--host 127.0.0.1]
 """
 
 from __future__ import annotations
@@ -23,10 +23,10 @@ import typer
 
 from claude_bus import __version__
 
-# Quiet structlog by default at the CLI surface — set CLAUDE_BUS_LOG_LEVEL
+# Quiet structlog by default at the CLI surface — set RAVEN_LOG_LEVEL
 # to DEBUG/INFO to bring it back. Library callers configure structlog
 # themselves and aren't affected.
-_log_level = os.environ.get("CLAUDE_BUS_LOG_LEVEL", "WARNING").upper()
+_log_level = os.environ.get("RAVEN_LOG_LEVEL", "WARNING").upper()
 structlog.configure(
     wrapper_class=structlog.make_filtering_bound_logger(
         getattr(logging, _log_level, logging.WARNING)
@@ -43,13 +43,13 @@ from claude_bus.cli import session as session_cmd
 from claude_bus.cli import tail as tail_cmd
 
 app = typer.Typer(
-    name="claude-bus",
+    name="raven",
     help="SQLite-backed role-addressable message bus for agent sessions.",
     no_args_is_help=True,
     add_completion=False,
 )
 
-app.command("init", help="Scaffold claude-bus in the current directory.")(
+app.command("init", help="Scaffold raven in the current directory.")(
     init_cmd.cmd_init
 )
 app.command("doctor", help="Run health checks against the local environment.")(
@@ -77,14 +77,14 @@ app.add_typer(
 )
 
 
-@app.command("version", help="Print claude-bus version and exit.")
+@app.command("version", help="Print raven version and exit.")
 def cmd_version() -> None:
-    typer.echo(f"claude-bus {__version__}")
+    typer.echo(f"raven {__version__}")
 
 
 def _version_callback(value: bool) -> None:
     if value:
-        typer.echo(f"claude-bus {__version__}")
+        typer.echo(f"raven {__version__}")
         raise typer.Exit()
 
 
@@ -98,7 +98,7 @@ def _global(
         help="Print version and exit.",
     ),
 ) -> None:
-    """claude-bus — SQLite-backed role-addressable message bus."""
+    """raven — SQLite-backed role-addressable message bus."""
 
 
 def cli_main() -> None:
