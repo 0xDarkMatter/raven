@@ -89,7 +89,20 @@ asyncio.run(main())
 
 This is what makes raven a **bus** rather than a mailbox: the consumer is alive and waiting for messages to flow in.
 
-## 8. Optional: turn on the HTTP bridge
+## 8. Watch live traffic with `tail`
+
+`raven tail` is an identity-free observer — it streams every message that flows through the bus without consuming any of them:
+
+```bash
+$ raven tail                           # follow all traffic
+$ raven tail --role writer:demo-1      # filter to one recipient
+$ raven tail --no-follow               # print backlog and exit
+$ raven tail --json                    # newline-delimited JSON
+```
+
+Useful for watching a multi-agent pipeline run in real time. Multiple tailers can run alongside active consumers with no interference.
+
+## 9. Optional: turn on the HTTP bridge
 
 ```bash
 $ pip install 'raven[http]'
@@ -106,7 +119,7 @@ $ curl  http://127.0.0.1:7713/health
 
 Useful when a consumer can't share the host filesystem — e.g. an agent running inside a Docker container.
 
-## 9. Optional: enforce a body shape
+## 10. Optional: enforce a body shape
 
 ```python
 from pydantic import BaseModel

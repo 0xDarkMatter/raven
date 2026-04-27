@@ -35,12 +35,19 @@ Edge-case + QOL polish following the v0.1.0 ship. No public-API breakage.
 
 ### Added
 
+- `raven tail` — live stream observer that watches all bus traffic (or
+  one role's messages) without consuming them. Identity-free, never
+  competes with subscribers. Flags: `--role`, `--from`, `--follow/--no-follow`,
+  `--interval`, `--json`.
 - `raven version` subcommand (mirrors `--version`).
 - Short flags: `inbox -r/--role -m/--max -j/--json`,
   `send -t/--type`, `read -j/--json`.
 - `doctor` checks the bundled `0001_initial.sql` migration is present
   on disk, catching broken installs early.
 - `_core.read_by_id()` — identity-free message fetch primitive.
+- `_core.list_since()` — id-range query used by `tail`.
+- Integration tests for `03-news-desk` and `04-server-incident` pipelines
+  (subprocess + SQLite assertions, 100% line coverage).
 
 ## [0.1.0] — 2026-04-25
 
@@ -92,5 +99,5 @@ know what's intentionally deferred.
 - Extended docs: `SCHEMA_REGISTRATION.md`, `HTTP_BRIDGE.md`, `DEPLOYMENT.md`
 - Two more example projects (two-session coordination, HTTP bridge consumer)
 
-[0.1.1]: https://github.com/0xDarkMatter/claude-bus/releases/tag/v0.1.1
-[0.1.0]: https://github.com/0xDarkMatter/claude-bus/releases/tag/v0.1.0
+[0.1.1]: https://github.com/0xDarkMatter/raven/releases/tag/v0.1.1
+[0.1.0]: https://github.com/0xDarkMatter/raven/releases/tag/v0.1.0

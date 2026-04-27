@@ -1,6 +1,6 @@
 """``raven`` CLI entry point.
 
-The 8 Phase-1 commands wired here are::
+The 10 commands wired here are::
 
     raven init
     raven doctor
@@ -9,7 +9,9 @@ The 8 Phase-1 commands wired here are::
     raven inbox --role <r:s> [--max N] [--json]
     raven read <id> [--json]
     raven ack <id>
+    raven tail [--role <r:s>] [--no-follow] [--json]
     raven serve [--port 7713] [--host 127.0.0.1]
+    raven version
 """
 
 from __future__ import annotations

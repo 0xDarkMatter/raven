@@ -13,7 +13,7 @@
 
 Where [Pigeon](https://github.com/0xDarkMatter/pigeon) is **email** — async notes you leave for a project that may not boot for hours — raven is **Slack**: live, in-swarm, sub-second, role-addressable. Both ship together because both shapes are needed for serious agent systems.
 
-**8 CLI commands. 5 worked examples. Optional HTTP bridge. One SQLite file. Zero infrastructure.**
+**10 CLI commands. 5 worked examples. Optional HTTP bridge. One SQLite file. Zero infrastructure.**
 
 ![raven](docs/assets/hackathon.gif)
 
@@ -26,6 +26,8 @@ Where [Pigeon](https://github.com/0xDarkMatter/pigeon) is **email** — async no
 *   ⚡ **Cached `init_db()`** - Long-running subscribers and bulk CLI usage no longer re-execute the migration script on every `BusClient()` instantiation. Pass `force=True` to bypass.
 *   🔧 **Cleaner CLI errors** - `cli_main()` renders `ClaudeBusError`, missing-message, missing-file, and permission-denied exceptions as one-line `error: ...` messages with proper exit codes — no Python tracebacks for users.
 *   🆕 **Quality-of-life additions** - `raven version` subcommand, short flags (`inbox -r/-m/-j`, `send -t`, `read -j`), `doctor` checks the bundled `0001_initial.sql` migration is present, and `_core.read_by_id()` identity-free fetch primitive.
+*   🔭 **`raven tail`** - Live stream observer: watches all bus traffic (or one role's messages) without consuming them. Identity-free, never competes with subscribers, pipe-friendly `--json` mode.
+*   ✅ **Integration tests** - Full subprocess integration tests for the news-desk and server-incident pipelines; 100% line coverage across all 179 tests.
 
 **v0.1.0** (April 2026)
 
@@ -75,22 +77,22 @@ raven picks the smallest shape that actually solves the problem: **one SQLite fi
 ```
 raven/
 ├── src/claude_bus/
-│   ├── _core.py          # send / inbox / ack / read_by_id
-│   ├── client.py         # BusClient — high-level API
-│   ├── aliases.py        # role:session ↔ identity registry
+│   ├── _core.py          # low-level send / list / claim / resolve primitives
+│   ├── client.py         # BusClient — high-level public API + subscribe()
+│   ├── aliases.py        # role:session ↔ deterministic alias registry
 │   ├── db.py             # init_db, WAL setup, busy timeout
-│   ├── schemas.py        # SchemaRegistry, Pydantic validation
-│   ├── session.py        # subscribe() async generator
+│   ├── schemas.py        # SchemaRegistry, Pydantic body validation
+│   ├── session.py        # register_role_alias helper
 │   ├── exceptions.py     # ClaudeBusError hierarchy
 │   ├── http.py           # Starlette bridge (optional [http] extra)
-│   ├── cli/              # 8-command Typer CLI
+│   ├── cli/              # Typer CLI (10 commands)
 │   └── migrations/       # 0001_initial.sql
 ├── examples/
 │   ├── 01-hello-world/        # single-process round-trip
 │   ├── 02-two-processes/      # cross-process coordination
 │   ├── 03-news-desk/          # 5 agents, fan-out + fan-in editorial
 │   └── 04-server-incident/    # 5 SRE agents diagnose flaky server
-├── tests/                # pytest, pytest-asyncio, ~700+ tests
+├── tests/                # pytest, pytest-asyncio, 179 tests (100% line coverage)
 ├── CHANGELOG.md
 └── pyproject.toml
 ```
@@ -110,7 +112,7 @@ Requires **Python 3.12+**.
 ### Five lines of Python
 
 ```python
-from raven import BusClient
+from claude_bus import BusClient
 
 a = BusClient(session_id="swarm-1", role="conductor", db_path="bus.db")
 b = BusClient(session_id="swarm-1", role="architect", db_path="bus.db")
@@ -154,11 +156,13 @@ acked #1
 | `init` | Write `raven.yaml` + initialise the SQLite DB at the configured path |
 | `doctor` | Health check — DB writable, migration present, schema valid |
 | `session init` | Pre-register a `<role>:<session>` identity without sending |
-| `send` | Publish a message: `--from`, `--to`, `--type`, `--body` (JSON) |
+| `send` | Publish a message: `--from`, `--to`, `-t/--type`, `--body` (JSON) |
 | `inbox` | List pending messages for a role: `-r/--role`, `-m/--max`, `-j/--json` |
-| `read` | Fetch a single message by id: `-j/--json` |
-| `ack` | Mark a message acknowledged (delivered → acked) |
+| `read` | Fetch a single message by id without acking it: `-j/--json` |
+| `ack` | Mark a message as read (idempotent) |
+| `tail` | Stream all bus traffic live — identity-free observer, never consumes messages |
 | `serve` | Start the optional Starlette HTTP bridge on `127.0.0.1:7713` |
+| `version` | Print the installed raven version |
 
 ### Worked examples
 
@@ -173,7 +177,7 @@ acked #1
 
 ```python
 import asyncio
-from raven import BusClient
+from claude_bus import BusClient
 
 async def consume():
     b = BusClient(session_id="swarm-1", role="architect", db_path="bus.db")
@@ -186,13 +190,27 @@ asyncio.run(consume())
 
 `subscribe()` claims messages atomically via `UPDATE … WHERE status IN ('sent','delivered')`. Two subscribers on the same role will not see the same message — the loser's update affects zero rows and the message is yielded exactly once.
 
+## Live bus observer — `tail`
+
+`raven tail` is a read-only observer that streams every message through the bus without consuming any of them. It's useful for debugging pipelines and watching live swarm traffic:
+
+```bash
+$ raven tail                          # all traffic, follow mode
+$ raven tail --role architect:swarm-1 # filter to one recipient
+$ raven tail --no-follow              # print backlog and exit
+$ raven tail --json                   # newline-delimited JSON (pipe-friendly)
+$ raven tail --from 42                # resume from a known message id
+```
+
+Multiple tailers can run in parallel alongside active subscribers — `tail` never touches message status and never competes with consumers.
+
 ## Pluggable schemas
 
 By default any JSON body is accepted. Register a Pydantic model to start enforcing a shape per message type:
 
 ```python
 from pydantic import BaseModel
-from raven import SchemaRegistry
+from claude_bus import SchemaRegistry
 
 class PlanBody(BaseModel):
     step: int
@@ -215,7 +233,7 @@ $ pip install 'raven[http]'
 $ raven serve --port 7713 &
 
 $ curl http://127.0.0.1:7713/health
-{"status": "ok", "db": "...", "version": "0.1.0"}
+{"status": "ok", "db": "...", "version": "0.1.1"}
 
 $ curl 'http://127.0.0.1:7713/inbox?role=architect:swarm-1'
 {"messages": [...]}
@@ -269,11 +287,12 @@ A message is **at-most-once** under `subscribe()` (claim-before-yield) and **at-
 | Python | 3.12+ |
 | License | MIT |
 | Status | Alpha — public surface stable for v0.1.x; see `CHANGELOG.md` for the v0.2 roadmap |
-| Tests | pytest + pytest-asyncio, ~700+ tests across DB, client, HTTP, CLI |
+| Tests | pytest + pytest-asyncio, 179 tests (100% line coverage) |
 
 ## Documentation
 
 - [`docs/QUICKSTART.md`](docs/QUICKSTART.md) — 5-minute walkthrough
+- [`AGENTS.md`](AGENTS.md) — developer guide: architecture, invariants, testing patterns
 - [`examples/01-hello-world/`](examples/01-hello-world/) — single-process round-trip
 - [`examples/02-two-processes/`](examples/02-two-processes/) — live cross-process coordination
 - [`examples/03-news-desk/`](examples/03-news-desk/) — 5 agents, fan-out + fan-in editorial pipeline
