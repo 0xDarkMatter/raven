@@ -610,3 +610,16 @@ def test_dunder_main_delegates(monkeypatch):
     with pytest.raises(SystemExit) as excinfo:
         runpy.run_module("raven_bus.adapters.hooks", run_name="__main__")
     assert excinfo.value.code == 0
+
+
+def test_inprocess_empty_inbox_is_silent(monkeypatch, capsys, tmp_path):
+    from raven_bus.adapters.hooks import peek as peek_mod
+
+    db_path = tmp_path / "bus.db"
+    seed_channel(db_path, CHANNEL, [])  # channel exists, nothing pending
+    monkeypatch.setenv("RAVEN_CONSUMER", CONSUMER)
+    monkeypatch.setenv("RAVEN_CHANNELS", CHANNEL)
+    monkeypatch.setenv("RAVEN_DB", str(db_path))
+    assert peek_mod.peek() == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
