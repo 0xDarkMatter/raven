@@ -1,238 +1,163 @@
-# AGENTS — raven developer guide
+# AGENTS — raven v2 developer guide
 
-Guide for AI agents (and human contributors) working inside this codebase.
+Guide for AI agents and human contributors working in this codebase. v0.2.0 is
+a breaking rewrite; this guide describes the v2 end state. Rationale is cited,
+not restated — decisions of record live in [docs/adr/](docs/adr/).
 
-## What this project is
+## What raven is
 
-**raven** is a SQLite-backed, role-addressable message bus for live coordination between agent sessions. It is the lower-level reusable messaging primitive extracted from [Axiom](https://github.com/0xDarkMatter/axiom).
+**raven** is a zero-infra, single-host coordination substrate for multi-agent
+runs: an append-only SQLite log partitioned into channels, with read-state per
+channel kind (ADR-001). Org-scoped chat belongs to Buzz; raven does in-run
+coordination.
 
-- **Package name (pip):** `raven`
-- **Python import:** `from claude_bus import BusClient` — the import root is `claude_bus`, not `raven`
-- **Binary:** `raven` (entry point: `claude_bus.cli.main:cli_main`)
-- **Version:** 0.1.1
+## Naming (ADR-004 — get this right or nothing imports)
 
-The distinction matters: `pip install raven` is correct; `import raven` will fail. Always use `from claude_bus import ...`.
+| | |
+|---|---|
+| **Python import** | `raven_bus` — `from raven_bus import db, log, ...`. The v1 import root is gone; v1 code uses `raven_bus.compat`. |
+| **CLI** | `raven` (entry point `raven_bus.cli.main:cli_main`) |
+| **pip dist name** | **UNDECIDED.** The `raven` PyPI name belongs to Sentry's legacy client. Install from source: `pip install -e .` |
+| **Version** | `0.2.0.dev0` (`raven_bus.__version__`) |
 
-## Running tests
+## Run & test
 
 ```bash
-# Full suite (recommended)
+# Full suite (the gate)
 python -m pytest tests/ -p no:cacheprovider --tb=short -q
 
-# Unit tests only
-python -m pytest tests/unit/ -p no:cacheprovider --tb=short -q
+# Coverage is locked at 100%
+python -m pytest tests/ --cov=raven_bus --cov-fail-under=100 -q
 
-# Integration tests only (run examples as subprocesses)
-python -m pytest tests/integration/ -v --tb=short
-
-# Coverage (must stay at 100%)
-python -m pytest tests/ --cov=claude_bus --cov-fail-under=100 -q
+# One v2 module's tests
+python -m pytest tests/v2/test_claims.py -q
 ```
 
-The test suite has 179 tests. All must pass before committing. Coverage is locked at 100% via `pyproject.toml`; new code needs tests.
+Every code change ships its tests in the same change. New code with no test
+fails the 100% gate. v2 tests live under `tests/v2/`; the legacy v1 suite
+(`tests/unit/`, `tests/integration/`) stays untouched until retired.
 
-## Architecture overview
-
-```
-src/claude_bus/
-├── _core.py          low-level SQLite primitives (send, list_unread, list_since,
-│                     try_claim, resolve, read_by_id) — no identity awareness
-├── client.py         BusClient: high-level public API wrapping _core
-│                     - send() / inbox() / read() / ack() / subscribe()
-│                     - auto-registers sender + recipient aliases on every send
-├── aliases.py        (role, session_id) ↔ deterministic hex alias
-│                     compute_alias() is pure — no DB round-trip
-│                     register() is idempotent (INSERT OR IGNORE)
-├── db.py             init_db() — idempotent schema apply, process-cached
-│                     connection() — context manager, WAL + foreign keys
-│                     teardown_session() — row-scoped cleanup
-├── schemas.py        SchemaRegistry — opt-in Pydantic body validation per type
-│                     permissive by default; strict mode raises SchemaValidationError
-├── session.py        register_role_alias() helper
-├── exceptions.py     ClaudeBusError hierarchy
-├── http.py           Starlette bridge (optional; requires [http] extra)
-├── cli/              Typer CLI — 10 commands
-│   ├── main.py       entry point + error rendering (cli_main)
-│   ├── init.py       raven init
-│   ├── doctor.py     raven doctor
-│   ├── send.py       raven send
-│   ├── inbox.py      raven inbox
-│   ├── read.py       raven read
-│   ├── ack.py        raven ack
-│   ├── tail.py       raven tail  (identity-free observer, never consumes)
-│   ├── serve.py      raven serve
-│   ├── session.py    raven session init
-│   └── _common.py    shared exit codes + output helpers
-└── migrations/
-    └── 0001_initial.sql   applied idempotently by init_db()
-```
-
-### Key invariants
-
-- **Address format:** `<role>:<session>` — role must not contain `:`, neither part may be empty.
-- **Aliases are deterministic:** `compute_alias(role, session)` always returns the same hex string. Producers can address recipients that haven't booted yet.
-- **At-most-once delivery under `subscribe()`:** `try_claim()` does `UPDATE … WHERE status IN ('sent','delivered')`. The winner gets rowcount=1; everyone else gets 0 and skips. No locking beyond SQLite's WAL.
-- **At-least-once under `inbox()`:** messages stay `sent` until explicitly acked. Call `ack(id)` after processing.
-- **`tail` never consumes:** `list_since()` queries by id range, never changes any status. Safe to run alongside active consumers.
-- **`init_db()` is process-cached:** it only runs the migration SQL once per process per DB path. Pass `force=True` in tests that need a fresh DB.
-
-### SQLite schema
-
-Two tables: `aliases` and `messages`.
+## Architecture map
 
 ```
-aliases:  alias (PK), role, session_id, created_at
-messages: id (PK, autoincrement), session_id, sender, recipient, type, urgency,
-          body (JSON), tags, in_reply_to (FK), conversation_id (FK),
-          ref_id, task_id, status, expires_at, created_at, delivered_at, resolved_at
+src/raven_bus/
+├── models.py     pydantic models + the ADR-002 address grammar
+│                 (validate_atom / parse_consumer_id / validate_channel_name)
+├── exceptions.py RavenBusError → {InvalidAddressError (also ValueError),
+│                 UnknownChannelError, UnknownMessageError, ClaimDeniedError,
+│                 WrongChannelKindError}
+├── paths.py      resolve_db_path(): arg > RAVEN_DB > ~/.raven/bus.db
+├── db.py         init_db() (idempotent, process-cached), connection() ctx mgr
+│                 (WAL + foreign_keys + Row, commit/rollback), data_version(),
+│                 sweep() (the ADR-001 enforcement point), teardown_run()
+├── channels.py   ensure_channel / get_channel / list_channels — kind is immutable
+├── log.py        append() (the ONLY messages writer) + read_after/read_by_id/read_thread
+├── cursors.py    broadcast: pending() + ack() (cursor-jump only) + get_cursor()
+├── claims.py     queue: claim_next / renew / complete / release / get_claim
+├── compat.py     v1 BusClient shim on the v2 store (deprecated, one release)
+├── migrations/0002_v2_schema.sql
+└── cli/          Typer `raven`: send read ack claim done release tail
+                  channels doctor teardown version  (_common.py = exit codes + error map)
 ```
 
-`conversation_id` is the raw DB column for what `BusClient.Message` exposes as `correlation_id`. Use `conversation_id` in raw SQL (e.g. integration tests); use `correlation_id` when working through the public API.
+Six tables: `channels`, `messages`, `cursors`, `claims`, `consumers`, `bus_meta`.
+`messages` has **no status column** — read-state lives in `cursors`/`claims`.
 
-## Public Python API
+## Landmines (ADR-001 — these are hard invariants)
 
-```python
-from claude_bus import (
-    BusClient,
-    Message,
-    SchemaRegistry,
-    ClaudeBusError,
-    SchemaValidationError,
-    UnknownMessageError,
-    init_db,
-    register_role_alias,
-)
-```
+Treat each as a build-breaker if violated. The decision text owns the *why*.
 
-### BusClient
-
-```python
-client = BusClient(session_id="swarm-1", role="conductor", db_path="bus.db")
-
-# Send
-msg = client.send(
-    to="architect:swarm-1",
-    type="plan",
-    body={"step": 1},
-    correlation_id=42,   # optional — threads this message to another
-    reply_to=10,         # optional — in_reply_to a specific message id
-    tags=["urgent"],
-    urgency="critical",
-    expires_in_s=300,
-)
-
-# Read inbox (unread messages for this role)
-messages = client.inbox(max=50)
-
-# Read a specific message by id (no status change)
-msg = client.read(message_id=1)
-
-# Acknowledge (mark read)
-client.ack(message_id=1)
-
-# Async subscribe — at-most-once, claims before yielding
-async for msg in client.subscribe(poll_interval_s=0.5):
-    process(msg)  # msg already acked
-```
-
-### SchemaRegistry
-
-```python
-from pydantic import BaseModel
-from claude_bus import SchemaRegistry
-
-class PlanBody(BaseModel):
-    step: int
-    goal: str
-
-SchemaRegistry.register("plan", PlanBody)
-SchemaRegistry.strict_mode(True)   # reject unregistered types
-SchemaRegistry.unregister("plan")  # remove a type
-```
-
-## CLI reference
-
-```
-raven init                             # scaffold raven.yaml + raven.db
-raven doctor                           # health check
-raven send --from r:s --to r:s \       # publish a message
-           -t <type> --body '<json>'
-raven inbox -r <role:session>          # list unread
-raven read <id>                        # fetch by id (no ack)
-raven ack <id>                         # mark read
-raven tail [-r <role:session>]         # stream all traffic (read-only)
-           [--no-follow] [--json]
-raven serve [--port 7713]              # start HTTP bridge
-raven session init <session-id>        # pre-register all roles in session
-raven version                          # print version
-```
-
-## Examples
-
-Four runnable examples in `examples/`:
-
-| Directory | Shape | Key patterns |
-|---|---|---|
-| `01-hello-world/` | 1 process | Basic send → inbox → ack round-trip |
-| `02-two-processes/` | 2 processes | Cross-process coordination, atomic claim |
-| `03-news-desk/` | 5 agents | Fan-out, fan-in, `correlation_id` threading, Pydantic schemas |
-| `04-server-incident/` | 5 SRE agents | Pipeline routing, `reply_to` chain, live subscribe |
-
-Each example has its own `run.py` and is integration-tested in `tests/integration/test_example_pipelines.py`.
+- **Append-only: never `UPDATE` or `DELETE` a `messages` row** outside
+  `db.teardown_run` (the one sanctioned prefix-scoped delete) and retention.
+  `log.append` is the sole writer. Reads never mutate.
+- **Every liveness read filters `expires_at`.** `read_after` filters by default
+  (`include_expired=True` is for `tail`/forensics only); `cursors.pending` and
+  `claims.claim_next` skip expired. v1 shipped `expires_at` but never enforced
+  it — v2 read paths call `db.sweep` first.
+- **Ack is a cursor jump, not per-message.** `cursors.ack(up_to_id)` advances
+  monotonically (`MAX(current, up_to_id)`); backwards ack is a silent no-op.
+  No gap tracking — `tail` covers forensics.
+- **Claims use `INSERT … ON CONFLICT DO NOTHING`.** Rowcount 1 wins; a lost
+  race retries the next candidate rather than returning `None`. Never a
+  read-modify-write claim.
+- **Channel kind is immutable.** Re-ensuring a channel with a different `kind`
+  raises `WrongChannelKindError`. Cursor ops require `broadcast`; claim ops
+  require `queue`.
+- **Lease bookkeeping lives in `claims`, never `messages`.** A lapsed lease is
+  reaped by `sweep` (message becomes claimable again); at `max_deliveries` it
+  flips to `dead`. `claim_next` snapshots lapsed counts before sweeping so a
+  re-claim increments `deliveries`; a voluntary `release` does not count.
 
 ## Testing patterns
 
-### Unit tests (tests/unit/)
+### Fixtures (tests/v2/conftest.py)
 
-Use `tmp_path` for per-test DB isolation. Call `_reset_init_cache()` and `_reset_alias_register_cache()` when testing across multiple DB paths in one process:
+Every test gets an isolated DB under `tmp_path` with the init cache reset:
 
 ```python
-from claude_bus.db import _reset_init_cache
-from claude_bus.client import _reset_alias_register_cache
-
-def test_something(tmp_path):
+@pytest.fixture()
+def db(tmp_path):
+    from raven_bus.db import _reset_init_cache, init_db
     _reset_init_cache()
-    _reset_alias_register_cache()
-    db = tmp_path / "test.db"
-    client = BusClient(session_id="test", role="alice", db_path=db)
-    ...
+    path = tmp_path / "bus.db"
+    init_db(path, force=True)
+    return path
 ```
 
-### Integration tests (tests/integration/)
+`init_db` is process-cached (`force=True` bypasses; `_reset_init_cache()` clears
+it for multi-DB-in-one-process tests). Add module-specific fixtures in your own
+test file, not in `conftest.py` (a frozen wave-0 artifact).
 
-Run examples as subprocesses so each gets its own process-level caches:
+### Landmine: scope sibling stubs via `monkeypatch`, never bare assignment
+
+Lanes call only sibling modules' public contracts. During the parallel build a
+lane's siblings may be stubs, so a test stands them in with faithful contract
+implementations. **Always do this through `pytest.MonkeyPatch`:**
 
 ```python
-result = subprocess.run(
-    [sys.executable, "run.py", "--db", str(tmp_path / "test.db")],
-    cwd=str(EXAMPLE_DIR),
-    capture_output=True, text=True, timeout=30.0,
-)
-assert result.returncode == 0
+def _install_sibling_stubs(monkeypatch):
+    monkeypatch.setattr(cursors_mod.db, "sweep", lambda _conn: None)
+    monkeypatch.setattr(cursors_mod.channels, "get_channel", get_channel)
+    monkeypatch.setattr(cursors_mod.log, "read_after", read_after)
 ```
 
-Use `sqlite3.connect(db)` directly in integration tests to inspect the raw schema. Note: the raw column is `conversation_id`, not `correlation_id`.
+A bare `cursors_mod.db.sweep = ...` replaces the **real** module attribute for
+every later test file in the process — it caused **8 cross-file failures at the
+wave-1 landing**. `monkeypatch` auto-restores on teardown. (`tests/v2/test_cursors.py`
+documents this in `_install_sibling_stubs`.)
 
-## Development setup
+### Raw-SQL data setup
 
-```bash
-# Install with all extras
-pip install -e '.[dev,http]'
+Sibling-lane stand-ins set up rows with direct SQL (e.g. `_insert_message`
+appends a `messages` row matching the `log.append` contract) so the code under
+test exercises real v2 semantics against a live schema.
 
-# Run the full suite with coverage
-python -m pytest tests/ --cov=claude_bus --cov-fail-under=100 -q
+## CLI surface (frozen)
 
-# Smoke-test the CLI
-raven --version
-raven doctor
+```
+raven send      --channel C --from R@RUN -t TYPE --body JSON
+                [--urgency U] [--tag T]... [--reply-to ID] [--expires-in S]
+                [--kind broadcast|queue|stream]
+raven read      --channel C --as R@RUN [-m MAX] [-j]      (broadcast pending)
+raven ack       --channel C --as R@RUN --up-to ID          (cursor jump)
+raven claim     --channel C --as R@RUN [--lease S] [-j]    (queue: claim next)
+raven done      --id ID --as R@RUN                         (complete claim)
+raven release   --id ID --as R@RUN
+raven tail      [--channel C] [--from ID] [--no-follow] [--json] [--interval S]
+raven channels  [--prefix P] [-j]
+raven doctor    [--db P]
+raven teardown  --run RUN [--yes]
+raven version
 ```
 
-## What's intentionally NOT here (Phase 2)
+Exit codes (`cli/_common.py`): `0` ok / `2` usage / `3` not-found / `10` error.
+Failures render as one-line `error: …`; tracebacks never reach users. Consumer
+ids are `<role>@<run>`; channels are path-style; atoms are lowercase
+`[a-z0-9][a-z0-9._-]*` (ADR-002).
 
-- `POST /send` and `POST /ack` HTTP endpoints (read-only bridge in v0.1.x)
-- `raven archive` / `raven search`
-- Persistent role aliases table
-- `sessions` table + session lifecycle commands
-- Multi-host / networked deployments (v0.1.x is single-host only)
+## Out of scope (P2+, see the design doc)
 
-See `CHANGELOG.md` `[Unreleased]` section for the full Phase 2 roadmap.
+ravend HTTP (P2), `raven-acp` + hook adapters / injection policy (P3,
+ADR-003 — *not built*; injection lives in adapters, never the store), fleetflow
+wiring (P4), Buzz bridge (P5). See
+[docs/design/raven2-architecture.md §8](docs/design/raven2-architecture.md#8-phasing).

@@ -1,141 +1,150 @@
-# Quickstart — raven
+# Quickstart — raven v2
 
-Five-minute walkthrough. Assumes Python 3.12+ and a fresh venv.
-
-## 1. Install
+Five-minute walkthrough of the v2 store. Assumes Python 3.12+. The pip
+distribution name is undecided — install from source (ADR-004):
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate          # on Windows: .venv\Scripts\activate
-pip install raven              # add [http] for the bridge
+pip install -e .
+raven version
 ```
 
-## 2. Initialise a workspace
+There is no `init` step. The DB is created on first use at `~/.raven/bus.db`
+(override with `RAVEN_DB`, or pass `--db` to any command). One host DB holds
+every run; runs are namespaced by channel prefix (ADR-002).
+
+We'll use a run called `demo`. Two roles: `orchestrator@demo` and `lane-1@demo`.
+
+## 1. Broadcast: send, read, ack
+
+A `broadcast` channel is how a runner steers its lanes — every subscriber sees
+every message; ack = advance your cursor.
 
 ```bash
-$ raven init
-wrote raven.yaml
-initialised /tmp/example/raven.db
-ready. try: raven doctor
+$ raven send --channel run/demo/control --from orchestrator@demo \
+    -t steer --body '{"note": "prefer the streaming parser"}'
+sent #1 orchestrator@demo -> run/demo/control type=steer
 ```
 
-`init` writes a default config plus an empty SQLite DB at `./raven.db`. Both are idempotent — re-run with `--force` to overwrite the config.
-
-## 3. Send your first message
+`--channel` is auto-created as `broadcast` (the default `--kind`) on first send.
 
 ```bash
-$ raven send \
-    --from conductor:demo-1 \
-    --to architect:demo-1 \
-    --type plan \
-    --body '{"step": 1, "goal": "design login"}'
-sent #1 conductor:demo-1 -> architect:demo-1 type=plan
-```
+# Read the lane's unseen messages. Reading does NOT ack.
+$ raven read --channel run/demo/control --as lane-1@demo
+#1  orchestrator@demo -> run/demo/control  type=steer  urgency=prompt  created=2026-...
+  body: {"note": "prefer the streaming parser"}
 
-Addresses are `"<role>:<session>"`. Both producer and consumer addresses are auto-registered on first use — no separate "register identity" step.
+# Ack by jumping the cursor to the highest id you've handled.
+$ raven ack --channel run/demo/control --as lane-1@demo --up-to 1
+acked lane-1@demo on run/demo/control up_to=1
 
-## 4. Read it from the recipient's inbox
-
-```bash
-$ raven inbox --role architect:demo-1
-#1  conductor:demo-1 -> architect:demo-1  type=plan  status=unread  created=...
-  body: {"goal": "design login", "step": 1}
-
-$ raven inbox --role architect:demo-1 --json
-{ "messages": [...] }
-```
-
-## 5. Ack to clear it
-
-```bash
-$ raven ack 1
-acked #1
-
-$ raven inbox --role architect:demo-1
+$ raven read --channel run/demo/control --as lane-1@demo
 (no messages)
 ```
 
-`read` is similar to `inbox` but takes a single id and does **not** clear the message — useful if you want to look at a conversation history without consuming it.
+A second lane has its own independent cursor — it sees the same message until
+it acks too. That's the fan-out property: `raven read --as lane-2@demo ...`
+returns `#1` regardless of `lane-1`'s cursor.
 
-## 6. Same flow from Python
+> **Ack is a cursor jump, not per-message** (ADR-001). `ack --up-to 3` marks
+> everything up to id 3 as seen. Backwards ack is a silent no-op.
 
-```python
-from claude_bus import BusClient
+## 2. Queue: claim, done
 
-conductor = BusClient(session_id="demo-1", role="conductor", db_path="./raven.db")
-architect = BusClient(session_id="demo-1", role="architect", db_path="./raven.db")
-
-conductor.send(to=architect.address, type="plan", body={"step": 2})
-
-for msg in architect.inbox():
-    print(msg.id, msg.type, msg.body)
-    architect.ack(msg.id)
-```
-
-## 7. Live subscribe (the bus shape)
-
-```python
-import asyncio
-from claude_bus import BusClient
-
-async def main():
-    client = BusClient(session_id="demo-1", role="architect", db_path="./raven.db")
-    async for msg in client.subscribe(poll_interval_s=0.5):
-        print("got:", msg.body)
-        # msg is already acked at this point
-
-asyncio.run(main())
-```
-
-This is what makes raven a **bus** rather than a mailbox: the consumer is alive and waiting for messages to flow in.
-
-## 8. Watch live traffic with `tail`
-
-`raven tail` is an identity-free observer — it streams every message that flows through the bus without consuming any of them:
+A `queue` channel hands out work packets — exactly one consumer wins each
+message, holds a lease, and finishes it. Create it with `--kind queue`.
 
 ```bash
-$ raven tail                           # follow all traffic
-$ raven tail --role writer:demo-1      # filter to one recipient
-$ raven tail --no-follow               # print backlog and exit
-$ raven tail --json                    # newline-delimited JSON
+$ raven send --channel run/demo/queue --from orchestrator@demo \
+    -t packet --body '{"file": "src/parser.py"}' --kind queue
+sent #2 orchestrator@demo -> run/demo/queue type=packet
+
+# Claim the oldest unclaimed message (leases it for 300s by default).
+$ raven claim --channel run/demo/queue --as lane-1@demo
+#2  orchestrator@demo -> run/demo/queue  type=packet  urgency=prompt  created=...
+
+# If lane-1 crashes before `done`, the lease expires and sweep requeues it —
+# it becomes claimable again, with deliveries incremented. Finish it instead:
+$ raven done --id 2 --as lane-1@demo
+done #2 as lane-1@demo
 ```
 
-Useful for watching a multi-agent pipeline run in real time. Multiple tailers can run alongside active consumers with no interference.
+`release --id 2 --as lane-1@demo` gives a message back voluntarily (immediately
+claimable, and it does **not** count toward dead-lettering). After
+`max_deliveries` (default 3) lapsed leases, a message goes to `dead` instead of
+requeueing (ADR-001).
 
-## 9. Optional: turn on the HTTP bridge
+## 3. Tail (the forensic surface)
+
+`tail` streams raw log messages — identity-free, never acks, never steals from
+consumers, and **includes expired** messages (it's for forensics, not liveness):
 
 ```bash
-$ pip install 'raven[http]'
-$ raven serve --port 7713
+$ raven tail --channel run/demo/control        # follow new messages
+$ raven tail --no-follow                        # drain the backlog and exit
+$ raven tail --json                             # newline-delimited JSON
+$ raven tail --from 2                           # resume from a known id
 ```
 
-In another terminal:
+## 4. Teardown
+
+`teardown --run` deletes every row belonging to a run — messages, cursors,
+claims, channels, and consumers — the one sanctioned bulk delete (ADR-001/002):
 
 ```bash
-$ curl 'http://127.0.0.1:7713/inbox?role=architect:demo-1'
-$ curl  http://127.0.0.1:7713/message/1
-$ curl  http://127.0.0.1:7713/health
+$ raven teardown --run demo --yes
+removed 3 rows for run 'demo'
 ```
 
-Useful when a consumer can't share the host filesystem — e.g. an agent running inside a Docker container.
+(Drop `--yes` for a confirmation prompt.)
 
-## 10. Optional: enforce a body shape
+## 5. Health check
+
+```bash
+$ raven doctor
+  [ok]    db       reachable at ~/.raven/bus.db (schema_version=2)
+  [ok]    wal      journal_mode=wal
+  [ok]    sweep    expired=0 requeued=0 dead_lettered=0
+all checks passed
+```
+
+## 6. The same flow from Python
 
 ```python
-from pydantic import BaseModel
-from claude_bus import SchemaRegistry
+from raven_bus import db, channels, log, cursors, claims
 
-class PlanBody(BaseModel):
-    step: int
-    goal: str
+db.init_db()  # creates ~/.raven/bus.db if missing (idempotent)
 
-SchemaRegistry.register("plan", PlanBody)
+# Broadcast: send + read + cursor-jump ack
+with db.connection() as conn:
+    channels.ensure_channel(conn, "run/demo/control", kind="broadcast")
+    log.append(conn, channel="run/demo/control", sender="orchestrator@demo",
+               type="steer", body={"note": "prefer the streaming parser"})
 
-# Subsequent sends with type='plan' are validated against PlanBody.
+with db.connection() as conn:
+    for msg in cursors.pending(conn, "lane-1@demo", "run/demo/control"):
+        handle(msg)
+        cursors.ack(conn, "lane-1@demo", "run/demo/control", up_to_id=msg.id)
+
+# Queue: claim + complete
+with db.connection() as conn:
+    channels.ensure_channel(conn, "run/demo/queue", kind="queue")
+    log.append(conn, channel="run/demo/queue", sender="orchestrator@demo",
+               type="packet", body={"file": "src/parser.py"})
+
+with db.connection() as conn:
+    msg = claims.claim_next(conn, "lane-1@demo", "run/demo/queue")  # or None
+    if msg is not None:
+        do_work(msg)
+        claims.complete(conn, msg.id, "lane-1@demo")
 ```
+
+Connections are short-lived context managers (WAL, foreign keys, auto
+commit/rollback). Cheap change-detection is `db.data_version(conn)` — poll it
+before running a full query.
 
 ## See also
 
-- [`README.md`](../README.md) — overview + mailbox-vs-bus framing
-- [`examples/01-hello-world/`](../examples/01-hello-world/) — runnable script
-- [`CHANGELOG.md`](../CHANGELOG.md) — release notes + Phase 2 roadmap
+- [README.md](../README.md) — overview, the three channel kinds, delivery-semantics table
+- [AGENTS.md](../AGENTS.md) — developer guide: architecture map, landmines, testing patterns
+- [docs/design/raven2-architecture.md](design/raven2-architecture.md) — the v2 design
+- [CHANGELOG.md](../CHANGELOG.md) — release notes
