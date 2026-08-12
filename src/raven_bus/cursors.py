@@ -74,7 +74,7 @@ def _load_cursor(conn: sqlite3.Connection, consumer: str, channel: Channel) -> C
         """,
         (consumer, channel.id),
     ).fetchone()
-    if row is None:
+    if row is None:  # pragma: no cover - only called after ack()'s upsert
         return None
     return Cursor(
         consumer=consumer,

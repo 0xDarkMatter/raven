@@ -1,13 +1,17 @@
-"""End-to-end test that the two-process example actually coordinates live.
+"""End-to-end test that examples/02-two-processes really enforces
+exactly-one-winner delivery on a native v2 queue channel.
 
-Spawns ``examples/02-two-processes/consumer.py`` as a real subprocess,
-runs ``producer.py`` against the same SQLite file, and asserts the
-consumer's stdout records every message the producer sent.
+Spawns two ``consumer.py`` processes racing for the same queue channel,
+runs ``producer.py`` to feed it 5 tasks, then asserts (from both
+processes' stdout AND the raw ``claims`` table) that every task id was
+claimed by exactly one consumer and none were double-delivered.
 """
 
 from __future__ import annotations
 
 import os
+import re
+import sqlite3
 import subprocess
 import sys
 import time
@@ -19,71 +23,90 @@ EXAMPLE_DIR = (
     Path(__file__).resolve().parent.parent.parent / "examples" / "02-two-processes"
 )
 
+_GOT_RE = re.compile(r"got #(\d+)")
+
 
 @pytest.mark.skipif(
     not EXAMPLE_DIR.exists(),
     reason="examples/02-two-processes/ not present (probably built without examples)",
 )
-def test_producer_consumer_coordinate_live(tmp_path: Path) -> None:
+def test_two_consumers_split_five_tasks_with_no_double_delivery(tmp_path: Path) -> None:
     db = tmp_path / "bus.db"
-    env = {**os.environ, "BUS_DB": str(db), "PYTHONUNBUFFERED": "1"}
+    env = {**os.environ, "RAVEN_DB": str(db), "PYTHONUNBUFFERED": "1"}
 
-    consumer = subprocess.Popen(
-        [sys.executable, "-u", str(EXAMPLE_DIR / "consumer.py")],
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    consumers = [
+        subprocess.Popen(
+            [
+                sys.executable, "-u", "consumer.py",
+                "--id", f"consumer-{i}@demo",
+                "--poll-interval", "0.02",
+            ],
+            cwd=str(EXAMPLE_DIR),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for i in range(2)
+    ]
 
     try:
-        # Wait for consumer to register and start polling.
-        deadline = time.time() + 5.0
-        consumer_lines: list[str] = []
-        while time.time() < deadline:
-            line = consumer.stdout.readline()
-            if line:
-                consumer_lines.append(line)
-                if "subscribing" in line:
-                    break
-            else:
-                time.sleep(0.05)
-        assert any("subscribing" in line for line in consumer_lines), (
-            f"consumer never reported subscribing within 5s: {consumer_lines}"
-        )
-
-        # Run the producer to completion.
         producer = subprocess.run(
-            [sys.executable, "-u", str(EXAMPLE_DIR / "producer.py")],
+            [sys.executable, "-u", "producer.py"],
+            cwd=str(EXAMPLE_DIR),
             env=env,
             capture_output=True,
             text=True,
             timeout=10.0,
         )
-        assert producer.returncode == 0, f"producer failed: {producer.stderr}"
-        producer_sent = sum(1 for line in producer.stdout.splitlines()
-                            if "[producer] sent" in line)
-        assert producer_sent == 5
+        assert producer.returncode == 0, producer.stderr
+        assert producer.stdout.count("[producer] sent") == 5
 
-        # Drain consumer output for up to 5s, looking for the 5 received lines.
-        received = 0
+        # Poll the DB until all 5 tasks are completed (or a safety-fuse deadline).
         deadline = time.time() + 5.0
-        while time.time() < deadline and received < 5:
-            line = consumer.stdout.readline()
-            if not line:
-                time.sleep(0.05)
-                continue
-            consumer_lines.append(line)
-            if "[consumer] got" in line:
-                received += 1
-        assert received == 5, (
-            f"consumer received {received}/5 messages. Output:\n"
-            + "".join(consumer_lines)
-        )
+        done = 0
+        while time.time() < deadline:
+            with sqlite3.connect(db) as conn:
+                done = conn.execute(
+                    "SELECT count(*) FROM claims WHERE state = 'done'"
+                ).fetchone()[0]
+            if done >= 5:
+                break
+            time.sleep(0.05)
     finally:
-        consumer.terminate()
-        try:
-            consumer.wait(timeout=2.0)
-        except subprocess.TimeoutExpired:
-            consumer.kill()
-            consumer.wait()
+        outputs = []
+        for c in consumers:
+            c.terminate()
+            try:
+                stdout, _ = c.communicate(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                c.kill()
+                stdout, _ = c.communicate()
+            outputs.append(stdout)
+
+    assert done == 5, (
+        f"expected 5 completed claims, got {done}. Consumer output:\n"
+        + "\n---\n".join(outputs)
+    )
+
+    claimed_ids_by_consumer = [
+        {int(m) for m in _GOT_RE.findall(out)} for out in outputs
+    ]
+    all_claimed = set().union(*claimed_ids_by_consumer)
+    assert all_claimed == {1, 2, 3, 4, 5}, (
+        f"expected ids 1-5 claimed exactly once total, got {all_claimed}"
+    )
+    overlap = claimed_ids_by_consumer[0] & claimed_ids_by_consumer[1]
+    assert not overlap, f"task(s) {overlap} were claimed by both consumers"
+
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT count(*) FROM messages WHERE type = 'task'"
+        ).fetchone()[0] == 5
+        state_counts = dict(
+            conn.execute("SELECT state, count(*) FROM claims GROUP BY state").fetchall()
+        )
+        assert state_counts == {"done": 5}
+        # One claim row per message: the schema's message_id PK already
+        # forbids double-claiming, but assert the count explicitly too.
+        assert conn.execute("SELECT count(*) FROM claims").fetchone()[0] == 5

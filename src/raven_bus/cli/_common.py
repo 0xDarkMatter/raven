@@ -107,8 +107,8 @@ def parse_body(body: str) -> dict[str, Any]:
         parsed = json.loads(body)
     except json.JSONDecodeError as exc:
         die(f"body is not valid JSON: {exc}", EXIT_USAGE)
-        return {}
+        return {}  # pragma: no cover - die() always raises typer.Exit
     if not isinstance(parsed, dict):
         die("body must be a JSON object", EXIT_USAGE)
-        return {}
+        return {}  # pragma: no cover - die() always raises typer.Exit
     return parsed

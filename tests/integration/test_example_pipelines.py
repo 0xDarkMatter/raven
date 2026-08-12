@@ -90,26 +90,26 @@ def test_news_desk_pipeline_publishes_all_articles(tmp_path: Path) -> None:
         assert _count(conn, "approval") == n
         assert _count(conn, "verification") == n
 
-        # All pipeline messages must carry a conversation_id (correlation) so the
+        # All pipeline messages must carry a thread_id (correlation) so the
         # publisher can pair approvals with their matching verifications.
         missing_corr = conn.execute(
             "SELECT count(*) FROM messages "
             "WHERE type IN ('draft', 'approval', 'verification') "
-            "AND conversation_id IS NULL"
+            "AND thread_id IS NULL"
         ).fetchone()[0]
-        assert missing_corr == 0, f"{missing_corr} pipeline messages have no conversation_id"
+        assert missing_corr == 0, f"{missing_corr} pipeline messages have no thread_id"
 
-        # Every conversation_id must resolve to a lead (the originating article).
+        # Every thread_id must resolve to a lead (the originating article).
         lead_ids = {r[0] for r in conn.execute("SELECT id FROM messages WHERE type='lead'")}
         corr_ids = {
             r[0]
             for r in conn.execute(
-                "SELECT DISTINCT conversation_id FROM messages "
+                "SELECT DISTINCT thread_id FROM messages "
                 "WHERE type IN ('draft', 'approval', 'verification')"
             )
         }
         assert corr_ids == lead_ids, (
-            f"conversation_ids {corr_ids} don't match lead ids {lead_ids}"
+            f"thread_ids {corr_ids} don't match lead ids {lead_ids}"
         )
 
 
@@ -166,15 +166,15 @@ def test_incident_pipeline_resolves_all_faults(tmp_path: Path) -> None:
             actual = _count(conn, msg_type)
             assert actual == n, f"type={msg_type!r}: expected {n}, got {actual}"
 
-        # All downstream messages must carry a conversation_id (correlation).
+        # All downstream messages must carry a thread_id (correlation).
         missing_corr = conn.execute(
             "SELECT count(*) FROM messages "
             "WHERE type IN ('investigate', 'prescription', 'fix_applied', 'resolved') "
-            "AND conversation_id IS NULL"
+            "AND thread_id IS NULL"
         ).fetchone()[0]
-        assert missing_corr == 0, f"{missing_corr} downstream messages have no conversation_id"
+        assert missing_corr == 0, f"{missing_corr} downstream messages have no thread_id"
 
-        # The set of conversation_ids used downstream must equal the set of
+        # The set of thread_ids used downstream must equal the set of
         # incident message ids — one complete chain per fault, no leakage.
         incident_ids = {
             r[0] for r in conn.execute("SELECT id FROM messages WHERE type='incident'")
@@ -182,7 +182,7 @@ def test_incident_pipeline_resolves_all_faults(tmp_path: Path) -> None:
         downstream_corr_ids = {
             r[0]
             for r in conn.execute(
-                "SELECT DISTINCT conversation_id FROM messages "
+                "SELECT DISTINCT thread_id FROM messages "
                 "WHERE type IN ('investigate', 'prescription', 'fix_applied', 'resolved')"
             )
         }

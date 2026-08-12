@@ -15,11 +15,14 @@ import json
 from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
+import pytest
 from typer.testing import CliRunner
 
-from raven_bus.cli.main import app
+from raven_bus.cli._common import EXIT_ERROR
+from raven_bus.cli.main import app, cli_main
 from raven_bus.exceptions import (
     ClaimDeniedError,
+    RavenBusError,
     UnknownChannelError,
     WrongChannelKindError,
 )
@@ -148,6 +151,21 @@ def test_send_invalid_body_json_exits_usage() -> None:
     )
     assert result.exit_code == 2
     assert "error:" in result.output
+
+
+def test_send_non_dict_body_exits_usage() -> None:
+    result = runner.invoke(
+        app,
+        [
+            "send",
+            "--channel", "run/r1/team",
+            "--from", "alice@r1",
+            "--type", "ping",
+            "--body", "[1, 2, 3]",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "body must be a JSON object" in result.output
 
 
 def test_send_bad_address_exits_usage() -> None:
@@ -361,6 +379,36 @@ def test_claim_happy_path_with_message() -> None:
     claim_next.assert_called_once_with(conn, "alice@r1", "run/r1/queue", lease_s=60)
 
 
+def test_claim_no_message_human() -> None:
+    conn = MagicMock()
+    with (
+        patch("raven_bus.db.init_db"),
+        patch("raven_bus.db.connection", return_value=_mock_connection(conn)),
+        patch("raven_bus.claims.claim_next", return_value=None),
+    ):
+        result = runner.invoke(
+            app, ["claim", "--channel", "run/r1/queue", "--as", "alice@r1"]
+        )
+    assert result.exit_code == 0
+    assert "(no message)" in result.stdout
+
+
+def test_claim_happy_path_with_message_json() -> None:
+    conn = MagicMock()
+    with (
+        patch("raven_bus.db.init_db"),
+        patch("raven_bus.db.connection", return_value=_mock_connection(conn)),
+        patch("raven_bus.claims.claim_next", return_value=_message()),
+    ):
+        result = runner.invoke(
+            app,
+            ["claim", "--channel", "run/r1/queue", "--as", "alice@r1", "-j"],
+        )
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["id"] == 1
+
+
 def test_claim_no_message_json() -> None:
     conn = MagicMock()
     with (
@@ -508,6 +556,35 @@ def test_tail_no_follow_all_channels_json() -> None:
     assert line["id"] == 1
 
 
+def test_tail_truncates_long_body_preview() -> None:
+    conn = MagicMock()
+    long_body = {"data": "x" * 100}
+    with (
+        patch("raven_bus.db.init_db"),
+        patch("raven_bus.db.connection", return_value=_mock_connection(conn)),
+        patch("raven_bus.log.read_after", return_value=[_message(body=long_body)]),
+        patch("raven_bus.channels.list_channels"),
+    ):
+        result = runner.invoke(
+            app, ["tail", "--channel", "run/r1/team", "--no-follow"]
+        )
+    assert result.exit_code == 0
+    assert "..." in result.stdout
+
+
+def test_tail_follow_sleeps_then_stops_on_ctrl_c() -> None:
+    conn = MagicMock()
+    with (
+        patch("raven_bus.db.init_db"),
+        patch("raven_bus.db.connection", return_value=_mock_connection(conn)),
+        patch("raven_bus.log.read_after", return_value=[]),
+        patch("raven_bus.channels.list_channels", return_value=[]),
+        patch("time.sleep", side_effect=KeyboardInterrupt),
+    ):
+        result = runner.invoke(app, ["tail"])
+    assert result.exit_code == 0
+
+
 # --------------------------------------------------------------------
 # channels
 # --------------------------------------------------------------------
@@ -633,3 +710,35 @@ def test_version() -> None:
     result = runner.invoke(app, ["version"])
     assert result.exit_code == 0
     assert "raven" in result.stdout
+
+
+def test_version_flag() -> None:
+    result = runner.invoke(app, ["--version"])
+    assert result.exit_code == 0
+    assert "raven" in result.stdout
+
+
+# --------------------------------------------------------------------
+# cli_main() — the console-script entry point's last-resort net
+# --------------------------------------------------------------------
+
+
+def test_cli_main_runs_app() -> None:
+    with patch("raven_bus.cli.main.app") as app_mock:
+        cli_main()
+    app_mock.assert_called_once_with()
+
+
+def test_cli_main_keyboard_interrupt_exits_130() -> None:
+    with patch("raven_bus.cli.main.app", side_effect=KeyboardInterrupt):
+        with pytest.raises(SystemExit) as excinfo:
+            cli_main()
+    assert excinfo.value.code == 130
+
+
+def test_cli_main_ravenbuserror_exits_error(capsys) -> None:
+    with patch("raven_bus.cli.main.app", side_effect=RavenBusError("boom")):
+        with pytest.raises(SystemExit) as excinfo:
+            cli_main()
+    assert excinfo.value.code == EXIT_ERROR
+    assert "error: boom" in capsys.readouterr().err

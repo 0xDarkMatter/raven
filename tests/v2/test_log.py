@@ -153,6 +153,11 @@ def test_append_without_ensure_requires_existing_channel(
         )
 
 
+def test_append_empty_channel_raises(conn: sqlite3.Connection) -> None:
+    with pytest.raises(InvalidAddressError):
+        log.append(conn, channel="", sender=SENDER, type="t", body={})
+
+
 def test_append_bad_sender_raises(conn: sqlite3.Connection) -> None:
     with pytest.raises(InvalidAddressError):
         log.append(conn, channel="c", sender="not-a-consumer-id", type="t", body={})
