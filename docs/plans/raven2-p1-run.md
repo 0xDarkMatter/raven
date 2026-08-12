@@ -42,15 +42,25 @@ lane's file.
 
 | Lane | Model | Owns (exclusive) | Delivers |
 |---|---|---|---|
-| `store` | sonnet | `db.py`, migration SQL, `tests/unit/test_db.py` | connection mgmt, WAL, init, opportunistic sweep (expiry + lease reap — ADR-001) |
-| `log` | sonnet | `channels.py`, `log.py`, `tests/unit/test_log.py` | channel CRUD by kind, append, list/tail reads (expires_at filtered — ADR-001) |
-| `cursors` | glm | `cursors.py`, `tests/unit/test_cursors.py` | broadcast read + cursor-jump ack (jump-only; no gap tracking) |
-| `claims` | codex | `claims.py`, `tests/unit/test_claims.py` | atomic claim, lease renew, requeue-on-expiry, dead-letter. DO NOT COMMIT (ADR-006 fleetflow rule — orchestrator commits) |
-| `cli` | sonnet | `cli/`, `tests/unit/test_cli.py` | `send read claim ack tail doctor teardown version` over the frozen interfaces |
-| `compat` | glm | `compat.py`, `tests/unit/test_compat.py` | v1 `BusClient(session_id, role)` on 2-consumer broadcast channels (ADR-004) |
+| `store` | sonnet | `src/raven_bus/db.py`, `tests/v2/test_db.py` | connection mgmt, WAL, init, opportunistic sweep (expiry + lease reap — ADR-001), teardown_run |
+| `log` | sonnet | `src/raven_bus/channels.py`, `src/raven_bus/log.py`, `tests/v2/test_log.py` | channel CRUD by kind, append, id-range reads (expires_at filtered — ADR-001) |
+| `cursors` | glm | `src/raven_bus/cursors.py`, `tests/v2/test_cursors.py` | broadcast read + cursor-jump ack (jump-only; no gap tracking) |
+| `claims` | codex | `src/raven_bus/claims.py`, `tests/v2/test_claims.py` | atomic claim, lease renew, requeue-on-expiry, dead-letter. DO NOT COMMIT (fleetflow ADR-006 — orchestrator commits). Sandbox has no venv/network: write code + tests, do NOT run them; `TESTS: not-run` is the expected FINAL REPLY value, the orchestrator runs the suite at collect |
+| `cli` | sonnet | `src/raven_bus/cli/`, `tests/v2/test_cli.py` | `send read ack claim done release tail channels doctor teardown version` over the frozen interfaces |
+| `compat` | glm | `src/raven_bus/compat.py`, `tests/v2/test_compat.py` | v1 `BusClient(session_id, role)` on compat broadcast channels (ADR-004) |
 
-File-disjointness holds: no two lanes share a path. `models.py`/stubs are
-frozen wave-0 artifacts; lanes import, never edit.
+File-disjointness holds: no two lanes share a path. `models.py` (including
+the implemented address-grammar helpers), `exceptions.py`, `paths.py`, the
+migration SQL, module stub signatures, and `tests/v2/conftest.py` are frozen
+wave-0 artifacts; lanes import, never edit. v2 tests live under `tests/v2/`
+so the live v1 suite (`tests/unit/`, `tests/integration/`) stays untouched
+until the `integrate` lane retires it.
+
+Lane environment (claude-family lanes): create a venv inside the lane —
+`uv venv .venv && uv pip install -e ".[dev,http]"` — then run only your own
+test file: `.venv/Scripts/python.exe -m pytest tests/v2/test_<module>.py -q`
+(or `.venv/bin/python` on POSIX paths). Full-suite 100% coverage is the
+`integrate` lane's gate, not yours.
 
 ## Wave 2 — verify + integrate (after wave-1 collect)
 

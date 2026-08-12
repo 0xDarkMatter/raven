@@ -43,11 +43,14 @@ Homepage = "https://github.com/0xDarkMatter/raven"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+# raven2-p1: both packages ship during the v2 build run; the integrate
+# lane removes claude_bus and flips coverage to raven_bus at land (ADR-004).
 [tool.hatch.build.targets.wheel]
-packages = ["src/claude_bus"]
+packages = ["src/claude_bus", "src/raven_bus"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "src/claude_bus/migrations/0001_initial.sql" = "claude_bus/migrations/0001_initial.sql"
+"src/raven_bus/migrations/0002_v2_schema.sql" = "raven_bus/migrations/0002_v2_schema.sql"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
