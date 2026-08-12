@@ -12,10 +12,48 @@ ADR-001 invariants enforced here:
 
 from __future__ import annotations
 
+import json
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from raven_bus.models import Message, Urgency
+from raven_bus import channels
+from raven_bus.exceptions import InvalidAddressError, UnknownMessageError
+from raven_bus.models import URGENCY_RANK, Message, Urgency, parse_consumer_id, validate_tags
+
+_SELECT = "SELECT * FROM messages"
+_NOW_SQL = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+
+
+def _format_ts(dt: datetime) -> str:
+    """UTC ISO-8601 with millisecond precision + 'Z', matching
+    ``strftime('%Y-%m-%dT%H:%M:%fZ','now')`` (sqlite's %f is SS.SSS)."""
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+
+
+def _row_to_message(row: sqlite3.Row, *, channel_name: str) -> Message:
+    tags_raw = row["tags"]
+    tags = [t for t in tags_raw.split(",") if t] if tags_raw else []
+    return Message(
+        id=row["id"],
+        channel=channel_name,
+        sender=row["sender"],
+        type=row["type"],
+        urgency=row["urgency"],
+        body=json.loads(row["body"]),
+        tags=tags,
+        reply_to=row["reply_to"],
+        thread_id=row["thread_id"],
+        expires_at=row["expires_at"],
+        created_at=row["created_at"],
+    )
+
+
+def _channel_name(conn: sqlite3.Connection, channel_id: int) -> str:
+    row = conn.execute(
+        "SELECT name FROM channels WHERE id = ?", (channel_id,)
+    ).fetchone()
+    return row["name"]
 
 
 def append(
@@ -43,7 +81,62 @@ def append(
       conversation rule.
     - body is JSON-serialised ``sort_keys=True, ensure_ascii=False``.
     """
-    raise NotImplementedError
+    role, run = parse_consumer_id(sender)
+    if urgency not in URGENCY_RANK:
+        raise InvalidAddressError(
+            f"urgency {urgency!r} must be one of {sorted(URGENCY_RANK)}"
+        )
+    clean_tags = validate_tags(tags)
+
+    conn.execute(
+        "INSERT INTO consumers (id, role, run, kind, last_seen_at) "
+        f"VALUES (?, ?, ?, 'agent', {_NOW_SQL}) "
+        "ON CONFLICT(id) DO UPDATE SET last_seen_at = excluded.last_seen_at",
+        (sender, role, run),
+    )
+
+    if ensure:
+        chan = channels.ensure_channel(conn, channel)
+    else:
+        chan = channels.get_channel(conn, channel)
+
+    resolved_thread_id = thread_id
+    if reply_to is not None and thread_id is None:
+        parent = conn.execute(
+            "SELECT id, thread_id FROM messages WHERE id = ?", (reply_to,)
+        ).fetchone()
+        if parent is not None:
+            resolved_thread_id = (
+                parent["thread_id"] if parent["thread_id"] is not None else parent["id"]
+            )
+
+    expires_at = None
+    if expires_in_s is not None:
+        expires_at = _format_ts(
+            datetime.now(UTC) + timedelta(seconds=expires_in_s)
+        )
+
+    body_json = json.dumps(body, sort_keys=True, ensure_ascii=False)
+    tags_str = ",".join(clean_tags)
+
+    cur = conn.execute(
+        "INSERT INTO messages "
+        "(channel_id, sender, type, urgency, body, tags, reply_to, thread_id, expires_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            chan.id,
+            sender,
+            type,
+            urgency,
+            body_json,
+            tags_str,
+            reply_to,
+            resolved_thread_id,
+            expires_at,
+        ),
+    )
+    row = conn.execute(f"{_SELECT} WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return _row_to_message(row, channel_name=chan.name)
 
 
 def read_after(
@@ -57,18 +150,45 @@ def read_after(
 ) -> list[Message]:
     """Messages in ``channel`` with id > after_id, id-ordered ascending.
     The tail/cursor read primitive. Filters expired unless asked."""
-    raise NotImplementedError
+    chan = channels.get_channel(conn, channel)
+    clauses = ["channel_id = ?", "id > ?"]
+    params: list[Any] = [chan.id, after_id]
+    if sender is not None:
+        clauses.append("sender = ?")
+        params.append(sender)
+    if not include_expired:
+        clauses.append(f"(expires_at IS NULL OR expires_at > {_NOW_SQL})")
+    params.append(limit)
+    rows = conn.execute(
+        f"{_SELECT} WHERE {' AND '.join(clauses)} ORDER BY id ASC LIMIT ?",
+        params,
+    ).fetchall()
+    return [_row_to_message(row, channel_name=chan.name) for row in rows]
 
 
 def read_by_id(conn: sqlite3.Connection, message_id: int) -> Message:
     """Fetch one message (no liveness filter — forensic read).
     Raises :class:`UnknownMessageError`."""
-    raise NotImplementedError
+    row = conn.execute(f"{_SELECT} WHERE id = ?", (message_id,)).fetchone()
+    if row is None:
+        raise UnknownMessageError(f"message {message_id!r} does not exist")
+    return _row_to_message(row, channel_name=_channel_name(conn, row["channel_id"]))
 
 
 def read_thread(conn: sqlite3.Connection, thread_id: int) -> list[Message]:
     """Thread root + all replies, oldest first (no liveness filter)."""
-    raise NotImplementedError
+    rows = conn.execute(
+        f"{_SELECT} WHERE id = ? OR thread_id = ? ORDER BY id ASC",
+        (thread_id, thread_id),
+    ).fetchall()
+    names: dict[int, str] = {}
+    messages = []
+    for row in rows:
+        cid = row["channel_id"]
+        if cid not in names:
+            names[cid] = _channel_name(conn, cid)
+        messages.append(_row_to_message(row, channel_name=names[cid]))
+    return messages
 
 
 __all__ = ["append", "read_after", "read_by_id", "read_thread"]
