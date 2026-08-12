@@ -31,6 +31,7 @@ import typer
 
 from raven_bus import __version__
 from raven_bus.cli import ack as ack_cmd
+from raven_bus.cli import acp as acp_cmd
 from raven_bus.cli import channels_cmd
 from raven_bus.cli import claim as claim_cmd
 from raven_bus.cli import doctor as doctor_cmd
@@ -76,6 +77,11 @@ app.command("teardown", help="Delete all data for a run.")(
     teardown_cmd.cmd_teardown
 )
 app.command("serve", help="Run the loopback HTTP bridge.")(serve_cmd.serve)
+app.command(
+    "acp",
+    help="Spawn an agent under the bus<->ACP harness.",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)(acp_cmd.acp)
 
 
 @app.command("version", help="Print raven version and exit.")

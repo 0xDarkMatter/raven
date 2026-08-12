@@ -27,12 +27,17 @@ return; undelivered/deferred messages stay pending for the next process
 from __future__ import annotations
 
 import subprocess
+import time
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict
 
-from raven_bus.adapters.acp.protocol import AcpClient
+from raven_bus import cursors, log, policy
+from raven_bus.adapters.acp.protocol import AcpClient, AcpError, PromptResult
+from raven_bus.db import connection as db_connection
+from raven_bus.models import Message, validate_channel_name
 
 
 class HarnessConfig(BaseModel):
@@ -66,12 +71,128 @@ def run_harness(
     0 = child exited cleanly / boundary cap reached, 10 = protocol
     error. ``client`` injection exists for tests; default constructs
     an AcpClient over ``child``."""
-    raise NotImplementedError
+    acp = client if client is not None else AcpClient(child)
+
+    try:
+        acp.initialize()
+        session_id = acp.new_session(cwd=config.cwd)
+    except AcpError:
+        return 10
+
+    boundary = 0
+    while True:
+        if child.poll() is not None:
+            return 0
+
+        pending = _gather_pending(config)
+        plan_ = policy.plan(pending, now=datetime.now(UTC), token_budget=config.token_budget)
+
+        if not plan_.interrupt and not plan_.batch and not plan_.digest_source:
+            time.sleep(config.poll_interval_s)
+            continue
+
+        boundary += 1
+        try:
+            _deliver(config, acp, session_id, plan_, boundary)
+        except AcpError:
+            return 10
+
+        if max_boundaries is not None and boundary >= max_boundaries:
+            return 0
+
+
+def _gather_pending(config: HarnessConfig) -> list[Message]:
+    """Pending messages across ``config.channels``, id-ascending merge."""
+    messages: list[Message] = []
+    with db_connection(config.db_path) as conn:
+        for channel in config.channels:
+            messages.extend(cursors.pending(conn, config.consumer, channel))
+    messages.sort(key=lambda m: m.id)
+    return messages
+
+
+def _deliver(
+    config: HarnessConfig,
+    acp: AcpClient,
+    session_id: str,
+    plan_: policy.InjectionPlan,
+    boundary: int,
+) -> None:
+    """Interrupts alone, first (one prompt each); then one prompt for
+    batch+digest if either is non-empty. Ack + reply-post happen after
+    each individual prompt succeeds — never before.
+
+    Every ack is capped at ``plan_.ack_up_to`` — the plan's own
+    id-ceiling that already stops before the first deferred message
+    (ADR-001 cursor-jump semantics: a single per-channel cursor can't
+    skip over an older, still-deferred message just because a newer
+    one on the same channel was delivered)."""
+    for msg in plan_.interrupt:
+        solo = policy.InjectionPlan(interrupt=[msg])
+        result = acp.prompt(session_id, policy.render(solo))
+        with db_connection(config.db_path) as conn:
+            _ack_covered(conn, config.consumer, [msg], plan_.ack_up_to)
+        _post_telemetry(config, result, boundary)
+
+    if plan_.batch or plan_.digest_source:
+        solo = policy.InjectionPlan(batch=plan_.batch, digest_source=plan_.digest_source)
+        result = acp.prompt(session_id, policy.render(solo))
+        with db_connection(config.db_path) as conn:
+            _ack_covered(
+                conn, config.consumer, list(plan_.batch) + list(plan_.digest_source), plan_.ack_up_to
+            )
+        _post_telemetry(config, result, boundary)
+
+
+def _ack_covered(
+    conn: object, consumer: str, messages: list[Message], ack_up_to: int
+) -> None:
+    """Ack each channel represented in ``messages`` up to the highest
+    covered id on that channel, never past ``ack_up_to`` (a message's
+    channel is on the Message; cursors are per-channel, so a
+    mixed-channel batch acks each once)."""
+    by_channel: dict[str, int] = {}
+    for msg in messages:
+        if msg.id > ack_up_to:
+            continue
+        by_channel[msg.channel] = max(by_channel.get(msg.channel, 0), msg.id)
+    for channel, up_to_id in by_channel.items():
+        cursors.ack(conn, consumer, channel, up_to_id)  # type: ignore[arg-type]
+
+
+def _post_telemetry(config: HarnessConfig, result: PromptResult, boundary: int) -> None:
+    """acp-reply (text + stop_reason) and an acp-activity heartbeat for
+    the session/update batch behind this prompt, on ``reply_channel``
+    (no-op when unset)."""
+    if config.reply_channel is None:
+        return
+    with db_connection(config.db_path) as conn:
+        log.append(
+            conn,
+            channel=config.reply_channel,
+            sender=config.consumer,
+            type="acp-reply",
+            urgency="fyi",
+            body={"text": result.text, "stop_reason": result.stop_reason, "boundary": boundary},
+        )
+        log.append(
+            conn,
+            channel=config.reply_channel,
+            sender=config.consumer,
+            type="acp-activity",
+            urgency="fyi",
+            body={"updates": len(result.raw_updates), "boundary": boundary},
+        )
 
 
 def parse_channels(raw: Sequence[str]) -> tuple[str, ...]:
     """Validate channel names (models grammar) for the CLI."""
-    raise NotImplementedError
+    channels = tuple(validate_channel_name(c) for c in raw)
+    if not channels:
+        from raven_bus.exceptions import InvalidAddressError
+
+        raise InvalidAddressError("at least one --channel is required")
+    return channels
 
 
 __all__ = ["HarnessConfig", "parse_channels", "run_harness"]
