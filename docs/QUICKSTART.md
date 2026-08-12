@@ -287,8 +287,9 @@ Use your raven tooling (or the CLI: raven read/ack) to act.
 
 **The hook never acks** — it only peeks, so it can run beside a `raven acp`
 harness on the same consumer (step 11) without double-delivery: the harness
-moves the cursor after each successful prompt; the hook just reads whatever is
-still pending. You act on a message yourself with `raven read` / `raven ack`.
+moves the cursor once per completed delivery boundary; the hook just reads
+whatever is still pending. You act on a message yourself with `raven read` /
+`raven ack`.
 
 ## See also
 

@@ -103,10 +103,13 @@ replaces v1's per-message delivery state with an append-only log + per-channel
   cancel`); agent-initiated requests are answered "method not found" (no fs/
   terminal capabilities granted). It spawns once, drives the loop, **exits when
   the child exits, never respawns** (lifecycle belongs to the spawner — design
-  §9 Q4). Delivery is **turn-boundary only**. **Acks follow the submit**: the
-  harness `cursors.ack`s only after a successful `session/prompt`, so a crash
-  between plan and prompt leaves the message pending for the next process.
-  Replies/telemetry post to `--reply-to` as `acp-reply`/`acp-activity`.
+  §9 Q4). Delivery is **turn-boundary only**. **Acks follow the completed
+  boundary**: the harness `cursors.ack`s once after every prompt of a
+  boundary succeeds (per-prompt acking could LOSE messages — adversarial
+  verify finding), so a crash mid-boundary redelivers at-least-once and
+  never drops. Replies/telemetry post to `--reply-to` as
+  `acp-reply`/`acp-activity` (which must not be a watched channel — the
+  config refuses the feedback loop).
 - **Claude Code PreToolUse hook** (`src/raven_bus/adapters/hooks/`) — a
   **peek-only** adapter for interactive sessions (ADR-006): on every tool call
   it reads pending, renders via `policy`, prints a compact block when anything
