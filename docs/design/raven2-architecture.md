@@ -239,7 +239,7 @@ Concrete touch-points in fleetflow (all additive, all optional per run):
 |---|---|---|
 | **P1 — core** ✅ shipped 2026-08-12 (run raven2-p1) | schema v2 (channels/cursors/claims+leases), Python API, CLI (`send/read/claim/ack/tail/doctor/teardown`), expiry actually working, v1-compat shim | the store; replaces v1 outright |
 | **P2 — ravend** ✅ shipped 2026-08-12 (run raven2-p2; ADR-005) | loopback HTTP read+write, SSE tail, `raven serve` (Process-Compose registration deferred until it first runs as a standing service); claim-frontier cursor for `claim_next` | polyglot + sandboxed participation |
-| **P3 — adapters** | `raven-acp` harness + Claude Code hook adapter; shared injection-policy module | mid-run steering; the attention layer |
+| **P3 — adapters** ✅ shipped 2026-08-12 (run raven2-p3; ADR-006) | `raven acp` harness + Claude Code hook adapter; shared injection-policy module (`raven_bus.policy`) | mid-run steering; the attention layer |
 | **P4 — fleetflow** | `ff-spawn --acp`, heartbeat switch, `ff-clean` teardown, dashboard SSE feed | the integration is real, measured on a live run |
 | **P5 — bridges** | raven↔Buzz relay | org tier without building a platform |
 
