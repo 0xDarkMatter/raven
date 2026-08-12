@@ -151,9 +151,13 @@ def claim_next(
     _upsert_consumer(conn, consumer)
     channel_id = _queue_channel_id(conn, channel)
 
-    lease_until = _lease_until(lease_s)
     after_id = 0
     while True:
+        # Lease deadline is computed per batch, not once up front: a
+        # short lease plus a slow scan over a large terminal backlog
+        # could otherwise write an already-expired lease_until
+        # (re-verify wave finding).
+        lease_until = _lease_until(lease_s)
         candidates = conn.execute(
             f"""
             SELECT m.id, ch.name, m.sender, m.type, m.urgency, m.body, m.tags,

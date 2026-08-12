@@ -136,7 +136,9 @@ def test_init_db_force_bypasses_cache(tmp_path: Path, monkeypatch) -> None:
 
     monkeypatch.setattr(bus_db.sqlite3, "connect", spy_connect)
     bus_db.init_db(target, force=True)
-    assert calls == ["connect"]
+    # force runs the version probe AND the schema apply — two connects,
+    # where the cached path makes none.
+    assert calls == ["connect", "connect"]
 
 
 def test_reset_init_cache_clears(tmp_path: Path) -> None:
@@ -516,3 +518,16 @@ def test_schema_current_probe_edges(tmp_path: Path, db: Path) -> None:
             (bus_db.SCHEMA_VERSION,),
         )
     assert bus_db._schema_current(db) is True
+
+
+def test_init_db_refuses_foreign_schema_version(db: Path) -> None:
+    """re-verify wave regression: a DB stamped by another schema version
+    must be refused, never re-stamped — CREATE IF NOT EXISTS would keep
+    the old tables while marking the file current."""
+    with bus_db.connection(db) as conn:
+        conn.execute("UPDATE bus_meta SET value = '1' WHERE key = 'schema_version'")
+    bus_db._reset_init_cache()
+    with pytest.raises(RuntimeError, match="schema version '1'"):
+        bus_db.init_db(db)
+    # The stamp must be untouched by the refusal.
+    assert bus_db._stored_schema_version(db) == "1"

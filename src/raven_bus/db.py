@@ -55,9 +55,20 @@ def init_db(db_path: str | Path | None = None, *, force: bool = False) -> Path:
     # actively writing raced into 'database is locked' at process
     # startup (finding verify-004). Only genuine first-creation runs
     # the script, and that residual race gets a bounded retry.
-    if not force and _schema_current(resolved):
+    stored = _stored_schema_version(resolved)
+    if not force and stored == SCHEMA_VERSION:
         _init_cache.add(resolved)
         return resolved
+    # A DB stamped with a DIFFERENT version must never be silently
+    # re-stamped: CREATE IF NOT EXISTS would leave the old tables in
+    # place while marking the file current (re-verify wave finding).
+    # v2 does not migrate foreign schemas — refuse loudly.
+    if stored is not None and stored != SCHEMA_VERSION:
+        raise RuntimeError(
+            f"{resolved} was created by schema version {stored!r}; this "
+            f"raven_bus expects version {SCHEMA_VERSION!r} and does not "
+            "migrate old files — point RAVEN_DB/db_path at a fresh path"
+        )
 
     schema_sql = _V2_MIGRATION.read_text(encoding="utf-8")
     last_error: sqlite3.OperationalError | None = None
@@ -91,14 +102,14 @@ def init_db(db_path: str | Path | None = None, *, force: bool = False) -> Path:
     )  # pragma: no cover -- loop always sets last_error before exhausting
 
 
-def _schema_current(resolved: Path) -> bool:
-    """True if ``resolved`` already carries the current schema version.
+def _stored_schema_version(resolved: Path) -> str | None:
+    """The schema version recorded in ``resolved``, or None.
 
     Read-only probe; never creates the file (sqlite3.connect would, so
     check existence first) and treats any error as "not initialised".
     """
     if not resolved.exists():
-        return False
+        return None
     try:
         conn = sqlite3.connect(str(resolved), timeout=DEFAULT_BUSY_TIMEOUT_S)
         try:
@@ -108,8 +119,13 @@ def _schema_current(resolved: Path) -> bool:
         finally:
             conn.close()
     except sqlite3.Error:
-        return False
-    return row is not None and str(row[0]) == SCHEMA_VERSION
+        return None
+    return None if row is None else str(row[0])
+
+
+def _schema_current(resolved: Path) -> bool:
+    """True if ``resolved`` already carries the current schema version."""
+    return _stored_schema_version(resolved) == SCHEMA_VERSION
 
 
 @contextmanager
