@@ -158,10 +158,11 @@ Three kinds, decided once at channel creation (`--kind`), immutable after
 
 The queue claim is v1's proven atomic-claim pattern relocated:
 `INSERT INTO claims … ON CONFLICT DO NOTHING` — rowcount 1 wins. A lapsed lease
-is reaped by the opportunistic `sweep`, making the message claimable again;
-once a claim's delivery count reaches `max_deliveries` the next sweep flips it
-to `dead` instead. This replaces v1's "crashed consumer = message stuck
-forever". (ADR-001.)
+is flipped to a durable `lapsed` state by the opportunistic `sweep` (the
+attempt count survives requeue); a lapsed message is re-won by a guarded
+`UPDATE` that increments `deliveries`, and at `max_deliveries` the sweep flips
+the claim to `dead` instead. This replaces v1's "crashed consumer = message
+stuck forever". (ADR-001.)
 
 ## v1→v2 migration
 

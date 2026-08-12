@@ -25,9 +25,10 @@ replaces v1's per-message delivery state with an append-only log + per-channel
   after `max_deliveries`), `stream` (observe-only, ring retention, tail-only).
   Kind is decided at creation and immutable after.
 - **Lease-backed queues.** Claim is `INSERT … ON CONFLICT DO NOTHING`
-  (rowcount 1 wins); a lapsed lease is reaped by the opportunistic `sweep`,
-  making the message claimable again, with `deliveries` incremented — replacing
-  v1's "crashed consumer = message stuck forever".
+  (rowcount 1 wins); a lapsed lease is flipped to a durable `lapsed` state by
+  the opportunistic `sweep` and re-won by a guarded `UPDATE` that increments
+  `deliveries` — attempt counts survive requeue, dead-letter fires reliably at
+  `max_deliveries`, replacing v1's "crashed consumer = message stuck forever".
 - **Full-string `<role>@<run>` addressing**; path-style channel names
   (`run/<run>/control`, `run/<run>/queue`, …); one host DB
   (`~/.raven/bus.db`, override `RAVEN_DB`); `raven teardown --run` is a

@@ -83,10 +83,13 @@ Treat each as a build-breaker if violated. The decision text owns the *why*.
 - **Channel kind is immutable.** Re-ensuring a channel with a different `kind`
   raises `WrongChannelKindError`. Cursor ops require `broadcast`; claim ops
   require `queue`.
-- **Lease bookkeeping lives in `claims`, never `messages`.** A lapsed lease is
-  reaped by `sweep` (message becomes claimable again); at `max_deliveries` it
-  flips to `dead`. `claim_next` snapshots lapsed counts before sweeping so a
-  re-claim increments `deliveries`; a voluntary `release` does not count.
+- **Lease bookkeeping lives in `claims`, never `messages`.** `sweep` flips a
+  lapsed lease to state `lapsed` (the row and its `deliveries` count are kept
+  DURABLY — never deleted); at `max_deliveries` it flips to `dead` instead.
+  `claim_next` re-wins a lapsed row via a guarded `UPDATE … WHERE
+  state='lapsed'` that increments `deliveries` atomically — there is no
+  caller-side snapshot, so any sweep call site is harmless to dead-letter
+  accounting. A voluntary `release` deletes the row and does not count.
 
 ## Testing patterns
 

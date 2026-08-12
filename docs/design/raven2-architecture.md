@@ -238,7 +238,7 @@ Concrete touch-points in fleetflow (all additive, all optional per run):
 | Phase | Ships | Proves |
 |---|---|---|
 | **P1 — core** | schema v2 (channels/cursors/claims+leases), Python API, CLI (`send/read/claim/ack/tail/doctor/teardown`), expiry actually working, v1-compat shim | the store; replaces v1 outright |
-| **P2 — ravend** | loopback HTTP read+write, SSE tail, Process-Compose registration | polyglot + sandboxed participation |
+| **P2 — ravend** | loopback HTTP read+write, SSE tail, Process-Compose registration; claim-frontier cursor for `claim_next` (P1 waiver: candidate search walks the terminal-claim backlog — fine at P1 scale, measured concern past ~10^5 terminal claims per channel) | polyglot + sandboxed participation |
 | **P3 — adapters** | `raven-acp` harness + Claude Code hook adapter; shared injection-policy module | mid-run steering; the attention layer |
 | **P4 — fleetflow** | `ff-spawn --acp`, heartbeat switch, `ff-clean` teardown, dashboard SSE feed | the integration is real, measured on a live run |
 | **P5 — bridges** | raven↔Buzz relay | org tier without building a platform |
