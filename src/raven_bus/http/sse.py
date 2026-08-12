@@ -26,6 +26,8 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 
+from anyio import to_thread
+
 from raven_bus import channels, db, log
 from raven_bus.http.app import Request, Response, map_exception
 
@@ -39,6 +41,13 @@ except ImportError as exc:  # pragma: no cover -- app.py provides the same guard
 POLL_INTERVAL_S = 0.25
 PING_INTERVAL_S = 15.0
 
+# Bounds (opus verify round): an `after` beyond int64 aborted MID-STREAM
+# (headers already sent — no envelope possible), and a burst larger than
+# one read_after batch stranded the remainder because delivery was gated
+# on data_version CHANGING — hence the drain loop in _collect_batch.
+_MAX_SQLITE_INT = 2**63 - 1
+_READ_BATCH = 100
+
 
 async def tail(request: Request) -> Response:
     """GET /tail?channel=&after=0 → StreamingResponse(text/event-stream).
@@ -49,11 +58,13 @@ async def tail(request: Request) -> Response:
     raw_after = request.query_params.get("after", "0")
     try:
         after = int(raw_after)
-        if after < 0:
-            raise ValueError("after must be greater than or equal to 0")
+        if not 0 <= after <= _MAX_SQLITE_INT:
+            raise ValueError(
+                f"after must be between 0 and {_MAX_SQLITE_INT}"
+            )
     except ValueError:
         detail = (
-            "after must be greater than or equal to 0"
+            f"after must be between 0 and {_MAX_SQLITE_INT}"
             if raw_after.lstrip("-").isdigit()
             else "after must be an integer"
         )
@@ -81,33 +92,45 @@ async def _events(
     last_version: int | None = None
     idle_s = 0.0
 
+    def _collect_batch(conn) -> list:
+        """Blocking read pass (runs in a worker thread): DRAINS each
+        channel — read_after loops until a short batch, so a burst
+        larger than one batch committed in a single txn cannot strand
+        messages behind an unchanged data_version (verify finding)."""
+        if channel is None:
+            # Deliberately O(channels) per changed poll: the HTTP bridge
+            # composes public store contracts instead of adding log APIs.
+            names = [item.name for item in channels.list_channels(conn)]
+        else:
+            names = [channel]
+
+        collected = []
+        for name in names:
+            while True:
+                channel_after = last_ids.setdefault(name, after)
+                batch = log.read_after(
+                    conn, name, channel_after,
+                    limit=_READ_BATCH, include_expired=True,
+                )
+                collected.extend(batch)
+                if batch:
+                    last_ids[name] = batch[-1].id
+                if len(batch) < _READ_BATCH:
+                    break
+        return sorted(collected, key=lambda item: item.id)
+
     try:
-        with db.connection(db_path) as conn:
+        # cross_thread: the connection lives on this task but every
+        # blocking call runs via to_thread; calls are awaited serially,
+        # so no two threads ever touch it at once (db.connection docs).
+        with db.connection(db_path, cross_thread=True) as conn:
             while not await request.is_disconnected():
-                version = db.data_version(conn)
+                version = await to_thread.run_sync(db.data_version, conn)
                 if last_version is None or version != last_version:
                     last_version = version
-                    if channel is None:
-                        # Deliberately O(channels) per changed poll: the HTTP bridge
-                        # composes public store contracts instead of adding log APIs.
-                        names = [item.name for item in channels.list_channels(conn)]
-                    else:
-                        names = [channel]
+                    messages = await to_thread.run_sync(_collect_batch, conn)
 
-                    messages = []
-                    for name in names:
-                        channel_after = last_ids.setdefault(name, after)
-                        messages.extend(
-                            log.read_after(
-                                conn,
-                                name,
-                                channel_after,
-                                include_expired=True,
-                            )
-                        )
-
-                    for message in sorted(messages, key=lambda item: item.id):
-                        last_ids[message.channel] = message.id
+                    for message in messages:
                         payload = json.dumps(
                             message.model_dump(mode="json"),
                             ensure_ascii=False,

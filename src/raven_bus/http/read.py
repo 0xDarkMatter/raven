@@ -17,19 +17,31 @@ way down (read_after / get_cursor / list_channels are).
 from __future__ import annotations
 
 from raven_bus import __version__, channels, cursors, db, log
-from raven_bus.http.app import JSONResponse, Request, Response, map_exception
+from raven_bus.http.app import JSONResponse, Request, Response, map_exception, run_db
 
 _TRUE = {"true", "1"}
 _FALSE = {"false", "0"}
 
+# Bounds for caller-supplied query ints (opus verify round): SQLite
+# treats LIMIT -1 as "no limit" (a GET could dump a whole channel), and
+# an `after` beyond int64 aborts mid-stream with OverflowError.
+MAX_LIMIT = 1000
+MAX_SQLITE_INT = 2**63 - 1
 
-def _query_int(request: Request, key: str, default: int) -> int:
-    """Parse query param ``key`` as int (``default`` when absent/empty).
-    A present-but-non-int value raises ValueError (→ 400 envelope)."""
+
+def _query_int(
+    request: Request, key: str, default: int, *,
+    minimum: int = 0, maximum: int = MAX_SQLITE_INT,
+) -> int:
+    """Parse query param ``key`` as a bounded int (``default`` when
+    absent/empty). Non-int or out-of-range → ValueError (→ 400)."""
     raw = request.query_params.get(key)
     if raw is None or raw == "":
         return default
-    return int(raw)  # ValueError propagates → map_exception → 400
+    value = int(raw)  # ValueError propagates → map_exception → 400
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{key!r} must be between {minimum} and {maximum}")
+    return value
 
 
 def _query_bool(request: Request, key: str, default: bool) -> bool:
@@ -62,7 +74,7 @@ async def health(request: Request) -> Response:
     exception to write-free reads, mirroring `raven doctor`; document in
     the response if the DB was just created is NOT required)."""
     try:
-        db.init_db(request.app.state.db_path)
+        await run_db(lambda: db.init_db(request.app.state.db_path))
         return JSONResponse(
             {
                 "status": "ok",
@@ -80,9 +92,13 @@ async def list_channels(request: Request) -> Response:
     mode='json'). Unknown prefix simply yields an empty list."""
     try:
         prefix = request.query_params.get("prefix") or None
-        with db.connection(request.app.state.db_path) as conn:
-            found = channels.list_channels(conn, prefix=prefix)
-        return JSONResponse({"channels": [c.model_dump(mode="json") for c in found]})
+
+        def work() -> list[dict]:
+            with db.connection(request.app.state.db_path) as conn:
+                found = channels.list_channels(conn, prefix=prefix)
+            return [c.model_dump(mode="json") for c in found]
+
+        return JSONResponse({"channels": await run_db(work)})
     except Exception as exc:  # noqa: BLE001 -- ADR-005: every failure → map_exception
         return map_exception(exc)
 
@@ -95,11 +111,17 @@ async def messages(request: Request) -> Response:
     try:
         name = request.path_params["name"]
         after = _query_int(request, "after", 0)
-        limit = _query_int(request, "limit", 100)
+        limit = _query_int(request, "limit", 100, minimum=1, maximum=MAX_LIMIT)
         include_expired = _query_bool(request, "include_expired", False)
-        with db.connection(request.app.state.db_path) as conn:
-            msgs = log.read_after(conn, name, after, limit=limit, include_expired=include_expired)
-        return JSONResponse({"messages": [m.model_dump(mode="json") for m in msgs]})
+
+        def work() -> list[dict]:
+            with db.connection(request.app.state.db_path) as conn:
+                msgs = log.read_after(
+                    conn, name, after, limit=limit, include_expired=include_expired
+                )
+            return [m.model_dump(mode="json") for m in msgs]
+
+        return JSONResponse({"messages": await run_db(work)})
     except Exception as exc:  # noqa: BLE001 -- ADR-005: every failure → map_exception
         return map_exception(exc)
 
@@ -111,10 +133,14 @@ async def pending(request: Request) -> Response:
     try:
         name = request.path_params["name"]
         consumer = _required_query(request, "consumer")
-        limit = _query_int(request, "limit", 100)
-        with db.connection(request.app.state.db_path) as conn:
-            msgs = cursors.pending(conn, consumer, name, limit=limit)
-        return JSONResponse({"messages": [m.model_dump(mode="json") for m in msgs]})
+        limit = _query_int(request, "limit", 100, minimum=1, maximum=MAX_LIMIT)
+
+        def work() -> list[dict]:
+            with db.connection(request.app.state.db_path) as conn:
+                msgs = cursors.pending(conn, consumer, name, limit=limit)
+            return [m.model_dump(mode="json") for m in msgs]
+
+        return JSONResponse({"messages": await run_db(work)})
     except Exception as exc:  # noqa: BLE001 -- ADR-005: every failure → map_exception
         return map_exception(exc)
 
@@ -125,9 +151,13 @@ async def cursor(request: Request) -> Response:
     try:
         name = request.path_params["name"]
         consumer = _required_query(request, "consumer")
-        with db.connection(request.app.state.db_path) as conn:
-            cur = cursors.get_cursor(conn, consumer, name)
-        return JSONResponse(cur.model_dump(mode="json") if cur is not None else None)
+
+        def work() -> dict | None:
+            with db.connection(request.app.state.db_path) as conn:
+                cur = cursors.get_cursor(conn, consumer, name)
+            return cur.model_dump(mode="json") if cur is not None else None
+
+        return JSONResponse(await run_db(work))
     except Exception as exc:  # noqa: BLE001 -- ADR-005: every failure → map_exception
         return map_exception(exc)
 

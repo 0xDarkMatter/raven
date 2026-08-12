@@ -132,3 +132,122 @@ def test_all_lost_round_advances_frontier_then_returns_none(db: Path) -> None:
     finally:
         racing.close()
         claims_mod._FRONTIER.clear()
+
+
+# --------------------------------------------------------------------------- #
+# Bridge hardening (opus refute-http round) — each test encodes a finding.
+# --------------------------------------------------------------------------- #
+
+
+def test_router_errors_wear_the_envelope(client: TestClient) -> None:
+    unknown = client.get("/nope")
+    assert unknown.status_code == 404
+    assert unknown.json()["error"] == "not_found"
+
+    wrong_method = client.get("/send")
+    assert wrong_method.status_code == 405
+    assert wrong_method.json()["error"] == "method_not_allowed"
+
+
+def test_claim_rejects_unknown_keys(client: TestClient, db: Path) -> None:
+    """The leases_s typo silently applied a default lease before —
+    every POST body is now strict, not just /send."""
+    resp = client.post(
+        "/claim",
+        json={"channel": "run/g/q", "consumer": "r@g", "leases_s": 3600},
+    )
+    assert resp.status_code == 400
+    assert "unknown field" in resp.json()["detail"]
+
+
+@pytest.mark.parametrize("lease", ["x", None, True, 10**30, 0, -5])
+def test_claim_rejects_bad_lease(client: TestClient, lease) -> None:
+    resp = client.post(
+        "/claim", json={"channel": "run/g/q", "consumer": "r@g", "lease_s": lease}
+    )
+    assert resp.status_code == 400
+
+
+def test_ack_rejects_null_up_to_id(client: TestClient) -> None:
+    resp = client.post(
+        "/ack", json={"channel": "run/g/a", "consumer": "r@g", "up_to_id": None}
+    )
+    assert resp.status_code == 400
+
+
+def test_send_rejects_string_tags(client: TestClient) -> None:
+    """A bare string used to be iterated character-wise into tags."""
+    resp = client.post(
+        "/send",
+        json={
+            "channel": "run/g/t", "sender": "r@g", "type": "t",
+            "body": {}, "tags": "abc",
+        },
+    )
+    assert resp.status_code == 400
+    assert "list of strings" in resp.json()["detail"]
+
+
+def test_messages_rejects_negative_limit(client: TestClient, db: Path) -> None:
+    """SQLite treats LIMIT -1 as unlimited — a GET could dump a channel."""
+    with bus_db.connection(db) as conn:
+        log.append(conn, channel="run/g/lim", sender="w@g", type="t", body={})
+    resp = client.get("/channels/run%2Fg%2Flim/messages?limit=-1")
+    assert resp.status_code == 400
+
+
+def test_sse_burst_larger_than_one_batch_fully_drains(db: Path) -> None:
+    """250 messages committed in ONE transaction stranded everything
+    past 100 (delivery was gated on data_version changing again)."""
+    import threading
+    import time as time_mod
+
+    import httpx
+    import uvicorn
+
+
+    with bus_db.connection(db) as conn:
+        for n in range(250):
+            log.append(
+                conn, channel="run/g/burst", sender="w@g", type="t",
+                body={"n": n},
+            )
+    # ONE commit for all 250 (connection context commits on exit).
+
+    app = http_app.create_app(db)
+    config = uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning")
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time_mod.time() + 10.0
+    while not server.started:
+        assert time_mod.time() < deadline, "uvicorn did not start"
+        time_mod.sleep(0.02)
+    port = server.servers[0].sockets[0].getsockname()[1]
+
+    seen = 0
+    try:
+        with (
+            httpx.Client(timeout=httpx.Timeout(10.0)) as http,
+            http.stream(
+                "GET", f"http://127.0.0.1:{port}/tail?channel=run/g/burst"
+            ) as response,
+        ):
+            for line in response.iter_lines():
+                if line.startswith("event: message"):
+                    seen += 1
+                    if seen == 250:
+                        break
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5.0)
+    assert seen == 250
+
+
+def test_send_rejects_non_object_body_field(client: TestClient) -> None:
+    resp = client.post(
+        "/send",
+        json={"channel": "run/g/b", "sender": "r@g", "type": "t", "body": [1, 2]},
+    )
+    assert resp.status_code == 400
+    assert "must be a JSON object" in resp.json()["detail"]

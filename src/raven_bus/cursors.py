@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import sqlite3
 
-from raven_bus import channels, db, log
+from raven_bus import channels, consumers, db, log
 from raven_bus.exceptions import WrongChannelKindError
 from raven_bus.models import Channel, Cursor, Message, parse_consumer_id
 
@@ -35,24 +35,6 @@ def _require_broadcast(conn: sqlite3.Connection, channel: str) -> Channel:
             f"cursor ops require a 'broadcast' channel; {channel!r} is kind={ch.kind!r}"
         )
     return ch
-
-
-def _upsert_consumer(conn: sqlite3.Connection, consumer: str, role: str, run: str) -> None:
-    """Register ``consumer`` and bump ``last_seen_at`` (idempotent).
-
-    WHY: ADR-002 — the consumer id is the full validated string; the
-    role/run atoms are parsed once upstream and reused here. On conflict
-    we touch only ``last_seen_at`` — role/run/kind are immutable facts
-    about an existing consumer, not per-read state.
-    """
-    conn.execute(
-        f"""
-        INSERT INTO consumers (id, role, run, last_seen_at)
-        VALUES (?, ?, ?, {_TS_NOW})
-        ON CONFLICT(id) DO UPDATE SET last_seen_at = {_TS_NOW}
-        """,
-        (consumer, role, run),
-    )
 
 
 def _last_ack_id(conn: sqlite3.Connection, consumer: str, channel_id: int) -> int:
@@ -100,10 +82,10 @@ def pending(
     db.sweep(conn)
 
     # ADR-002: validate the full <role>@<run> string via the frozen helper.
-    role, run = parse_consumer_id(consumer)
+    parse_consumer_id(consumer)  # early ADR-002 validation; touch() re-parses cheaply
 
     ch = _require_broadcast(conn, channel)
-    _upsert_consumer(conn, consumer, role, run)
+    consumers.touch(conn, consumer)
 
     # WHY read_after over a hand-rolled query: it is the canonical
     # expiry-filtering, id-ascending read (log lane contract). Reading
@@ -121,9 +103,9 @@ def ack(
     """Advance the cursor to ``max(current, up_to_id)`` (monotonic —
     acking backwards is a no-op, never an error). Returns the resulting
     cursor. Creates the cursor row if absent."""
-    role, run = parse_consumer_id(consumer)
+    parse_consumer_id(consumer)  # early ADR-002 validation; touch() re-parses cheaply
     ch = _require_broadcast(conn, channel)
-    _upsert_consumer(conn, consumer, role, run)
+    consumers.touch(conn, consumer)
 
     # WHY a single UPSERT with MAX + a guarded updated_at: it is atomic
     # monotonic advancement with no read/modify/write race. The CASE

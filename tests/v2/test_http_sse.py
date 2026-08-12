@@ -130,7 +130,16 @@ def test_negative_after_is_400_before_stream(client: TestClient) -> None:
     response = client.get("/tail?after=-1")
 
     assert response.status_code == 400
-    assert response.json()["detail"] == "after must be greater than or equal to 0"
+    assert response.json()["detail"].startswith("after must be between 0 and")
+
+
+def test_oversized_after_is_400_before_stream(client: TestClient) -> None:
+    # Beyond int64 previously crashed MID-STREAM after 200 + headers
+    # (opus verify finding) — must now fail before streaming.
+    response = client.get(f"/tail?after={2**64}")
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "bad_request"
 
 
 def test_unknown_channel_is_404_before_stream(client: TestClient) -> None:
@@ -296,12 +305,28 @@ def test_serve_db_preflight_failure_is_one_line_error(
     run.assert_not_called()
 
 
-def test_serve_warns_for_non_loopback_host(
+def test_serve_refuses_non_loopback_host_without_optin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # ADR-005's no-auth posture must not be defeatable by one flag
+    # (opus verify finding): non-loopback binds need --yes-expose.
+    _, _, _, run = _mock_serve_runtime(monkeypatch)
+
+    result = runner.invoke(cli_app, ["serve", "--host", "example.test"])
+
+    assert result.exit_code == 2
+    assert "refusing to bind non-loopback host" in result.output
+    run.assert_not_called()
+
+
+def test_serve_warns_for_non_loopback_host_with_optin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _mock_serve_runtime(monkeypatch)
 
-    result = runner.invoke(cli_app, ["serve", "--host", "example.test"])
+    result = runner.invoke(
+        cli_app, ["serve", "--host", "example.test", "--yes-expose"]
+    )
 
     assert result.exit_code == 0
     assert "warning:" in result.output

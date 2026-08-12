@@ -129,15 +129,24 @@ def _schema_current(resolved: Path) -> bool:
 
 
 @contextmanager
-def connection(db_path: str | Path | None = None) -> Iterator[sqlite3.Connection]:
+def connection(
+    db_path: str | Path | None = None, *, cross_thread: bool = False
+) -> Iterator[sqlite3.Connection]:
     """Short-lived connection: WAL + foreign_keys pragmas, Row factory,
     commit on clean exit, rollback + re-raise on exception, always
-    closed. DEFERRED isolation."""
+    closed. DEFERRED isolation.
+
+    ``cross_thread=True`` disables sqlite3's same-thread check for
+    callers that hold the connection on one task but run each blocking
+    call in a worker thread (ravend's SSE tail). The CALLER must
+    guarantee no two threads use it concurrently — awaiting each call
+    before the next satisfies that."""
     resolved = resolve_db_path(db_path)
     conn = sqlite3.connect(
         str(resolved),
         timeout=DEFAULT_BUSY_TIMEOUT_S,
         isolation_level="DEFERRED",
+        check_same_thread=not cross_thread,
     )
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode = WAL")

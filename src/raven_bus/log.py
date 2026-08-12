@@ -17,7 +17,7 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from raven_bus import channels
+from raven_bus import channels, consumers
 from raven_bus.exceptions import InvalidAddressError, UnknownMessageError
 from raven_bus.models import URGENCY_RANK, Message, Urgency, parse_consumer_id, validate_tags
 
@@ -81,19 +81,14 @@ def append(
       conversation rule.
     - body is JSON-serialised ``sort_keys=True, ensure_ascii=False``.
     """
-    role, run = parse_consumer_id(sender)
+    parse_consumer_id(sender)  # early ADR-002 validation
     if urgency not in URGENCY_RANK:
         raise InvalidAddressError(
             f"urgency {urgency!r} must be one of {sorted(URGENCY_RANK)}"
         )
     clean_tags = validate_tags(tags)
 
-    conn.execute(
-        "INSERT INTO consumers (id, role, run, kind, last_seen_at) "
-        f"VALUES (?, ?, ?, 'agent', {_NOW_SQL}) "
-        "ON CONFLICT(id) DO UPDATE SET last_seen_at = excluded.last_seen_at",
-        (sender, role, run),
-    )
+    consumers.touch(conn, sender)
 
     if ensure:
         chan = channels.ensure_channel(conn, channel)

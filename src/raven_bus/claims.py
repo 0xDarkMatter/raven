@@ -11,9 +11,9 @@ claims row. A lapsed claim is re-won atomically by
 WHERE message_id=? AND state='lapsed'`` (rowcount 1 wins); a
 never-claimed message by the INSERT above. There is no caller-side
 snapshot, so any sweep call site (cursors, doctor, other channels) is
-harmless to dead-letter accounting. A voluntary ``release`` deletes the
-row, deliberately forgetting attempts — cooperative hand-back is not a
-failure signal.
+harmless to dead-letter accounting. A voluntary ``release`` flips the
+row to lapsed with deliveries=0 (never delete: a deleted row becomes a
+never-claimed candidate below every process's frontier — see release()).
 
 Every public operation invokes ``db.sweep`` before observing actionable
 claim state. Valid only on ``queue`` channels
@@ -54,13 +54,13 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from raven_bus import db
+from raven_bus import consumers, db
 from raven_bus.exceptions import (
     ClaimDeniedError,
     UnknownChannelError,
     WrongChannelKindError,
 )
-from raven_bus.models import Claim, Message, parse_consumer_id, validate_channel_name
+from raven_bus.models import Claim, Message, validate_channel_name
 
 DEFAULT_LEASE_S = 300
 
@@ -115,21 +115,6 @@ _FRESH_CANDIDATES_SQL = f"""
     ORDER BY m.id
     LIMIT {_CANDIDATE_BATCH}
 """
-
-
-def _upsert_consumer(conn: sqlite3.Connection, consumer: str) -> None:
-    role, run = parse_consumer_id(consumer)
-    conn.execute(
-        f"""
-        INSERT INTO consumers(id, role, run, last_seen_at)
-        VALUES (?, ?, ?, {_NOW_SQL})
-        ON CONFLICT(id) DO UPDATE SET
-            role = excluded.role,
-            run = excluded.run,
-            last_seen_at = excluded.last_seen_at
-        """,
-        (consumer, role, run),
-    )
 
 
 def _queue_channel_id(conn: sqlite3.Connection, channel: str) -> int:
@@ -275,7 +260,7 @@ def claim_next(
     write lock (finding verify-002), and a warm frontier skips it
     entirely on repeat calls."""
     db.sweep(conn)
-    _upsert_consumer(conn, consumer)
+    consumers.touch(conn, consumer)
     channel_id = _queue_channel_id(conn, channel)
     frontier_key = (_frontier_db_key(conn), channel_id)
 
@@ -353,7 +338,7 @@ def renew(
     consumer, or not in state 'leased' (a lapsed-and-reaped lease is
     indistinguishable from never-claimed — by design)."""
     db.sweep(conn)
-    _upsert_consumer(conn, consumer)
+    consumers.touch(conn, consumer)
     cursor = conn.execute(
         """
         UPDATE claims
@@ -376,7 +361,7 @@ def complete(conn: sqlite3.Connection, message_id: int, consumer: str) -> Claim:
     rules as :func:`renew`. Idempotent for the same consumer: completing
     an already-'done' claim you own returns it unchanged."""
     db.sweep(conn)
-    _upsert_consumer(conn, consumer)
+    consumers.touch(conn, consumer)
     cursor = conn.execute(
         f"""
         UPDATE claims
@@ -409,7 +394,7 @@ def release(conn: sqlite3.Connection, message_id: int, consumer: str) -> None:
     repair can help OTHER processes). As 'lapsed' it travels the lapsed
     scan, which ignores the frontier by design, in every process."""
     db.sweep(conn)
-    _upsert_consumer(conn, consumer)
+    consumers.touch(conn, consumer)
     cursor = conn.execute(
         f"""
         UPDATE claims

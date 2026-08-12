@@ -12,7 +12,9 @@ from pathlib import Path
 from typing import Any
 
 try:
+    from anyio import to_thread
     from starlette.applications import Starlette
+    from starlette.exceptions import HTTPException
     from starlette.requests import Request
     from starlette.responses import JSONResponse, Response
     from starlette.routing import Route
@@ -57,6 +59,26 @@ def map_exception(exc: Exception) -> JSONResponse:
     raise exc
 
 
+async def run_db(fn):
+    """Run a blocking store closure in a worker thread.
+
+    Every handler's sqlite3 work goes through this: blocking I/O
+    directly in an async handler serializes the WHOLE process behind
+    one busy-timeout (a held write lock froze /channels for 5.46s in
+    the verify round — including SSE streams)."""
+    return await to_thread.run_sync(fn)
+
+
+async def _http_exception(request: Request, exc: HTTPException) -> JSONResponse:
+    """Router-level errors (404 no-route, 405 method) wear the same
+    envelope as handler errors — plain-text bodies from the router were
+    a verify finding."""
+    code = "not_found" if exc.status_code == 404 else "error"
+    if exc.status_code == 405:
+        code = "method_not_allowed"
+    return error_response(code, exc.detail or "", exc.status_code)
+
+
 def create_app(db_path: str | Path | None = None) -> Starlette:
     """Build the ravend app bound to ``db_path``. Pure function — the
     resolved path is captured in ``app.state.db_path``; handlers read it
@@ -67,6 +89,7 @@ def create_app(db_path: str | Path | None = None) -> Starlette:
     resolved = resolve_db_path(db_path)
     app = Starlette(
         debug=False,
+        exception_handlers={HTTPException: _http_exception},
         routes=[
             Route("/health", read.health, methods=["GET"]),
             Route("/channels", read.list_channels, methods=["GET"]),
@@ -109,4 +132,5 @@ __all__ = [
     "error_response",
     "map_exception",
     "read_json_body",
+    "run_db",
 ]
