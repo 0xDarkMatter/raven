@@ -55,12 +55,22 @@ src/raven_bus/
 ├── cursors.py    broadcast: pending() + ack() (cursor-jump only) + get_cursor()
 ├── claims.py     queue: claim_next / renew / complete / release / get_claim
 ├── compat.py     v1 BusClient shim on the v2 store (deprecated, one release)
+├── policy.py     THE attention layer (ADR-003/006) — plan() + render(); pure,
+│                 deterministic, NO I/O and NO clock reads (now + budget are inputs).
+│                 The ONLY composer of injection text; adapters call these two and
+│                 shuttle bytes, never building framing themselves.
 ├── http/         ravend — optional loopback HTTP bridge (the `[http]` extra; ADR-005)
 │                 app.py = frozen route table + error envelope + exception→status map;
 │                 read.py / write.py / sse.py = the 1:1 handlers; cli/serve.py runs it
+├── adapters/     deliver bus messages INTO a running agent session (ADR-006 — THIN):
+│   ├── acp/      protocol.py = minimal ACP client (JSON-RPC 2.0 over the child's
+│   │             stdio: initialize/session/new/session/prompt/session/update/cancel);
+│   │             harness.py = the dumb-pipe loop (gather pending → plan → deliver → ack-after)
+│   └── hooks/    Claude Code PreToolUse hook: peek.py (runnable as a module) +
+│                 raven-inbox-hook.sh (trivial exec wrapper). PEEK-ONLY — never acks.
 ├── migrations/0002_v2_schema.sql
 └── cli/          Typer `raven`: send read ack claim done release tail
-                  channels doctor teardown version serve  (_common.py = exit codes + error map)
+                  channels doctor teardown version serve acp  (_common.py = exit codes + error map)
 ```
 
 Six tables: `channels`, `messages`, `cursors`, `claims`, `consumers`, `bus_meta`.
@@ -121,6 +131,40 @@ frozen in `http/app.py`'s route table (= ADR-005's endpoint table).
   go. A real socket close does. Streaming tests therefore spin up a real uvicorn
   on an ephemeral loopback port (per-test daemon thread); see
   `tests/v2/test_http_sse.py`'s module docstring.
+
+## Landmines — adapters (ADR-003/006 — the P3 attention layer)
+
+`policy` + two thin adapters. Same rule shape as the store landmines: the
+decision text owns the *why*; treat each as a build-breaker.
+
+- **Only `policy.render` composes injection text.** An adapter that builds its
+  own framing — even a header line — is a **defect**. The sender-attributed data
+  frame IS the prompt-injection defense (ADR-003); two implementations drift.
+  Adapters call `policy.plan` then `policy.render` and print/submit the result.
+- **`policy` stays pure: no clock reads, no I/O, no randomness.** `now` and the
+  token budget are *inputs* to `plan` (`datetime` is passed in; the harness
+  passes `datetime.now(UTC)`, the hook the same). A `datetime.now()` or file
+  read inside `policy.py` is a build-breaker — the functions must stay
+  deterministic for identical inputs (it's how they're tested).
+- **The hook must NEVER ack.** It only peeks (`cursors.pending`, which advances
+  nothing) and renders. `cursors.ack` appears nowhere in `adapters/hooks/`. This
+  is what lets a hook run *beside* a harness on the same consumer without
+  double-delivery — only the harness moves the cursor (ADR-006).
+- **The harness acks ONLY after a successful `session/prompt`.** `_deliver`
+  submits first, then `cursors.ack`. If the child dies (ACP EOF) before the
+  submit completes, the loop returns and the message stays pending for the next
+  process/boundary — an undelivered message must never be acked. Every ack is
+  also capped at `plan.ack_up_to`, which stops before the first deferred id
+  (cursor-jump can't skip an older still-deferred message — ADR-001).
+- **The harness is a dumb pipe: no respawn.** `run_harness` exits when the child
+  exits or ACP errors; lifecycle (spawn/reap/restart) belongs to the spawner
+  (design §9 Q4 — ff-spawn's journal). Two owners of respawn = orphan factories.
+- **Subprocess-driven hook tests are invisible to coverage.** The hook's real
+  path runs in a child process (`python -m …peek`), so `--cov` never sees it.
+  Exercise the logic through its **in-process twins**: import `peek`/`policy`
+  and call `peek()` / `policy.plan`/`render` directly in the same process
+  (see `tests/v2/test_hook.py`, `tests/v2/test_policy.py`). A line only hit by
+  a subprocess call reads as uncovered and fails the 100% gate.
 
 ## Testing patterns
 
@@ -183,6 +227,9 @@ raven doctor    [--db P]
 raven teardown  --run RUN [--yes]
 raven version
 raven serve    [--host 127.0.0.1] [--port 7713] [--db P]   (run ravend under uvicorn; `[http]` extra)
+raven acp      --as R@RUN --channel C [--channel C]... [--reply-to C]
+               [--db P] [--poll-interval S] [--budget N] [--cwd .] -- <agent cmd...>
+                                                            (dumb-pipe ACP harness; ADR-006)
 ```
 
 Exit codes (`cli/_common.py`): `0` ok / `2` usage / `3` not-found / `10` error.
@@ -190,9 +237,10 @@ Failures render as one-line `error: …`; tracebacks never reach users. Consumer
 ids are `<role>@<run>`; channels are path-style; atoms are lowercase
 `[a-z0-9][a-z0-9._-]*` (ADR-002).
 
-## Out of scope (P3+, see the design doc)
+## Out of scope (P4+, see the design doc)
 
-`raven-acp` + hook adapters / injection policy (P3, ADR-003 — *not built*;
-injection lives in adapters, never the store), fleetflow wiring (P4), Buzz
-bridge (P5). See
+P3 shipped: `raven acp` + the Claude Code hook share `raven_bus.policy`
+(ADR-003/006 — injection lives in adapters, never the store; see the
+[adapters landmines](#landmines--adapters-adr-003006--the-p3-attention-layer)).
+Still out: fleetflow wiring (P4), Buzz bridge (P5). See
 [docs/design/raven2-architecture.md §8](docs/design/raven2-architecture.md#8-phasing).
