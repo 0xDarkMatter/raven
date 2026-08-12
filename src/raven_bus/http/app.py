@@ -94,7 +94,9 @@ async def read_json_body(request: Request) -> dict[str, Any]:
     except Exception as exc:
         raise ValueError(f"request body is not valid JSON: {exc}") from exc
     if not isinstance(body, dict):
-        raise ValueError("request body must be a JSON object")
+        # ValueError, not TypeError: map_exception routes ValueError to the
+        # 400 envelope — a TypeError would surface as a 500.
+        raise ValueError("request body must be a JSON object")  # noqa: TRY004
     return body
 
 

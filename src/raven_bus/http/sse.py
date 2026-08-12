@@ -22,7 +22,22 @@ generator exit cleanly (no error envelope mid-stream).
 
 from __future__ import annotations
 
-from raven_bus.http.app import Request, Response
+import asyncio
+import json
+from collections.abc import AsyncIterator
+
+from raven_bus import channels, db, log
+from raven_bus.http.app import Request, Response, map_exception
+
+try:
+    from starlette.responses import StreamingResponse
+except ImportError as exc:  # pragma: no cover -- app.py provides the same guard
+    raise ImportError(
+        "raven_bus.http requires the [http] extra: pip install -e '.[http]'"
+    ) from exc
+
+POLL_INTERVAL_S = 0.25
+PING_INTERVAL_S = 15.0
 
 
 async def tail(request: Request) -> Response:
@@ -30,7 +45,88 @@ async def tail(request: Request) -> Response:
 
     Bad `after` → 400 envelope (before the stream starts); unknown
     channel → 404 before streaming."""
-    raise NotImplementedError
+    channel = request.query_params.get("channel") or None
+    raw_after = request.query_params.get("after", "0")
+    try:
+        after = int(raw_after)
+        if after < 0:
+            raise ValueError("after must be greater than or equal to 0")
+    except ValueError:
+        detail = (
+            "after must be greater than or equal to 0"
+            if raw_after.lstrip("-").isdigit()
+            else "after must be an integer"
+        )
+        return map_exception(ValueError(detail))
+
+    db_path = request.app.state.db_path
+    if channel is not None:
+        try:
+            with db.connection(db_path) as conn:
+                channels.get_channel(conn, channel)
+        except Exception as exc:  # noqa: BLE001 -- ADR-005: every failure routes through map_exception
+            return map_exception(exc)
+
+    return StreamingResponse(
+        _events(request, db_path=db_path, channel=channel, after=after),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
-__all__ = ["tail"]
+async def _events(
+    request: Request, *, db_path, channel: str | None, after: int
+) -> AsyncIterator[str]:
+    last_ids: dict[str, int] = {} if channel is None else {channel: after}
+    last_version: int | None = None
+    idle_s = 0.0
+
+    try:
+        with db.connection(db_path) as conn:
+            while not await request.is_disconnected():
+                version = db.data_version(conn)
+                if last_version is None or version != last_version:
+                    last_version = version
+                    if channel is None:
+                        # Deliberately O(channels) per changed poll: the HTTP bridge
+                        # composes public store contracts instead of adding log APIs.
+                        names = [item.name for item in channels.list_channels(conn)]
+                    else:
+                        names = [channel]
+
+                    messages = []
+                    for name in names:
+                        channel_after = last_ids.setdefault(name, after)
+                        messages.extend(
+                            log.read_after(
+                                conn,
+                                name,
+                                channel_after,
+                                include_expired=True,
+                            )
+                        )
+
+                    for message in sorted(messages, key=lambda item: item.id):
+                        last_ids[message.channel] = message.id
+                        payload = json.dumps(
+                            message.model_dump(mode="json"),
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                        yield (
+                            f"event: message\n"
+                            f"id: {message.id}\n"
+                            f"data: {payload}\n\n"
+                        )
+                        idle_s = 0.0
+
+                await asyncio.sleep(POLL_INTERVAL_S)
+                idle_s += POLL_INTERVAL_S
+                if idle_s >= PING_INTERVAL_S:
+                    yield ": ping\n\n"
+                    idle_s = 0.0
+    except asyncio.CancelledError:
+        return
+
+
+__all__ = ["PING_INTERVAL_S", "POLL_INTERVAL_S", "tail"]
