@@ -27,7 +27,7 @@ from typing import Callable
 
 from pydantic import BaseModel, Field
 
-from claude_bus import BusClient, Message, SchemaRegistry
+from raven_bus.compat import BusClient, Message, SchemaRegistry
 
 # ----- session + addresses -------------------------------------------
 

@@ -32,7 +32,7 @@ from dataclasses import dataclass
 
 from pydantic import BaseModel, Field
 
-from claude_bus import BusClient, Message, SchemaRegistry
+from raven_bus.compat import BusClient, Message, SchemaRegistry
 from server import PRESCRIPTION, FlakyServer
 
 # ----- session + addresses -------------------------------------------
