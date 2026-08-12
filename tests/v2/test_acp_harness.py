@@ -102,6 +102,11 @@ def _never_dies() -> FakeChild:
     return FakeChild([None])
 
 
+def _dies_after(polls: int) -> FakeChild:
+    """Alive for ``polls`` poll() calls, then exited-0."""
+    return FakeChild([None] * polls + [0])
+
+
 def _config(**overrides) -> HarnessConfig:
     fields = {
         "consumer": CONSUMER,
@@ -201,10 +206,19 @@ def test_batch_and_digest_deliver_as_one_prompt(db: Path, monkeypatch: pytest.Mo
     assert cur.last_ack_id == d2.id
 
 
-def test_ack_only_after_successful_prompt(db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_ack_only_after_full_boundary_succeeds(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Two blocking messages; the double raises on the second prompt.
-    The first message's ack must have landed; the second must not —
-    it stays pending for the next process."""
+    NOTHING may be acked — the boundary did not complete, so both stay
+    pending and the next process redelivers (at-least-once).
+
+    History: this test originally pinned per-prompt acking (first
+    message acked before the second was attempted). The opus verify
+    round proved that shape LOSES messages — an interrupt's ack at
+    ack_up_to could cover lower-id batch messages a failed batch prompt
+    never delivered — so the contract moved to one ack per completed
+    boundary."""
     with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
         msg_a = _append(conn, urgency="blocking")
         msg_b = _append(conn, urgency="blocking")
@@ -227,9 +241,8 @@ def test_ack_only_after_successful_prompt(db: Path, monkeypatch: pytest.MonkeyPa
         cur = cursors.get_cursor(conn, CONSUMER, CHANNEL)
         still_pending = cursors.pending(conn, CONSUMER, CHANNEL)
 
-    assert cur is not None
-    assert cur.last_ack_id == msg_a.id
-    assert [m.id for m in still_pending] == [msg_b.id]
+    assert cur is None  # no ack landed — the boundary never completed
+    assert [m.id for m in still_pending] == [msg_a.id, msg_b.id]
 
 
 def test_deferred_fyi_never_acked_and_blocks_later_ack(
@@ -462,3 +475,42 @@ def test_cli_rejects_bad_consumer_id(db: Path) -> None:
         ["acp", "--as", "not valid", "--channel", CHANNEL, "--db", str(db), "--", "echo"],
     )
     assert result.exit_code == 2
+
+
+def test_reply_channel_must_not_be_watched() -> None:
+    """Feedback-loop guard (opus verify finding): telemetry posted to a
+    watched channel would be digested back into the agent."""
+    with pytest.raises(ValueError, match="telemetry back"):
+        HarnessConfig(
+            consumer=CONSUMER,
+            channels=(CHANNEL,),
+            reply_channel=CHANNEL,
+        )
+
+
+def test_delivered_watermark_prevents_redelivery_storm(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deferred fyi pins ack_up_to below a delivered blocking message;
+    the session must NOT redeliver the blocking message every tick
+    (opus verify finding: full-CPU byte-identical prompt storm)."""
+    with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+        msg_fyi = _append(conn, urgency="fyi")
+        msg_block = _append(conn, urgency="blocking")
+
+    # Real policy: fyi deferred (below thresholds) pins ack to fyi.id-1;
+    # blocking delivers. Second boundary must find nothing deliverable.
+    client = FakeAcpClient()
+    client.next_results = [
+        PromptResult(stop_reason="end_turn", text="ok", raw_updates=[]),
+    ]
+    config = _config(db_path=db, poll_interval_s=0.01)
+    code = run_harness(config, _dies_after(3), client=client, max_boundaries=5)
+
+    assert code == 0
+    delivered_ids = [p for p in client.prompts]
+    # exactly ONE delivery of the blocking message, not one per tick
+    assert len(delivered_ids) == 1
+    with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+        still = cursors.pending(conn, CONSUMER, CHANNEL)
+    assert [m.id for m in still] == [msg_fyi.id, msg_block.id]

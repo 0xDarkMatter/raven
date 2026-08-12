@@ -437,3 +437,45 @@ def test_injection_plan_defaults():
     assert p.digest_source == []
     assert p.deferred == []
     assert p.ack_up_to == 0
+
+
+# --------------------------------------------------------------------------- #
+# Opus verify-round fixes (raven2-p3): escape valves and caps.
+# --------------------------------------------------------------------------- #
+def test_oversized_single_prompt_is_rescued_not_starved():
+    """A lone prompt message bigger than the whole budget delivers
+    anyway (oldest first) — permanent head-of-line starvation was the
+    verify finding; the budget is a guardrail, not an invoice."""
+    big_a = _msg(1, body={"x": "a" * 3000})
+    big_b = _msg(2, body={"x": "b" * 3000})
+    result = plan([big_a, big_b], now=_EPOCH, token_budget=100)
+    assert [m.id for m in result.batch] == [1]
+    assert [m.id for m in result.deferred] == [2]
+    assert result.ack_up_to == 1
+
+
+def test_digest_is_budget_capped():
+    """The digest sheds newest fyi back to deferred until the combined
+    render fits — it was unbounded (verify finding)."""
+    msgs = [
+        _msg(i, urgency="fyi", body={"note": "n" * 60}, created_at=_EPOCH)
+        for i in range(1, 41)
+    ]
+    now = _EPOCH + timedelta(seconds=100_000)
+    result = plan(msgs, now=now, token_budget=300)
+    assert result.digest_source  # digest still triggered (age)
+    assert result.deferred       # but capped — some fyi pushed back
+    rendered = render(result)
+    assert estimate_tokens(rendered) <= 300
+
+
+def test_body_render_is_truncated():
+    """An unbudgeted interrupt cannot dump an arbitrarily large body
+    (verify finding): per-message render truncation bounds it."""
+    from raven_bus.policy import MAX_BODY_RENDER_CHARS
+
+    huge = _msg(1, urgency="blocking", body={"x": "y" * (MAX_BODY_RENDER_CHARS * 3)})
+    result = plan([huge], now=_EPOCH)
+    rendered = render(result)
+    assert "[body truncated:" in rendered
+    assert len(rendered) < MAX_BODY_RENDER_CHARS * 2

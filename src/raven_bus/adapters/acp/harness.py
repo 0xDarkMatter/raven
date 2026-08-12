@@ -32,7 +32,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 from raven_bus import cursors, log, policy
 from raven_bus.adapters.acp.protocol import AcpClient, AcpError, PromptResult
@@ -50,13 +50,26 @@ class HarnessConfig(BaseModel):
     """Broadcast channels to watch (pending+ack per ADR-001)."""
 
     reply_channel: str | None = None
-    """Where agent output/telemetry is posted (None = no posting)."""
+    """Where agent output/telemetry is posted (None = no posting).
+    MUST NOT be one of ``channels`` — the harness would digest its own
+    acp-reply/acp-activity messages back into the agent (feedback
+    loop; verify finding). Enforced below."""
 
     db_path: Path | None = None
     poll_interval_s: float = 1.0
     token_budget: int = 2000
     cwd: str = "."
     """cwd passed to session/new (the agent's working directory)."""
+
+    @model_validator(mode="after")
+    def _no_reply_feedback_loop(self) -> HarnessConfig:
+        if self.reply_channel is not None and self.reply_channel in self.channels:
+            raise ValueError(
+                f"reply_channel {self.reply_channel!r} is also a watched "
+                "channel — the harness would inject its own telemetry back "
+                "into the agent"
+            )
+        return self
 
 
 def run_harness(
@@ -79,12 +92,24 @@ def run_harness(
     except AcpError:
         return 10
 
+    # In-memory delivered watermark per channel: a message delivered this
+    # SESSION but not (yet) coverable by the cursor (a lower-id deferred
+    # fyi pins ack_up_to) must not be re-planned every tick — that was a
+    # full-CPU byte-identical redelivery storm (verify finding). Crash
+    # semantics unchanged: the dict dies with the process, the cursor is
+    # the durable truth, redelivery after a crash is at-least-once.
+    delivered_watermark: dict[str, int] = {}
+
     boundary = 0
     while True:
         if child.poll() is not None:
             return 0
 
-        pending = _gather_pending(config)
+        pending = [
+            m
+            for m in _gather_pending(config)
+            if m.id > delivered_watermark.get(m.channel, 0)
+        ]
         plan_ = policy.plan(pending, now=datetime.now(UTC), token_budget=config.token_budget)
 
         if not plan_.interrupt and not plan_.batch and not plan_.digest_source:
@@ -93,7 +118,7 @@ def run_harness(
 
         boundary += 1
         try:
-            _deliver(config, acp, session_id, plan_, boundary)
+            _deliver(config, acp, session_id, plan_, boundary, delivered_watermark)
         except AcpError:
             return 10
 
@@ -117,31 +142,39 @@ def _deliver(
     session_id: str,
     plan_: policy.InjectionPlan,
     boundary: int,
+    delivered_watermark: dict[str, int],
 ) -> None:
     """Interrupts alone, first (one prompt each); then one prompt for
-    batch+digest if either is non-empty. Ack + reply-post happen after
-    each individual prompt succeeds — never before.
+    batch+digest if either is non-empty.
 
-    Every ack is capped at ``plan_.ack_up_to`` — the plan's own
-    id-ceiling that already stops before the first deferred message
-    (ADR-001 cursor-jump semantics: a single per-channel cursor can't
-    skip over an older, still-deferred message just because a newer
-    one on the same channel was delivered)."""
+    The cursor ack happens ONCE, after EVERY prompt of the boundary has
+    succeeded, capped at ``plan_.ack_up_to``. Per-prompt acking looked
+    crash-safer but caused MESSAGE LOSS (verify finding): an interrupt's
+    ack at ack_up_to could cover lower-id batch messages the failed
+    batch prompt never delivered. A crash mid-boundary now redelivers
+    already-prompted interrupts — at-least-once, the survivable
+    failure mode. The delivered watermark advances even where the
+    cursor cannot (deferred fyi pinning ack_up_to), so this session
+    never re-delivers what it already injected."""
     for msg in plan_.interrupt:
         solo = policy.InjectionPlan(interrupt=[msg])
         result = acp.prompt(session_id, policy.render(solo))
-        with db_connection(config.db_path) as conn:
-            _ack_covered(conn, config.consumer, [msg], plan_.ack_up_to)
         _post_telemetry(config, result, boundary)
 
     if plan_.batch or plan_.digest_source:
         solo = policy.InjectionPlan(batch=plan_.batch, digest_source=plan_.digest_source)
         result = acp.prompt(session_id, policy.render(solo))
-        with db_connection(config.db_path) as conn:
-            _ack_covered(
-                conn, config.consumer, list(plan_.batch) + list(plan_.digest_source), plan_.ack_up_to
-            )
         _post_telemetry(config, result, boundary)
+
+    delivered = (
+        list(plan_.interrupt) + list(plan_.batch) + list(plan_.digest_source)
+    )
+    with db_connection(config.db_path) as conn:
+        _ack_covered(conn, config.consumer, delivered, plan_.ack_up_to)
+    for msg in delivered:
+        delivered_watermark[msg.channel] = max(
+            delivered_watermark.get(msg.channel, 0), msg.id
+        )
 
 
 def _ack_covered(
@@ -186,8 +219,14 @@ def _post_telemetry(config: HarnessConfig, result: PromptResult, boundary: int) 
 
 
 def parse_channels(raw: Sequence[str]) -> tuple[str, ...]:
-    """Validate channel names (models grammar) for the CLI."""
-    channels = tuple(validate_channel_name(c) for c in raw)
+    """Validate channel names (models grammar) for the CLI; dedupe
+    preserving first-seen order (a repeated --channel would double-
+    deliver every message and halve digest thresholds — verify
+    finding)."""
+    seen: dict[str, None] = {}
+    for c in raw:
+        seen.setdefault(validate_channel_name(c), None)
+    channels = tuple(seen)
     if not channels:
         from raven_bus.exceptions import InvalidAddressError
 

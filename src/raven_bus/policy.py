@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from collections.abc import Sequence
 from datetime import datetime
 
@@ -40,6 +41,8 @@ DEFAULT_DIGEST_MIN_COUNT = 5
 DEFAULT_DIGEST_MAX_AGE_S = 300.0
 
 _DIGEST_PREVIEW_MAX_CHARS = 80
+
+_TYPE_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]")
 
 
 def estimate_tokens(text: str) -> int:
@@ -110,12 +113,27 @@ def plan(
     batch = list(prompt_msgs)
     deferred_prompt: list[Message] = []
 
-    def _fits(candidate_batch: list[Message]) -> bool:
-        probe = InjectionPlan(batch=candidate_batch, digest_source=digest_source)
+    def _fits(candidate_batch: list[Message], candidate_digest: list[Message]) -> bool:
+        probe = InjectionPlan(batch=candidate_batch, digest_source=candidate_digest)
         return estimate_tokens(render(probe)) <= token_budget
 
-    while batch and not _fits(batch):
+    while batch and not _fits(batch, digest_source):
         deferred_prompt.append(batch.pop())
+
+    # Oversized-single escape valve (verify finding): a lone prompt
+    # message whose OWN render exceeds the budget would otherwise defer
+    # forever and head-of-line-block the whole tier via the ack clamp.
+    # Deliver the oldest one anyway — the budget is a guardrail, not an
+    # invoice, and per-message render truncation bounds the worst case.
+    if not batch and deferred_prompt:
+        rescue = min(deferred_prompt, key=lambda m: m.id)
+        deferred_prompt.remove(rescue)
+        batch = [rescue]
+
+    # Digest is budget-capped too (verify finding: it was unbounded):
+    # shed newest fyi back to deferred until the combined render fits.
+    while digest_source and not _fits(batch, digest_source):
+        deferred_fyi.append(digest_source.pop())
 
     deferred = sorted(deferred_fyi + deferred_prompt, key=lambda m: m.id)
 
@@ -179,8 +197,26 @@ def _sanitize_line(text: str) -> str:
     return _neutralize(text)
 
 
+MAX_BODY_RENDER_CHARS = 8000
+"""Per-message body-render cap: bounds the worst case of an unbudgeted
+interrupt (urgency is sender-chosen — an 80KB blocking body must not be
+able to dump ~20K tokens into a session; verify finding). Truncation
+happens BEFORE neutralization so a cut can never expose a
+reconstructable marker fragment."""
+
+
+def _truncated_body_json(message: Message) -> str:
+    body_json = json.dumps(message.body, sort_keys=True, ensure_ascii=False)
+    if len(body_json) > MAX_BODY_RENDER_CHARS:
+        omitted = len(body_json) - MAX_BODY_RENDER_CHARS
+        body_json = (
+            body_json[:MAX_BODY_RENDER_CHARS]
+            + f" …[body truncated: {omitted} chars omitted; read id {message.id} via the bus]"
+        )
+    return _neutralize(body_json)
+
+
 def _render_message(message: Message) -> str:
-    body_json = _neutralize(json.dumps(message.body, sort_keys=True, ensure_ascii=False))
     lines = [
         _MSG_OPEN,
         f"id: {message.id}",
@@ -188,7 +224,7 @@ def _render_message(message: Message) -> str:
         f"type: {_sanitize_line(message.type)}",
         f"urgency: {message.urgency}",
         _BODY_OPEN,
-        body_json,
+        _truncated_body_json(message),
         _BODY_CLOSE,
         _MSG_CLOSE,
     ]
@@ -240,7 +276,12 @@ def render_digest_line(message: Message) -> str:
         preview = preview[: _DIGEST_PREVIEW_MAX_CHARS - 1] + "…"
     preview = _neutralize(preview)
     sender = _sanitize_line(message.sender)
-    msg_type = _sanitize_line(message.type)
+    # type is FREE TEXT (the store does not grammar-validate it), and the
+    # digest line's structure is positional — a crafted type could forge
+    # a second, fully attributed entry on the same line (verify finding).
+    # Allowlist it down to identifier characters; sender needs no such
+    # filter (ADR-002 grammar already excludes brackets/parens/spaces).
+    msg_type = _TYPE_SAFE_RE.sub("_", message.type)[:32]
     return f"[{message.id}] {sender} ({msg_type}): {preview}"
 
 
