@@ -294,3 +294,61 @@ def test_empty_queue_polls_stay_flat_once_frontier_is_warm(raw_db: Path) -> None
     # toward the cold, whole-backlog scan cost.
     assert abs(first_warm - second_warm) < max(first_warm, second_warm) * 0.5
     conn.close()
+
+
+def test_released_message_below_frontier_is_reclaimable(raw_db: Path) -> None:
+    """raven2-p2 refute-frontier regression, finding 1 (the release
+    hide): append m1/m2, claim both, advance the frontier past them,
+    release m1 — m1 must still be claimable by ANY consumer/process
+    (it travels the lapsed scan, which ignores the frontier)."""
+    conn = _connect(raw_db)
+    channel_id = _insert_channel(conn)
+    m1 = _insert_message(conn, channel_id)
+    m2 = _insert_message(conn, channel_id)
+    conn.commit()
+
+    assert claim_next(conn, "a@r", QUEUE).id == m1
+    assert claim_next(conn, "a@r", QUEUE).id == m2
+    # A poll on the drained queue advances the frontier past both ids.
+    assert claim_next(conn, "a@r", QUEUE) is None
+
+    claims.release(conn, m1, "a@r")
+    reclaimed = claim_next(conn, "b@r", QUEUE)
+    assert reclaimed is not None and reclaimed.id == m1
+    # Voluntary release never counts toward dead-letter: fresh count.
+    row = conn.execute(
+        "SELECT deliveries FROM claims WHERE message_id = ?", (m1,)
+    ).fetchone()
+    assert row["deliveries"] == 1
+    conn.close()
+
+
+def test_frontier_goes_cold_when_db_file_is_replaced(tmp_path: Path) -> None:
+    """raven2-p2 refute-frontier regression, finding 2: a warm frontier
+    must not survive the FILE being replaced at the same path — the
+    cache key carries (st_dev, st_ino), so a new file is a new key."""
+    from raven_bus import db as bus_db
+
+    target = tmp_path / "swap.db"
+
+    def _fresh_db_with_one_message() -> None:
+        bus_db._reset_init_cache()
+        bus_db.init_db(target, force=True)
+        conn = _connect(target)
+        channel_id = _insert_channel(conn)
+        _insert_message(conn, channel_id)
+        conn.commit()
+        conn.close()
+
+    _fresh_db_with_one_message()
+    conn = _connect(target)
+    assert claim_next(conn, "a@r", QUEUE) is not None
+    assert claim_next(conn, "a@r", QUEUE) is None  # frontier warms
+    conn.close()
+
+    target.unlink()  # replace the file wholesale at the same path
+    _fresh_db_with_one_message()
+    conn = _connect(target)
+    # Stale frontier would hide message id 1 in the NEW file.
+    assert claim_next(conn, "b@r", QUEUE) is not None
+    conn.close()

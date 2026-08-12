@@ -383,8 +383,14 @@ def test_release_happy_path(client: TestClient, db: Path) -> None:
     assert resp.content == b""
 
     conn = _raw(db)
-    row = conn.execute("SELECT * FROM claims WHERE message_id = ?", (mid,)).fetchone()
-    assert row is None
+    row = conn.execute(
+        "SELECT state, deliveries FROM claims WHERE message_id = ?", (mid,)
+    ).fetchone()
+    # Release flips to lapsed/0 rather than deleting: a deleted row became
+    # a never-claimed candidate below every process's claim frontier and
+    # was permanently hidden (raven2-p2 refute-frontier finding).
+    assert row is not None
+    assert (row["state"], row["deliveries"]) == ("lapsed", 0)
     conn.close()
 
 

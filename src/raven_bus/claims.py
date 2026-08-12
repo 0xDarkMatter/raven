@@ -49,6 +49,7 @@ being populated.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -201,13 +202,24 @@ def _denied(message_id: int, consumer: str) -> ClaimDeniedError:
 
 
 def _frontier_db_key(conn: sqlite3.Connection) -> str:
-    """Identify the attached DB file for the ``_FRONTIER`` cache key.
+    """Identify the attached DB FILE (not just its path) for the
+    ``_FRONTIER`` cache key.
 
-    ``PRAGMA database_list`` reflects the same read snapshot as any
-    other statement on this connection -- cheap (single row) and
-    avoids threading db_path through every caller."""
+    ``PRAGMA database_list`` yields the path; the (st_dev, st_ino)
+    stamp is appended so a REPLACED file at the same path (teardown +
+    re-init in tests, or an operator swapping the DB) gets a cold
+    frontier instead of inheriting the dead file's watermark — a stale
+    watermark over a fresh file hides every message in it
+    (raven2-p2 refute-frontier finding). Stat failure degrades to the
+    bare path: worst case is the original staleness only on filesystems
+    that cannot identify files, never a crash."""
     row = conn.execute("PRAGMA database_list").fetchone()
-    return "" if row is None else str(row[2])
+    path = "" if row is None else str(row[2])
+    try:
+        stat = os.stat(path)
+        return f"{path}|{stat.st_dev}:{stat.st_ino}"
+    except OSError:
+        return path
 
 
 def _maybe_advance_frontier(
@@ -384,16 +396,24 @@ def complete(conn: sqlite3.Connection, message_id: int, consumer: str) -> Claim:
 
 
 def release(conn: sqlite3.Connection, message_id: int, consumer: str) -> None:
-    """Voluntarily give a leased message back: deletes the claim row so
-    the message is immediately claimable. The next claim starts fresh at
-    deliveries=1 — deliberate: voluntary release is cooperative, not a
-    failure signal, so it never counts toward dead-lettering. Same
-    denial rules as :func:`renew`."""
+    """Voluntarily give a leased message back: flips the claim row to
+    'lapsed' with ``deliveries=0``, so the message is immediately
+    re-claimable and the next claim starts at deliveries=1 — voluntary
+    release is cooperative, not a failure signal, so it never counts
+    toward dead-lettering. Same denial rules as :func:`renew`.
+
+    WHY flip-not-delete (raven2-p2 refute-frontier finding): deleting
+    the row turned the message back into a NEVER-CLAIMED candidate at
+    an old id — below every process's claim frontier, hence permanently
+    invisible to frontier-bounded fresh scans (and no in-process cache
+    repair can help OTHER processes). As 'lapsed' it travels the lapsed
+    scan, which ignores the frontier by design, in every process."""
     db.sweep(conn)
     _upsert_consumer(conn, consumer)
     cursor = conn.execute(
-        """
-        DELETE FROM claims
+        f"""
+        UPDATE claims
+        SET state = 'lapsed', deliveries = 0, updated_at = {_NOW_SQL}
         WHERE message_id = ? AND consumer = ? AND state = 'leased'
         """,
         (message_id, consumer),
