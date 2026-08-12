@@ -62,31 +62,43 @@ def test_two_consumers_split_five_tasks_with_no_double_delivery(tmp_path: Path) 
         assert producer.returncode == 0, producer.stderr
         assert producer.stdout.count("[producer] sent") == 5
 
-        # Poll the DB until all 5 tasks are completed (or a safety-fuse deadline).
-        deadline = time.time() + 5.0
+        # Poll the DB until all 5 tasks are completed (or a safety-fuse
+        # deadline). The fuse is generous: two consumer processes + this
+        # poller all share one WAL file, and on Windows a claimant can sit
+        # out several seconds behind the 5s busy timeout — a tight fuse
+        # here flaked ~1 in 4 runs at wave-2 gating. Each poll connection
+        # is explicitly closed so the reader never lingers as a lock peer.
+        deadline = time.time() + 15.0
         done = 0
         while time.time() < deadline:
-            with sqlite3.connect(db) as conn:
+            conn = sqlite3.connect(db, timeout=5.0)
+            try:
                 done = conn.execute(
                     "SELECT count(*) FROM claims WHERE state = 'done'"
                 ).fetchone()[0]
+            finally:
+                conn.close()
             if done >= 5:
                 break
             time.sleep(0.05)
     finally:
         outputs = []
+        errs = []
         for c in consumers:
             c.terminate()
             try:
-                stdout, _ = c.communicate(timeout=2.0)
+                stdout, stderr = c.communicate(timeout=2.0)
             except subprocess.TimeoutExpired:
                 c.kill()
-                stdout, _ = c.communicate()
+                stdout, stderr = c.communicate()
             outputs.append(stdout)
+            errs.append(stderr)
 
     assert done == 5, (
-        f"expected 5 completed claims, got {done}. Consumer output:\n"
+        f"expected 5 completed claims, got {done}. Consumer stdout:\n"
         + "\n---\n".join(outputs)
+        + "\nConsumer stderr:\n"
+        + "\n---\n".join(errs)
     )
 
     claimed_ids_by_consumer = [

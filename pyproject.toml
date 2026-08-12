@@ -72,3 +72,10 @@ skip_empty = true
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+
+[tool.ruff.lint.per-file-ignores]
+# Demo agents keep a blanket safety net so one bad handler can't kill the
+# whole multi-agent example; tests assert returncode explicitly instead of
+# using subprocess's check.
+"examples/*/agents.py" = ["BLE001"]
+"tests/integration/*" = ["PLW1510"]

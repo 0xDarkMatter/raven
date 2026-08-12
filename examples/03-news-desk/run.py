@@ -46,7 +46,7 @@ async def amain(db_path: Path, n_articles: int) -> None:
     # Wait until publisher signals done (or a 10s safety fuse).
     try:
         await asyncio.wait_for(stop.wait(), timeout=10.0)
-    except asyncio.TimeoutError:  # pragma: no cover -- only fires if pipeline stalls
+    except TimeoutError:  # pragma: no cover -- only fires if pipeline stalls
         transcript.line("setup", "TIMEOUT — pipeline stalled")
         stop.set()
 

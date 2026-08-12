@@ -730,15 +730,19 @@ def test_cli_main_runs_app() -> None:
 
 
 def test_cli_main_keyboard_interrupt_exits_130() -> None:
-    with patch("raven_bus.cli.main.app", side_effect=KeyboardInterrupt):
-        with pytest.raises(SystemExit) as excinfo:
-            cli_main()
+    with (
+        patch("raven_bus.cli.main.app", side_effect=KeyboardInterrupt),
+        pytest.raises(SystemExit) as excinfo,
+    ):
+        cli_main()
     assert excinfo.value.code == 130
 
 
 def test_cli_main_ravenbuserror_exits_error(capsys) -> None:
-    with patch("raven_bus.cli.main.app", side_effect=RavenBusError("boom")):
-        with pytest.raises(SystemExit) as excinfo:
-            cli_main()
+    with (
+        patch("raven_bus.cli.main.app", side_effect=RavenBusError("boom")),
+        pytest.raises(SystemExit) as excinfo,
+    ):
+        cli_main()
     assert excinfo.value.code == EXIT_ERROR
     assert "error: boom" in capsys.readouterr().err

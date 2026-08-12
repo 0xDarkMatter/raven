@@ -115,7 +115,7 @@ def test_two_connections_have_exactly_one_winner(raw_db: Path) -> None:
             message = claim_next(conn, consumer, QUEUE)
             conn.commit()
             results.append((consumer, None if message is None else message.id))
-        except BaseException as exc:  # surfaced in the test thread below
+        except BaseException as exc:  # noqa: BLE001 -- race-harness thread re-raises in the main test
             failures.append(exc)
         finally:
             conn.close()

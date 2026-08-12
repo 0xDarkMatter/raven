@@ -101,9 +101,7 @@ def _global(
 
 
 def cli_main() -> None:
-    """Console entry point (wired as ``raven2`` during the build run;
-    takes over the ``raven`` script name when claude_bus is removed at
-    integrate — ADR-004).
+    """Console entry point — owns the ``raven`` script name (ADR-004).
 
     Individual commands map raven_bus's exception hierarchy to the
     frozen exit codes via ``cli._common.handle_errors``; this is a

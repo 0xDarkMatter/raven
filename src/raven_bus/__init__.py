@@ -3,7 +3,7 @@
 Append-only message log partitioned into channels; read-state lives per
 channel kind (ADR-001): broadcast → cursors, queue → claims+leases,
 stream → none. Addressing is full-string ``<role>@<run>`` on one host DB
-(ADR-002). This package replaces ``claude_bus`` (ADR-004); the v1 API
+(ADR-002). This package replaces the retired v1 import root (ADR-004); the v1 API
 survives temporarily in :mod:`raven_bus.compat`.
 
 Wave-0 skeleton note (raven2-p1 run): signatures in this package are
