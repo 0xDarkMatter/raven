@@ -11,17 +11,18 @@ Per boundary (the loop, roughly):
    (data_version fast-poll allowed) and re-check;
 3. deliver: each ``interrupt`` alone via ``AcpClient.prompt``, then the
    batch+digest render as one prompt;
-4. AFTER each successful prompt submission, ``cursors.ack`` up to that
-   delivery's ids (never past deferred — the plan's ack_up_to already
-   guarantees the final position; intermediate acks per interrupt are
-   fine and crash-safer);
+4. AFTER the WHOLE boundary succeeds, one ``cursors.ack`` capped at the
+   plan's ack_up_to (per-prompt acking LOST messages — see _deliver);
+   an in-memory delivered watermark stops same-session redelivery
+   where a deferred fyi pins the cursor;
 5. post the agent's reply text and stop_reason to the bus as telemetry
    (``log.append`` type='acp-reply' on the reply_channel), and each
    session/update batch count as type='acp-activity' heartbeats.
 
 Crash semantics: if the child dies (AcpError EOF), stop cleanly and
-return; undelivered/deferred messages stay pending for the next process
-(that is WHY ack happens only after submission).
+return; anything not yet acked stays pending and redelivers
+at-least-once in the next process (ack only after a completed
+boundary is WHY loss cannot happen).
 """
 
 from __future__ import annotations
