@@ -352,3 +352,20 @@ def test_frontier_goes_cold_when_db_file_is_replaced(tmp_path: Path) -> None:
     # Stale frontier would hide message id 1 in the NEW file.
     assert claim_next(conn, "b@r", QUEUE) is not None
     conn.close()
+
+
+def test_frontier_key_degrades_to_path_when_stat_fails(
+    raw_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Filesystems that cannot identify files degrade to the bare-path
+    key (worst case: the original staleness), never a crash."""
+    conn = _connect(raw_db)
+
+    def _no_stat(_path):
+        raise OSError("stat unavailable")
+
+    monkeypatch.setattr(claims.os, "stat", _no_stat)
+    key = claims._frontier_db_key(conn)
+    assert key.endswith("claims.db")
+    assert "|" not in key
+    conn.close()
