@@ -464,7 +464,9 @@ section points rather than restates:
   `raven_bus.policy` (ADR-003/006 — injection policy lives in adapters, *not*
   the store; the bus never decides when a message enters an agent's context).
   See [Adapters](#adapters-delivering-into-a-running-agent).
-- **P4 — fleetflow:** `ff-spawn --acp`, heartbeat switch, `ff-clean` teardown, dashboard SSE.
+- **P4 — fleetflow:** shipped — opt-in bus heartbeats (P4a, fleetflow ADR-022)
+  and `ff-spawn --acp` steerable claude lanes (P4b, fleetflow ADR-023: packet
+  as trusted boundary 0, verdict from telemetry, `acceptEdits` default).
 - **P5 — bridges:** raven↔Buzz relay.
 
 ## Documentation

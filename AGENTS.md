@@ -250,5 +250,7 @@ ids are `<role>@<run>`; channels are path-style; atoms are lowercase
 P3 shipped: `raven acp` + the Claude Code hook share `raven_bus.policy`
 (ADR-003/006 — injection lives in adapters, never the store; see the
 [adapters landmines](#landmines--adapters-adr-003006--the-p3-attention-layer)).
-Still out: fleetflow wiring (P4), Buzz bridge (P5). See
+P4 shipped: fleetflow heartbeats (ADR-022) + `ff-spawn --acp` (fleetflow
+ADR-023 — packet as trusted boundary 0 via `--initial-prompt-file`, mode via
+`--mode`, verdict from telemetry). Still out: Buzz bridge (P5). See
 [docs/design/raven2-architecture.md §8](docs/design/raven2-architecture.md#8-phasing).
