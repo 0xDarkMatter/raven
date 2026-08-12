@@ -55,9 +55,12 @@ src/raven_bus/
 ├── cursors.py    broadcast: pending() + ack() (cursor-jump only) + get_cursor()
 ├── claims.py     queue: claim_next / renew / complete / release / get_claim
 ├── compat.py     v1 BusClient shim on the v2 store (deprecated, one release)
+├── http/         ravend — optional loopback HTTP bridge (the `[http]` extra; ADR-005)
+│                 app.py = frozen route table + error envelope + exception→status map;
+│                 read.py / write.py / sse.py = the 1:1 handlers; cli/serve.py runs it
 ├── migrations/0002_v2_schema.sql
 └── cli/          Typer `raven`: send read ack claim done release tail
-                  channels doctor teardown version  (_common.py = exit codes + error map)
+                  channels doctor teardown version serve  (_common.py = exit codes + error map)
 ```
 
 Six tables: `channels`, `messages`, `cursors`, `claims`, `consumers`, `bus_meta`.
@@ -90,6 +93,34 @@ Treat each as a build-breaker if violated. The decision text owns the *why*.
   state='lapsed'` that increments `deliveries` atomically — there is no
   caller-side snapshot, so any sweep call site is harmless to dead-letter
   accounting. A voluntary `release` deletes the row and does not count.
+
+## Landmines — the HTTP bridge (ADR-005)
+
+ravend is a **thin loopback bridge**, not a second store. The wire surface is
+frozen in `http/app.py`'s route table (= ADR-005's endpoint table).
+
+- **Thin-bridge rule: a handler maps 1:1 onto one module-contract call.** It
+  validates/decodes, opens one `db.connection`, calls one contract function,
+  encodes the result. **Adding logic to a handler is a defect** — it belongs in
+  the module contract (where it's already at 100% coverage), not in HTTP. The
+  one sanctioned pairing is `send`'s `ensure_channel` + `append(ensure=False)`,
+  mirroring `raven send`; everything else is a single call.
+- **GET handlers never write.** v1's `GET /inbox` registered alias rows as a
+  side effect — that bug class is the reason this line exists. (The one nuance:
+  `GET /pending` calls `cursors.pending`, which by module contract runs the
+  opportunistic sweep and bumps `last_seen_at`. That is the *module's* write,
+  not the handler's — the handler still makes exactly one contract call.)
+- **The claim frontier is a pure per-process optimisation.** `claims._FRONTIER`
+  is an in-memory `{(db_path, channel_id): id}` watermark that lets a warm
+  `claim_next` skip a cold backlog scan. It is never persisted and never read
+  for correctness — a fresh process re-derives it from the same query that
+  serves the request. Correctness must never depend on it being populated.
+- **SSE tests need the real-uvicorn harness.** Sync `TestClient.stream` over an
+  infinite SSE generator hangs on context exit — the portal can't reliably
+  deliver `http.disconnect`, so the generator's poll loop never sees the client
+  go. A real socket close does. Streaming tests therefore spin up a real uvicorn
+  on an ephemeral loopback port (per-test daemon thread); see
+  `tests/v2/test_http_sse.py`'s module docstring.
 
 ## Testing patterns
 
@@ -151,6 +182,7 @@ raven channels  [--prefix P] [-j]
 raven doctor    [--db P]
 raven teardown  --run RUN [--yes]
 raven version
+raven serve    [--host 127.0.0.1] [--port 7713] [--db P]   (run ravend under uvicorn; `[http]` extra)
 ```
 
 Exit codes (`cli/_common.py`): `0` ok / `2` usage / `3` not-found / `10` error.
@@ -158,9 +190,9 @@ Failures render as one-line `error: …`; tracebacks never reach users. Consumer
 ids are `<role>@<run>`; channels are path-style; atoms are lowercase
 `[a-z0-9][a-z0-9._-]*` (ADR-002).
 
-## Out of scope (P2+, see the design doc)
+## Out of scope (P3+, see the design doc)
 
-ravend HTTP (P2), `raven-acp` + hook adapters / injection policy (P3,
-ADR-003 — *not built*; injection lives in adapters, never the store), fleetflow
-wiring (P4), Buzz bridge (P5). See
+`raven-acp` + hook adapters / injection policy (P3, ADR-003 — *not built*;
+injection lives in adapters, never the store), fleetflow wiring (P4), Buzz
+bridge (P5). See
 [docs/design/raven2-architecture.md §8](docs/design/raven2-architecture.md#8-phasing).
