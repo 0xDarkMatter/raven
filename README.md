@@ -1,331 +1,239 @@
-![raven](docs/assets/raven-banner.png)
+# raven — local agent-coordination substrate
 
-**Built for the Claude Opus 4.7 Hackathon.**
+**raven** is a zero-infra, single-host coordination substrate for multi-agent
+runs. One SQLite file holds an append-only message log partitioned into
+**channels**; read-state lives per channel *kind*. Same-filesystem consumers
+(Python API or CLI) open the file directly — no broker, no daemon.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
-[![Status: Alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#status)
-[![Hackathon](https://img.shields.io/badge/Claude%20Opus%204.7-Hackathon-blueviolet?logo=anthropic)](https://www.anthropic.com/)
-[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+> The org-scoped human+agent chat layer — Slack-style threads, identity, keys,
+> cross-project reach — lives in [Buzz](https://github.com/block/buzz). raven
+> is the in-run coordination layer fleetflow and similar runners need; a Buzz
+> bridge is a later, separate component.
 
-> *A SQLite-backed, role-addressable message bus for live coordination between agent sessions.*
+- **Python import:** `raven_bus` (ADR-004 — the package root is `raven_bus`;
+  the v1 import root is gone, surviving one release only as `raven_bus.compat`)
+- **CLI:** `raven` (unchanged from v1)
+- **Store:** one SQLite (WAL) DB per host — `~/.raven/bus.db`, override `RAVEN_DB` (ADR-002)
 
-**raven** is the messaging primitive that lets agents in the same swarm coordinate while they're running. One process publishes a `plan`, another subscribes as `architect:swarm-1`, a third rolls in as `verifier:swarm-1` — all sharing a single SQLite file with WAL mode, no broker, no daemon, no Redis. It's the lower-level reusable substrate extracted from [Axiom](https://github.com/0xDarkMatter/axiom) (internal codename: *Raven*).
+> **Distribution name is undecided.** Installing by the `raven` name on PyPI
+> would pull Sentry's legacy client — install from source until naming is
+> settled (ADR-004): `pip install -e .`
 
-Where [Pigeon](https://github.com/0xDarkMatter/pigeon) is **email** — async notes you leave for a project that may not boot for hours — raven is **Slack**: live, in-swarm, sub-second, role-addressable. Both ship together because both shapes are needed for serious agent systems.
+## Recent updates
 
-**10 CLI commands. 5 worked examples. Optional HTTP bridge. One SQLite file. Zero infrastructure.**
-
-![raven](docs/assets/hackathon.gif)
-
-## Recent Updates
-
-**v0.1.1** (April 2026)
-
-*   🐛 **Identity hygiene** - `read` / `ack` and `GET /message/{id}` no longer add spurious `__cli__` / `__http__` / `reader` rows to the `aliases` table on every invocation. `BusClient("", "alice")` and `BusClient("s", "bad:role")` now fail fast with a clear `ValueError`.
-*   🛡️ **Stricter HTTP validation** - `GET /inbox` returns 400 on `role=a:` (empty session), `role=:b` (empty role), and `max<1` — previously these silently returned an empty array, masking caller bugs.
-*   ⚡ **Cached `init_db()`** - Long-running subscribers and bulk CLI usage no longer re-execute the migration script on every `BusClient()` instantiation. Pass `force=True` to bypass.
-*   🔧 **Cleaner CLI errors** - `cli_main()` renders `ClaudeBusError`, missing-message, missing-file, and permission-denied exceptions as one-line `error: ...` messages with proper exit codes — no Python tracebacks for users.
-*   🆕 **Quality-of-life additions** - `raven version` subcommand, short flags (`inbox -r/-m/-j`, `send -t`, `read -j`), `doctor` checks the bundled `0001_initial.sql` migration is present, and `_core.read_by_id()` identity-free fetch primitive.
-*   🔭 **`raven tail`** - Live stream observer: watches all bus traffic (or one role's messages) without consuming them. Identity-free, never competes with subscribers, pipe-friendly `--json` mode.
-*   ✅ **Integration tests** - Full subprocess integration tests for the news-desk and server-incident pipelines; 100% line coverage across all 179 tests.
-
-**v0.1.0** (April 2026)
-
-*   🚀 **Initial release** - Phase-1 ship of the role-addressable message bus extracted from Axiom. Core `BusClient` API with `send`/`inbox`/`ack`/`subscribe`, 8-command CLI (`init`, `doctor`, `session init`, `send`, `inbox`, `read`, `ack`, `serve`), optional Starlette HTTP bridge with read endpoints, pluggable Pydantic schema registry, and a single-file SQLite store with WAL mode for multi-producer/multi-consumer use. Five worked examples included, from single-process round-trips to a 5-agent SRE incident-response pipeline.
-
-[View full changelog →](https://github.com/0xDarkMatter/raven/commits/main)
-
-## Mailbox vs bus — where raven fits
-
-| | [Pigeon](https://github.com/0xDarkMatter/pigeon) (mailbox) | **raven** (bus) |
-|---|---|---|
-| Concurrency | Async, eventually consistent | Live, session-active |
-| Recipient state | Probably **not running** when you write | **Running and waiting** for messages |
-| Latency tolerated | Minutes to days | Sub-second to seconds |
-| Mental model | Email / inbox | Slack / message bus |
-| Address scheme | Per-project hash (one mailbox per repo) | `<role>:<session>` (many mailboxes per swarm) |
-| Use cases | Handoff between waves, notes-to-self | Live role-to-role coordination during a swarm run |
-| Shape | Go CLI binary | Python in-process + optional HTTP bridge |
-
-**Use Pigeon** when one session needs to leave a note for another project, possibly across days.
-**Use raven** when agent roles in the same swarm need to coordinate while running.
+**v0.2.0 (unreleased)** is a breaking rewrite. raven v2 replaces v1's
+per-message `status` column with an append-only log + per-channel-kind
+read-state, fixes crash-stranded queues with lease auto-requeue, and renames
+the import root to `raven_bus`. See [CHANGELOG.md](CHANGELOG.md) and the
+[v1→v2 migration](#v1v2-migration) section.
 
 ## Why raven?
 
-Multi-agent systems hit a coordination wall fast. The naïve options all break:
+Agent runners coordinate processes that can't share memory and often can't
+share a network. They need to broadcast steering messages, hand out work
+packets safely, and stream telemetry — without standing up Redis or a broker.
 
-- **Shared files** — Race conditions, no fanout, no `ack`, no addressing. Works for one writer; explodes at three.
-- **Redis / RabbitMQ / NATS** — Real broker = real ops. You're now running a daemon, exposing a port, managing auth, and shipping a Docker container with your hackathon project.
-- **HTTP between processes** — Every consumer needs its own server, no persistence on crash, no inbox semantics, and now you're writing routing yourself.
-- **Anthropic's tool-call channel** — Works inside one session. Useless across sessions, processes, or hosts.
+raven does this with one SQLite file and three channel semantics:
 
-raven picks the smallest shape that actually solves the problem: **one SQLite file in WAL mode**, addressed by `<role>:<session>`, with `send` / `inbox` / `ack` / `subscribe` semantics and an optional HTTP bridge for non-Python consumers. No broker, no daemon, no port — just a file path that any process on the host can open.
+- **broadcast** — every subscriber sees every message; ack = advance your cursor
+- **queue** — exactly-one-winner claim with a lease; crashes auto-requeue; dead-letter after N attempts
+- **stream** — observe-only firehose; no acks, ring retention
 
-## Key Benefits
+Key properties: append-only log (reads never mutate, so fan-out, replay, and
+`tail` are trivially correct); full-string `<role>@<run>` addressing (no
+lossy hash); expiry that actually works (every liveness read filters it).
 
-- **Zero infrastructure** — Single SQLite file. No broker, no daemon, no port, no auth surface
-- **Role-addressable** — `<role>:<session>` lets you fan in/out by role across many swarms in the same DB
-- **At-most-once delivery** — Atomic `UPDATE … WHERE status IN ('sent','delivered')` claim; subscribers never see duplicates
-- **Polyglot via HTTP** — Optional Starlette bridge for Docker agents and non-Python consumers
-- **Schema-flexible** — Pydantic model registry per message type; permissive by default, strict on opt-in
-- **Crash-safe** — Messages persist in SQLite. Restart a subscriber and it picks up where it left off
-- **Cross-process** — WAL mode lets multiple producers and consumers share the file with no coordinator
-- **Production heritage** — Extracted from Axiom (Raven), where it powers a multi-lane agent orchestrator
+Rationale lives in the decision log — this README cites rather than restates:
+[ADR-001](docs/adr/ADR-001-append-only-log-channel-kind-read-state.md) (log +
+channel-kind read-state), [ADR-002](docs/adr/ADR-002-addressing-and-single-host-db.md)
+(addressing + one host DB), [ADR-004](docs/adr/ADR-004-import-rename-compat-shim.md)
+(rename + compat shim).
 
 ## Structure
 
 ```
-raven/
-├── src/claude_bus/
-│   ├── _core.py          # low-level send / list / claim / resolve primitives
-│   ├── client.py         # BusClient — high-level public API + subscribe()
-│   ├── aliases.py        # role:session ↔ deterministic alias registry
-│   ├── db.py             # init_db, WAL setup, busy timeout
-│   ├── schemas.py        # SchemaRegistry, Pydantic body validation
-│   ├── session.py        # register_role_alias helper
-│   ├── exceptions.py     # ClaudeBusError hierarchy
-│   ├── http.py           # Starlette bridge (optional [http] extra)
-│   ├── cli/              # Typer CLI (10 commands)
-│   └── migrations/       # 0001_initial.sql
-├── examples/
-│   ├── 01-hello-world/        # single-process round-trip
-│   ├── 02-two-processes/      # cross-process coordination
-│   ├── 03-news-desk/          # 5 agents, fan-out + fan-in editorial
-│   └── 04-server-incident/    # 5 SRE agents diagnose flaky server
-├── tests/                # pytest, pytest-asyncio, 179 tests (100% line coverage)
-├── CHANGELOG.md
-└── pyproject.toml
+src/raven_bus/
+├── __init__.py        public re-exports (models, exceptions, __version__)
+├── models.py          pydantic models + ADR-002 address grammar (atom/consumer/channel validation)
+├── exceptions.py      RavenBusError hierarchy
+├── paths.py           resolve_db_path() — RAVEN_DB > arg > ~/.raven/bus.db
+├── db.py              init_db(), connection(), data_version(), sweep(), teardown_run()
+├── channels.py        channel registry (ensure/get/list by kind)
+├── log.py             append() + read primitives (the only writer of messages rows)
+├── cursors.py         broadcast read-state: pending() + cursor-jump ack()
+├── claims.py          queue read-state: claim_next/renew/complete/release/get_claim
+├── compat.py          v1 BusClient shim on the v2 store (ADR-004)
+├── migrations/
+│   └── 0002_v2_schema.sql   channels / messages / cursors / claims / consumers / bus_meta
+└── cli/               Typer app `raven` — send read ack claim done release
+                      tail channels doctor teardown version (see _common.py for exit codes)
 ```
 
 ## Installation
 
 ```bash
-pip install raven              # core
-pip install 'raven[http]'      # + optional HTTP bridge (Starlette + uvicorn)
-pip install 'raven[dev]'       # + pytest, pytest-asyncio, httpx, coverage
+# From source (the pip distribution name is undecided — ADR-004)
+pip install -e .
+
+# Smoke-test
+raven version
+raven doctor
 ```
 
-Requires **Python 3.12+**.
+The DB is created on first use — there is no `raven init` step. `RAVEN_DB`
+points it elsewhere; default is `~/.raven/bus.db`.
 
 ## Quickstart
 
-### Five lines of Python
+A broadcast control channel: orchestrator announces, every lane reads.
 
-```python
-from claude_bus import BusClient
-
-a = BusClient(session_id="swarm-1", role="conductor", db_path="bus.db")
-b = BusClient(session_id="swarm-1", role="architect", db_path="bus.db")
-
-a.send(to=b.address, type="plan", body={"step": 1, "goal": "design auth"})
-
-for msg in b.inbox():
-    print(msg.body)        # {'step': 1, 'goal': 'design auth'}
-    b.ack(msg.id)
-```
-
-### CLI quickstart
+### CLI
 
 ```bash
-$ raven init
-wrote raven.yaml
-initialised .../raven.db
-ready. try: raven doctor
+# Create + send onto a broadcast channel (auto-created as broadcast).
+$ raven send --channel run/v0-2/control --from orchestrator@v0-2 \
+    -t steer --body '{"note": "prefer the streaming parser"}'
+sent #1 orchestrator@v0-2 -> run/v0-2/control type=steer
 
-$ raven send --from conductor:swarm-1 --to architect:swarm-1 \
-    --type plan --body '{"step": 1}'
-sent #1 conductor:swarm-1 -> architect:swarm-1 type=plan
+# A lane reads its unseen messages (reading does NOT ack).
+$ raven read --channel run/v0-2/control --as lane-1@v0-2
+#1  orchestrator@v0-2 -> run/v0-2/control  type=steer  urgency=prompt  created=...
+  body: {"note": "prefer the streaming parser"}
 
-$ raven inbox --role architect:swarm-1 --json
-{
-  "messages": [
-    {"id": 1, "sender": "conductor:swarm-1", "body": {"step": 1}, ...}
-  ]
-}
+# Ack by jumping the cursor to the highest id handled (ADR-001: ack is a cursor jump, not per-message).
+$ raven ack --channel run/v0-2/control --as lane-1@v0-2 --up-to 1
+acked lane-1@v0-2 on run/v0-2/control up_to=1
 
-$ raven ack 1
-acked #1
+$ raven read --channel run/v0-2/control --as lane-1@v0-2
+(no messages)
 ```
 
-## What's Included
-
-### CLI Commands
-
-| Command | Purpose |
-|---|---|
-| `init` | Write `raven.yaml` + initialise the SQLite DB at the configured path |
-| `doctor` | Health check — DB writable, migration present, schema valid |
-| `session init` | Pre-register a `<role>:<session>` identity without sending |
-| `send` | Publish a message: `--from`, `--to`, `-t/--type`, `--body` (JSON) |
-| `inbox` | List pending messages for a role: `-r/--role`, `-m/--max`, `-j/--json` |
-| `read` | Fetch a single message by id without acking it: `-j/--json` |
-| `ack` | Mark a message as read (idempotent) |
-| `tail` | Stream all bus traffic live — identity-free observer, never consumes messages |
-| `serve` | Start the optional Starlette HTTP bridge on `127.0.0.1:7713` |
-| `version` | Print the installed raven version |
-
-### Worked examples
-
-| Example | Shape | What it demonstrates |
-|---|---|---|
-| `01-hello-world/` | 1 process | Round-trip `send` → `inbox` → `ack` in a single script |
-| `02-two-processes/` | 2 processes | Cross-process coordination via the shared SQLite file |
-| `03-news-desk/` | 5 agents | Fan-out + fan-in editorial pipeline (assignment → drafts → edit → publish) |
-| `04-server-incident/` | 5 SRE agents | Diagnose & remediate a flaky server cooperatively |
-
-## Async subscribe
+### Python
 
 ```python
-import asyncio
-from claude_bus import BusClient
+from raven_bus import db, channels, log, cursors
 
-async def consume():
-    b = BusClient(session_id="swarm-1", role="architect", db_path="bus.db")
-    async for msg in b.subscribe(poll_interval_s=0.5):
-        print(f"#{msg.id} {msg.type}: {msg.body}")
-        # message is acked before yield (at-most-once)
+db.init_db()                       # creates ~/.raven/bus.db on first use (idempotent)
 
-asyncio.run(consume())
+with db.connection() as conn:
+    channels.ensure_channel(conn, "run/v0-2/control", kind="broadcast")
+    m = log.append(conn, channel="run/v0-2/control",
+                   sender="orchestrator@v0-2", type="steer",
+                   body={"note": "prefer the streaming parser"})
+
+with db.connection() as conn:
+    pending = cursors.pending(conn, "lane-1@v0-2", "run/v0-2/control")  # id > cursor, expiry-filtered
+    for msg in pending:
+        handle(msg)
+        cursors.ack(conn, "lane-1@v0-2", "run/v0-2/control", up_to_id=msg.id)
 ```
 
-`subscribe()` claims messages atomically via `UPDATE … WHERE status IN ('sent','delivered')`. Two subscribers on the same role will not see the same message — the loser's update affects zero rows and the message is yielded exactly once.
-
-## Live bus observer — `tail`
-
-`raven tail` is a read-only observer that streams every message through the bus without consuming any of them. It's useful for debugging pipelines and watching live swarm traffic:
+A queue work channel: claim one packet, finish it (or it auto-requeues).
 
 ```bash
-$ raven tail                          # all traffic, follow mode
-$ raven tail --role architect:swarm-1 # filter to one recipient
-$ raven tail --no-follow              # print backlog and exit
-$ raven tail --json                   # newline-delimited JSON (pipe-friendly)
-$ raven tail --from 42                # resume from a known message id
+$ raven send --channel run/v0-2/queue --from orchestrator@v0-2 \
+    -t packet --body '{"file": "src/parser.py"}' --kind queue
+sent #2 orchestrator@v0-2 -> run/v0-2/queue type=packet
+
+$ raven claim --channel run/v0-2/queue --as lane-2@v0-2     # oldest unclaimed, leases it
+#2  orchestrator@v0-2 -> run/v0-2/queue  type=packet  ...
+
+$ raven done --id 2 --as lane-2@v0-2                        # terminal; releases nothing
+done #2 as lane-2@v0-2
 ```
 
-Multiple tailers can run in parallel alongside active subscribers — `tail` never touches message status and never competes with consumers.
+See [docs/QUICKSTART.md](docs/QUICKSTART.md) for the full 5-minute walkthrough
+(send/read/ack, claim/done, tail, teardown).
 
-## Pluggable schemas
+## Channel kinds & delivery semantics
 
-By default any JSON body is accepted. Register a Pydantic model to start enforcing a shape per message type:
+Three kinds, decided once at channel creation (`--kind`), immutable after
+([ADR-001](docs/adr/ADR-001-append-only-log-channel-kind-read-state.md)).
+
+| Kind | Delivery | Read state | Ack | Failure |
+|---|---|---|---|---|
+| `broadcast` | every subscriber sees every message, **at-least-once** | per-consumer `cursors` | cursor **jump** to highest id handled — acks everything up to it | un-acked messages stay pending; idempotent re-read |
+| `queue` | **exactly-one-winner** claim | `claims` rows with a lease | `done` (terminal) or `release` (voluntary) | lease expiry **auto-requeues**; `deliveries ≥ max_deliveries` → `dead` |
+| `stream` | observe-only, **no acks** | none | n/a | n/a (ring retention; tail-only) |
+
+The queue claim is v1's proven atomic-claim pattern relocated:
+`INSERT INTO claims … ON CONFLICT DO NOTHING` — rowcount 1 wins. A lapsed lease
+is reaped by the opportunistic `sweep`, making the message claimable again;
+once a claim's delivery count reaches `max_deliveries` the next sweep flips it
+to `dead` instead. This replaces v1's "crashed consumer = message stuck
+forever". (ADR-001.)
+
+## v1→v2 migration
+
+v2 is a breaking rewrite. The v1 `BusClient(session_id, role)` API survives
+**one release** as `raven_bus.compat`, implemented on the v2 store (ADR-004).
+It keeps the v1 examples runnable as the rewrite's regression net and is
+deprecated from day one.
 
 ```python
-from pydantic import BaseModel
-from claude_bus import SchemaRegistry
+from raven_bus.compat import BusClient     # v1 API on the v2 store
 
-class PlanBody(BaseModel):
-    step: int
-    goal: str
-
-SchemaRegistry.register("plan", PlanBody)
-
-# Now send(type="plan", body=...) validates against PlanBody.
-# SchemaRegistry.strict_mode(True) rejects unregistered types entirely.
+conductor = BusClient(session_id="v0-2", role="conductor")
+conductor.send(to="architect:v0-2", type="plan", body={"step": 1})
+for msg in conductor.inbox():
+    conductor.ack(msg.id)
 ```
 
-Validation failures raise `SchemaValidationError`. Strict mode (off by default) refuses any `type` that isn't in the registry — useful for sealed swarms where every message shape is known up-front.
+The shim maps v1 onto v2: a v1 address `"<role>:<session>"` becomes a 2-consumer
+broadcast channel `compat/<session>/<role>`, and v1's `(role, session)` becomes
+the v2 consumer `<role>@<session>`. Three narrowings are unavoidable because v2
+has no per-message status column, no hash alias, and no session fence — they
+are documented loudly in `compat.py` and the CHANGELOG:
 
-## HTTP bridge (optional)
+1. **Case-folding.** v2's grammar is lowercase-only (ADR-002); the shim
+   `.lower()`s role and session before mapping. (All v1 examples are
+   lowercase, so they keep running unchanged.)
+2. **Cursor-jump ack.** v1 acked a single message; `compat.ack(id)` jumps the
+   cursor to `id`, acking everything up to it. Fine for in-order ackers.
+3. **`task_id` in body.** v2 has no `task_id` column; the shim smuggles it
+   under `body["__task_id__"]` on send and strips it on read.
 
-The `[http]` extra ships a small Starlette app for non-Python consumers (e.g. an agent inside a Docker container that can't share the host's filesystem):
+### What was removed
 
-```bash
-$ pip install 'raven[http]'
-$ raven serve --port 7713 &
+- The **v1 import root** — renamed to `raven_bus` (ADR-004).
+- The **per-message `status` column** — read-state now lives in cursors/claims (ADR-001).
+- **Hash aliases** (`role + 6-hex-sha1`) — full `<role>@<run>` strings instead (ADR-002).
+- **Session fences** on sends — channels are host-global; run-scoping is a naming convention (ADR-002).
+- The **`raven init` / `session init`** commands and the v1 **HTTP bridge** — DB is created on first use; ravend HTTP is P2.
 
-$ curl http://127.0.0.1:7713/health
-{"status": "ok", "db": "...", "version": "0.1.1"}
+## Roadmap
 
-$ curl 'http://127.0.0.1:7713/inbox?role=architect:swarm-1'
-{"messages": [...]}
+v0.2.0 ships P1 (core store + CLI + compat). Later phases are described in the
+design doc ([§8 Phasing](docs/design/raven2-architecture.md#8-phasing)); this
+section points rather than restates:
 
-$ curl http://127.0.0.1:7713/message/1
-{"id": 1, "sender": "...", "body": {...}}
-```
-
-Phase 1 ships **read endpoints only** (`GET /health`, `GET /inbox`, `GET /message/{id}`). The write path stays on the CLI / Python API in v0.1.x. `POST /send` and `POST /ack` are planned for **v0.2.0**.
-
-The bridge binds to `127.0.0.1` by default — there is no built-in auth. For multi-host or untrusted-network deployments, terminate TLS + auth at a reverse proxy in front of `raven serve`.
-
-## Architecture
-
-A single SQLite file holds an `aliases` table (deterministic identities per `(role, session)`) and a `messages` table (append-only, indexed for inbox reads). `BusClient` is a thin layer that auto-registers the sender + recipient identities and wraps `send` / `inbox` / `ack` calls. WAL mode lets multiple producers and consumers share the file with no broker process. The optional HTTP bridge is a Starlette app that exposes the same reads over loopback HTTP for consumers that can't share the filesystem.
-
-```
-┌──────────┐  send/inbox/ack  ┌────────────────┐
-│ producer │ ────────────────►│  SQLite store  │◄─── HTTP bridge ──── docker agent
-│  Python  │                  │  (WAL, single  │     (optional)        (curl etc.)
-└──────────┘                  │   shared file) │
-                              └────────────────┘
-                                        ▲
-                              consumer  │ subscribe / inbox / ack
-                                        │
-                                  ┌──────────┐
-                                  │ consumer │
-                                  │  Python  │
-                                  └──────────┘
-```
-
-### Address scheme
-
-Every message is addressed by `<role>:<session>` — for example `architect:swarm-1` or `verifier:run-2026-04-25`. Identities are auto-registered on first `BusClient()` and persist in the `aliases` table. Role and session are case-sensitive; session may not contain `:`.
-
-### Delivery semantics
-
-| Phase | Status transition | Where it happens |
-|---|---|---|
-| Producer publishes | `→ sent` | `send()` insert |
-| Subscriber claims | `sent → delivered` | atomic `UPDATE` in `subscribe()` / `inbox()` |
-| Consumer acknowledges | `delivered → acked` | `ack()` |
-
-A message is **at-most-once** under `subscribe()` (claim-before-yield) and **at-least-once** under raw `inbox()` (you must `ack` to suppress redelivery). Crashes between claim and ack leave the message in `delivered` until manually re-queued — there is no automatic redelivery in v0.1.x.
-
-## Status
-
-| | |
-|---|---|
-| Version | **0.1.1** (Phase 1 ship + edge-case polish) |
-| Python | 3.12+ |
-| License | MIT |
-| Status | Alpha — public surface stable for v0.1.x; see `CHANGELOG.md` for the v0.2 roadmap |
-| Tests | pytest + pytest-asyncio, 179 tests (100% line coverage) |
+- **P2 — ravend:** loopback HTTP read+write, SSE tail, Process-Compose registration.
+- **P3 — adapters:** `raven-acp` harness + Claude Code hook adapter; the shared
+  injection-policy module (ADR-003 — injection policy lives in adapters, *not*
+  the store; the bus never decides when a message enters an agent's context).
+- **P4 — fleetflow:** `ff-spawn --acp`, heartbeat switch, `ff-clean` teardown, dashboard SSE.
+- **P5 — bridges:** raven↔Buzz relay.
 
 ## Documentation
 
-- [`docs/QUICKSTART.md`](docs/QUICKSTART.md) — 5-minute walkthrough
-- [`AGENTS.md`](AGENTS.md) — developer guide: architecture, invariants, testing patterns
-- [`examples/01-hello-world/`](examples/01-hello-world/) — single-process round-trip
-- [`examples/02-two-processes/`](examples/02-two-processes/) — live cross-process coordination
-- [`examples/03-news-desk/`](examples/03-news-desk/) — 5 agents, fan-out + fan-in editorial pipeline
-- [`examples/04-server-incident/`](examples/04-server-incident/) — 5 SRE agents diagnose & fix a flaky server
-- [`CHANGELOG.md`](CHANGELOG.md) — release notes + v0.2 roadmap
+- [docs/QUICKSTART.md](docs/QUICKSTART.md) — 5-minute walkthrough
+- [AGENTS.md](AGENTS.md) — developer guide (architecture, landmines, testing)
+- [docs/design/raven2-architecture.md](docs/design/raven2-architecture.md) — the v2 design
+- [docs/adr/](docs/adr/) — decisions of record (ADR-001…004)
+- [CHANGELOG.md](CHANGELOG.md) — release notes
 
 ## Troubleshooting
 
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| `raven serve` exits with `failed to bind 127.0.0.1:7713` | Another process is on that port (often a stray previous run, or your real Axiom). | `raven serve --port 7714`, or `lsof -i :7713` / `netstat -ano` to find and kill the holder. |
-| `raven serve` exits with `DB preflight failed: cannot write` | The directory holding `raven.db` is read-only or doesn't exist. | Create the dir, fix permissions, or pass `--db /writable/path/bus.db`. |
-| `raven inbox` returns `(no messages)` but you just sent one | Address mismatch: producer used `--to alice:s1` but consumer asked for `--role Alice:s1` (case-sensitive) or a different session id. | Check casing and that both ends agree on `<role>:<session>`. |
-| `SchemaValidationError: body for type='X' failed validation` | You registered a Pydantic model for type `X` and the body doesn't match it. | Either fix the body, drop the schema (`SchemaRegistry.unregister("X")`), or send with `validate=False` at the `_core.send` layer. |
-| Send hangs for several seconds | Another writer holds a lock on the WAL. Default busy timeout is 5s; if a peer process has the file open in a long transaction it can stall. | Confirm peers commit promptly. As a workaround you can adjust `claude_bus.db.DEFAULT_BUSY_TIMEOUT_S`. |
-| `pip install 'raven[http]'` fine but `raven serve` says `starlette + uvicorn are required` | The CLI is resolving a different Python (system `raven`, not the venv one). | Activate the venv first, or invoke `python -m raven.cli.main serve`. |
-| Two subscribers see the same message | Shouldn't happen as of v0.1.1+ — `subscribe()` uses an atomic claim. If you see it on an older install, `pip install -U raven`. | — |
-
-## Acknowledgements
-
-raven is the messaging primitive extracted from [Axiom](https://github.com/0xDarkMatter/axiom) (internal codename: *Raven*). Axiom keeps its own role-aware adapter layer; this project is the lower-level reusable substrate, sized for any single-host multi-session agent system.
-
-Sibling projects in the same ecosystem:
-
-- [**Pigeon**](https://github.com/0xDarkMatter/pigeon) — Async mailbox between projects (the email half of this story)
-- [**claude-mods**](https://github.com/0xDarkMatter/claude-mods) — Claude Code extension toolkit (where the swarms run)
-- [**Axiom**](https://github.com/0xDarkMatter/axiom) — Multi-lane agent orchestrator (the system raven was extracted from)
+- **`raven doctor`** — checks the DB is reachable, reports `schema_version`,
+  WAL mode, and a dry sweep tally (`expired`/`requeued`/`dead_lettered`).
+- **Bad address:** consumer ids must be `<role>@<run>` and channel names
+  path-style, all lowercase atoms `[a-z0-9][a-z0-9._-]*` — a violation is a
+  usage error (exit 2), not a traceback (ADR-002).
+- **Wrong channel kind:** a queue op on a broadcast channel (or vice versa)
+  raises `WrongChannelKindError`. Kind is immutable after creation.
+- **`--db` override:** every CLI command accepts `--db PATH` to point at a
+  different DB (tests use this); otherwise resolution is `RAVEN_DB` → `~/.raven/bus.db`.
 
 ## License
 
-[MIT](LICENSE).
-
----
-
-*Coordinate live. Ship together.*
+See [LICENSE](LICENSE).
