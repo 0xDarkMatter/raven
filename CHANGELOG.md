@@ -12,7 +12,10 @@ replaces v1's per-message delivery state with an append-only log + per-channel
 (log + channel-kind read-state), [ADR-002](docs/adr/ADR-002-addressing-and-single-host-db.md)
 (full-string addressing + one host DB), [ADR-004](docs/adr/ADR-004-import-rename-compat-shim.md)
 (rename + compat shim), [ADR-005](docs/adr/ADR-005-ravend-http-contract.md)
-(ravend thin loopback bridge).
+(ravend thin loopback bridge), [ADR-003](docs/adr/ADR-003-injection-in-adapters-messages-are-data.md)
+(injection lives in adapters; messages are data, not instructions),
+[ADR-006](docs/adr/ADR-006-adapter-architecture.md)
+(thin adapters + dumb-pipe ACP harness + one policy module).
 
 ### Added — the v2 store
 
@@ -76,6 +79,48 @@ replaces v1's per-message delivery state with an append-only log + per-channel
   (the verify-002 cost). Never persisted, never read for correctness — a fresh
   process re-derives it on first call; correctness never depends on it.
 
+### Added — adapters (P3)
+
+- **Delivering bus messages INTO a running agent session** (ADR-003/006 — the
+  one thing the store deliberately never does: deciding *when/how* a message
+  enters an agent's context). Two thin adapters ship, sharing **one**
+  injection-policy module `raven_bus.policy`.
+- **`raven_bus.policy`** — the attention layer: `plan()` partitions a
+  consumer's pending messages into tiers — `blocking` → an **interrupt**
+  (delivered alone, first), `prompt` (the default) → a **batch** (one render),
+  `fyi` → held as a token-capped **digest** until `digest_min_count` (5) pile
+  up or the oldest exceeds `digest_max_age_s` (300 s), else `deferred`.
+  **Pure and deterministic** — `now` and the token budget are inputs, never
+  read from a clock or I/O. `render()` is the **only** composer of injection
+  text (the sender-attributed data framing that **is** the prompt-injection
+  defense); adapters call `plan`+`render` and never build framing themselves.
+  A `blocking` message is never starved by budget; deferred ids are excluded
+  from the plan's `ack_up_to`.
+- **`raven acp`** — a **dumb-pipe** harness (ADR-006) driving an
+  [Agent Client Protocol](https://agentclientprotocol.com) agent subprocess
+  (Claude Code, Goose, Codex, …) over its stdio. Minimal client subset only
+  (`initialize`, `session/new`, `session/prompt`, `session/update`, `session/
+  cancel`); agent-initiated requests are answered "method not found" (no fs/
+  terminal capabilities granted). It spawns once, drives the loop, **exits when
+  the child exits, never respawns** (lifecycle belongs to the spawner — design
+  §9 Q4). Delivery is **turn-boundary only**. **Acks follow the submit**: the
+  harness `cursors.ack`s only after a successful `session/prompt`, so a crash
+  between plan and prompt leaves the message pending for the next process.
+  Replies/telemetry post to `--reply-to` as `acp-reply`/`acp-activity`.
+- **Claude Code PreToolUse hook** (`src/raven_bus/adapters/hooks/`) — a
+  **peek-only** adapter for interactive sessions (ADR-006): on every tool call
+  it reads pending, renders via `policy`, prints a compact block when anything
+  is deliverable, prints nothing when the inbox is empty, **always exits 0**.
+  Config is env-only (`RAVEN_CONSUMER` to activate; `RAVEN_CHANNELS`;
+  `RAVEN_DB`). **The hook never acks** — so it can run beside a `raven acp`
+  harness on the same consumer without double-delivery. Install is documented,
+  not automated (mirror the block in `~/.claude/settings.json`).
+- **Testing against a fake agent, never a live model.** A deterministic
+  stdlib-only fake ACP agent (`tests/v2/fake_acp_agent.py`, scenarios incl.
+  `echo`/`slow`/`request-perms`/`die-mid-prompt`/`garbage`) drives the protocol
+  client and harness. The hook's real path runs in a subprocess (invisible to
+  coverage), so its logic is also exercised via **in-process twins**.
+
 ### Fixed
 
 - **Per-batch lease deadline.** `claim_next` now computes `lease_until` per
@@ -127,8 +172,8 @@ table, schema discovery) is superseded by the v2 design. The real roadmap is
 the phasing in [docs/design/raven2-architecture.md §8](docs/design/raven2-architecture.md#8-phasing):
 
 - **P2 — ravend:** loopback HTTP read+write, SSE tail, Process-Compose registration.
-- **P3 — adapters:** `raven-acp` harness + Claude Code hook adapter; the shared
-  injection-policy module (ADR-003).
+- **P3 — adapters:** shipped — `raven acp` harness + Claude Code hook adapter;
+  shared injection-policy module (ADR-003/006; see *Added — adapters (P3)* above).
 - **P4 — fleetflow:** `ff-spawn --acp`, heartbeat switch, `ff-clean` teardown, dashboard SSE.
 - **P5 — bridges:** raven↔Buzz relay.
 
