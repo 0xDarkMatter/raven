@@ -61,15 +61,19 @@ def _insert_message(
     return int(cur.lastrowid)
 
 
-def _install_sibling_stubs(conn: sqlite3.Connection) -> None:
+def _install_sibling_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
     """Monkeypatch the sibling-lane entry points that cursors calls.
 
     These mirror the frozen docstring contracts so the code under test
     is exercised against real v2 semantics, not the lane stubs.
+    MUST go through pytest's monkeypatch: cursors imports the REAL
+    raven_bus.db/channels/log modules, so a bare assignment here would
+    replace them for every later test file in the process (it did —
+    8 cross-file failures at wave-1 landing).
     """
     # db.sweep — no-op for broadcast cursors (no leases to reap; expiry
     # is enforced by read_after's filter, matching ADR-001).
-    cursors_mod.db.sweep = lambda _conn: None  # type: ignore[attr-defined]
+    monkeypatch.setattr(cursors_mod.db, "sweep", lambda _conn: None)
 
     def get_channel(_conn: sqlite3.Connection, name: str):
         from raven_bus.models import Channel
@@ -87,7 +91,7 @@ def _install_sibling_stubs(conn: sqlite3.Connection) -> None:
             created_at=datetime.fromisoformat(row["created_at"]),
         )
 
-    cursors_mod.channels.get_channel = get_channel  # type: ignore[attr-defined]
+    monkeypatch.setattr(cursors_mod.channels, "get_channel", get_channel)
 
     def read_after(
         _conn: sqlite3.Connection,
@@ -130,26 +134,27 @@ def _install_sibling_stubs(conn: sqlite3.Connection) -> None:
             for r in rows
         ]
 
-    cursors_mod.log.read_after = read_after  # type: ignore[attr-defined]
+    monkeypatch.setattr(cursors_mod.log, "read_after", read_after)
 
 
 # --------------------------------------------------------------------------- #
 # Fixture: a raw sqlite3 connection on a freshly-migrated in-memory DB.
 # --------------------------------------------------------------------------- #
 @pytest.fixture()
-def conn():
+def conn(monkeypatch: pytest.MonkeyPatch):
     """A migrated sqlite3 connection with sibling-lane stubs installed.
 
     Each test owns its own private DB; we commit at handoff so the next
     operation sees durable rows. Production code never commits (the
     db.connection context manager owns that); our private fixture does
-    the commit harness the real connection would.
+    the commit harness the real connection would. Sibling stubs are
+    scoped to the test via monkeypatch — they auto-restore on teardown.
     """
     cx = sqlite3.connect(":memory:")
     cx.row_factory = sqlite3.Row
     cx.execute("PRAGMA foreign_keys = ON")
     cx.executescript(MIGRATION.read_text(encoding="utf-8"))
-    _install_sibling_stubs(cx)
+    _install_sibling_stubs(monkeypatch)
     yield cx
     cx.close()
 
