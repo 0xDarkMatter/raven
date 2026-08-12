@@ -514,3 +514,19 @@ def test_delivered_watermark_prevents_redelivery_storm(
     with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
         still = cursors.pending(conn, CONSUMER, CHANNEL)
     assert [m.id for m in still] == [msg_fyi.id, msg_block.id]
+
+
+def test_store_error_exits_ten_not_traceback(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GLM verify finding: an sqlite busy-timeout in the store path
+    escaped run_harness as a crash; it must exit 10 like AcpError."""
+    import sqlite3 as sqlite3_mod
+
+    def _busy(_config):
+        raise sqlite3_mod.OperationalError("database is locked")
+
+    monkeypatch.setattr(harness, "_gather_pending", _busy)
+    client = FakeAcpClient()
+    code = run_harness(_config(db_path=db), _never_dies(), client=client)
+    assert code == 10

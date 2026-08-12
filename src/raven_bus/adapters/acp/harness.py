@@ -26,7 +26,9 @@ return; undelivered/deferred messages stay pending for the next process
 
 from __future__ import annotations
 
+import sqlite3
 import subprocess
+import sys
 import time
 from collections.abc import Sequence
 from datetime import UTC, datetime
@@ -36,6 +38,7 @@ from pydantic import BaseModel, ConfigDict, model_validator
 
 from raven_bus import cursors, log, policy
 from raven_bus.adapters.acp.protocol import AcpClient, AcpError, PromptResult
+from raven_bus.exceptions import RavenBusError
 from raven_bus.db import connection as db_connection
 from raven_bus.models import Message, validate_channel_name
 
@@ -105,21 +108,29 @@ def run_harness(
         if child.poll() is not None:
             return 0
 
-        pending = [
-            m
-            for m in _gather_pending(config)
-            if m.id > delivered_watermark.get(m.channel, 0)
-        ]
-        plan_ = policy.plan(pending, now=datetime.now(UTC), token_budget=config.token_budget)
-
-        if not plan_.interrupt and not plan_.batch and not plan_.digest_source:
-            time.sleep(config.poll_interval_s)
-            continue
-
-        boundary += 1
         try:
+            pending = [
+                m
+                for m in _gather_pending(config)
+                if m.id > delivered_watermark.get(m.channel, 0)
+            ]
+            plan_ = policy.plan(
+                pending, now=datetime.now(UTC), token_budget=config.token_budget
+            )
+
+            if not plan_.interrupt and not plan_.batch and not plan_.digest_source:
+                time.sleep(config.poll_interval_s)
+                continue
+
+            boundary += 1
             _deliver(config, acp, session_id, plan_, boundary, delivered_watermark)
-        except AcpError:
+        except (AcpError, RavenBusError, sqlite3.Error) as exc:
+            # Store errors (a 5s busy timeout under writer load is an
+            # sqlite3.OperationalError) must exit like protocol errors —
+            # a traceback-crash was the GLM verify finding. One stderr
+            # breadcrumb; undelivered messages stay pending (cursor is
+            # the durable truth).
+            print(f"raven-acp: {type(exc).__name__}: {exc}", file=sys.stderr)
             return 10
 
         if max_boundaries is not None and boundary >= max_boundaries:
