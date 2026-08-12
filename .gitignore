@@ -17,6 +17,8 @@ dist/
 *.whl
 
 # raven runtime
+claude-bus.db
+claude-bus.db-*
 raven.db
 raven.db-journal
 raven.db-wal
