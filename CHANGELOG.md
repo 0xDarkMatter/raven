@@ -58,9 +58,16 @@ replaces v1's per-message delivery state with an append-only log + per-channel
   table in `http/app.py` **is** ADR-005's endpoint table (the wire format of
   record). Errors use the envelope `{"error","detail"}` with 400 (invalid
   input) / 404 (unknown channel or message) / 409 (claim denied, wrong kind).
-- **`raven serve`** subcommand: runs ravend under uvicorn, with a loopback
-  default and a one-line warning on a non-loopback `--host`. Missing the
+- **`raven serve`** subcommand: runs ravend under uvicorn, loopback by
+  default; a non-loopback `--host` is **refused** unless `--yes-expose` is
+  passed (and then warns — ravend has no in-process auth). Missing the
   `[http]` extra fails fast with the CLI's normal one-line `error: …`.
+- **Hardened bridge inputs** (adversarial verify round): strict bodies on
+  every POST (unknown keys 400), bounded `lease_s`/`limit`/`after`/ids,
+  router-level 404/405 wear the same envelope, SSE drains bursts larger
+  than one read batch, and all store work runs off the event loop so one
+  held write lock cannot freeze the process. New store contract
+  `consumers.touch()` (heartbeat + deduplicated upserts).
 - **SSE tail** at `GET /tail` — an observer like `raven tail`: never consumes,
   never mutates, may serve expired; `event: message` per row, `: ping`
   comments while idle.

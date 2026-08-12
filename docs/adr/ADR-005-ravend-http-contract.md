@@ -61,6 +61,23 @@ never consumes, may serve expired (forensic, like `raven tail`).
 - **Fat handlers** (validation/orchestration in HTTP) — duplicates the
   module contracts and drifts.
 
+## Amendment (2026-08-12, post adversarial verify)
+
+The verify wave hardened the contract without changing the route table:
+
+- **Every POST body is strict** — unknown keys → 400 (a `leases_s` typo
+  silently applying a default lease was the finding).
+- **All caller ints are bounded**: `lease_s` 1..30d, `limit` 1..1000
+  (SQLite's LIMIT -1 means unlimited), `after`/ids within int64.
+- **Router-level 404/405 wear the same envelope** (405 code:
+  `method_not_allowed`).
+- **`raven serve` refuses non-loopback hosts** without an explicit
+  `--yes-expose` — the posture must not be defeatable by one flag.
+- **Handlers run store work in worker threads** (`app.run_db`); the SSE
+  tail drains multi-batch bursts and holds a `cross_thread` connection.
+- **`consumers.touch()`** is the store contract behind `/heartbeat`,
+  ending the raw-SQL drift this ADR's thin-bridge rule forbade.
+
 ## Consequences
 
 - Port 7713 (unclaimed in the machine port registry as of 2026-08-12).

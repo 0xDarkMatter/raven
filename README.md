@@ -162,7 +162,8 @@ Install the extra and run it:
 
 ```bash
 pip install -e ".[http]"        # starlette + uvicorn
-raven serve                     # 127.0.0.1:7713; --host/--port/--db override
+raven serve                     # 127.0.0.1:7713; --port/--db override
+                                # (non-loopback --host requires --yes-expose)
 ```
 
 All v2 store operations are exposed. Send, read broadcast pending, ack, claim,
