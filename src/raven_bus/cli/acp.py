@@ -19,6 +19,7 @@ from pathlib import Path
 
 import typer
 
+from raven_bus import channels as channels_mod
 from raven_bus import db, models
 from raven_bus.adapters.acp.harness import HarnessConfig, parse_channels, run_harness
 from raven_bus.cli._common import EXIT_ERROR, EXIT_USAGE, die, handle_errors
@@ -106,6 +107,17 @@ def acp(
             if initial_prompt is None or not initial_prompt.strip():
                 die("--initial-prompt-file is empty", EXIT_USAGE)
         db.init_db(db_path)
+        # Ensure the lane's channels exist BEFORE the loop: a lane must be
+        # startable before its orchestrator has sent anything (the first
+        # pending() poll on a never-used channel raised UnknownChannelError
+        # and killed the harness — found by the P4b live run). Broadcast is
+        # the only kind the cursor loop can serve; a kind mismatch on an
+        # existing channel fails loudly here (WrongChannelKindError).
+        with db.connection(db_path) as conn:
+            for name in channels:
+                channels_mod.ensure_channel(conn, name, kind="broadcast")
+            if reply_to is not None:
+                channels_mod.ensure_channel(conn, reply_to, kind="broadcast")
 
     config = HarnessConfig(
         consumer=as_,

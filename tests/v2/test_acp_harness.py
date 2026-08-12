@@ -524,6 +524,41 @@ def test_cli_initial_prompt_file_read_and_passed_verbatim(
     assert captured["config"].initial_prompt == "do the thing\n"
 
 
+def test_cli_ensures_watched_and_reply_channels_before_loop(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lane must be startable before its orchestrator has sent anything:
+    the CLI pre-creates its channels (broadcast) so the first pending()
+    poll cannot raise UnknownChannelError (P4b live finding)."""
+
+    class _FakeProc:
+        def __init__(self, argv, **kwargs) -> None:
+            pass
+
+        def poll(self):
+            return 0
+
+        def terminate(self) -> None:
+            pass  # pragma: no cover -- child already exited
+
+    monkeypatch.setattr("raven_bus.cli.acp.subprocess.Popen", _FakeProc)
+    monkeypatch.setattr("raven_bus.cli.acp.run_harness", lambda *a, **k: 0)
+
+    result = runner.invoke(
+        app,
+        [
+            "acp", "--as", CONSUMER, "--channel", "run/run1/fresh",
+            "--reply-to", "run/run1/freshtele", "--db", str(db), "--", "agent",
+        ],
+    )
+    assert result.exit_code == 0
+    from raven_bus import channels as channels_mod
+
+    with db_mod.connection(db) as conn:
+        assert channels_mod.get_channel(conn, "run/run1/fresh").kind == "broadcast"
+        assert channels_mod.get_channel(conn, "run/run1/freshtele").kind == "broadcast"
+
+
 def test_cli_initial_prompt_file_missing_is_usage_error(
     db: Path, tmp_path: Path
 ) -> None:

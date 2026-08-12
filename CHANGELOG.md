@@ -122,7 +122,10 @@ replaces v1's per-message delivery state with an append-only log + per-channel
   message reads as data, and a well-behaved agent refuses it (observed
   live: a claude lane declined its own assignment citing injection
   hygiene). Bus messages remain data-framed; only the spawner's packet
-  is trusted.
+  is trusted. `raven acp` also pre-creates its watched and reply
+  channels (broadcast) at startup, so a lane is startable before its
+  orchestrator has sent anything (a first poll on a never-used channel
+  used to die with `UnknownChannelError`).
 - **Claude Code PreToolUse hook** (`src/raven_bus/adapters/hooks/`) — a
   **peek-only** adapter for interactive sessions (ADR-006): on every tool call
   it reads pending, renders via `policy`, prints a compact block when anything
