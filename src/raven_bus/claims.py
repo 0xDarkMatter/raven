@@ -18,6 +18,32 @@ failure signal.
 Every public operation invokes ``db.sweep`` before observing actionable
 claim state. Valid only on ``queue`` channels
 (:class:`WrongChannelKindError` otherwise).
+
+CLAIM FRONTIER (verify-002 waived-P1 fix): a cold ``claim_next`` scans
+from message id 0, so a channel with a large terminal (done/dead)
+backlog pays an index scan proportional to that backlog on *every*
+call, not just the first. ``_FRONTIER`` is a per-process, in-memory
+``{(db_path, channel_id): id}`` watermark below which no NEVER-CLAIMED
+message can exist -- once a fresh-candidate scan proves it reached the
+true end of the messages table for a channel without filling a batch,
+every id up to that table's current max is known to already carry a
+claims row (or was just about to receive one), so the next call's
+fresh scan starts there instead of at 0. Lapsed rows (leases that
+expired) are NOT covered by the frontier -- they can and do exist
+below it, since a message can be claimed-then-lapse long after the
+frontier passed its id -- so they are always found via a direct
+``claims JOIN messages`` scan on ``state = 'lapsed'``, independent of
+the watermark. This keeps the sanctioned two-part shape: "have I ever
+been claimed" (frontier-bounded) is a different question from "am I
+lapsed right now" (small-table scan).
+
+Crash behaviour: the dict is pure cache, never persisted. A fresh
+process (restart, crash, new worker) starts every channel at
+frontier=0 and re-derives the watermark from the same query that
+serves the request -- one full backlog scan to warm up, same cost as
+today's unoptimised path, then O(batch) after. No schema change, no
+public-signature change, no correctness dependency on the dict ever
+being populated.
 """
 
 from __future__ import annotations
@@ -44,6 +70,50 @@ DEFAULT_LEASE_S = 300
 _CANDIDATE_BATCH = 32
 
 _NOW_SQL = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+
+# Per-process claim-frontier cache -- see the module docstring
+# ("CLAIM FRONTIER") for the invariant, the two-part scan shape it
+# enables, and cold-process (empty-dict) crash behaviour.
+_FRONTIER: dict[tuple[str, int], int] = {}
+
+_CANDIDATE_COLUMNS = """
+    m.id, ch.name, m.sender, m.type, m.urgency, m.body, m.tags,
+    m.reply_to, m.thread_id, m.expires_at, m.created_at
+"""
+
+# Part (a): lapsed rows -- always scanned from after_id, never bounded
+# by the frontier, since a message can lapse long after its id fell
+# below the watermark. Cheap because the claims table is small
+# relative to messages (no index on state is added -- that would be a
+# schema change, out of scope for this lane).
+_LAPSED_CANDIDATES_SQL = f"""
+    SELECT {_CANDIDATE_COLUMNS}, 'lapsed' AS claim_state
+    FROM claims AS cl
+    JOIN messages AS m ON m.id = cl.message_id
+    JOIN channels AS ch ON ch.id = m.channel_id
+    WHERE cl.state = 'lapsed'
+      AND m.channel_id = ?
+      AND m.id > ?
+      AND (m.expires_at IS NULL OR m.expires_at > {_NOW_SQL})
+    ORDER BY m.id
+    LIMIT {_CANDIDATE_BATCH}
+"""
+
+# Part (b): never-claimed rows -- bounded below by max(after_id,
+# frontier), so a warm frontier skips straight past any terminal
+# backlog instead of re-walking it every call.
+_FRESH_CANDIDATES_SQL = f"""
+    SELECT {_CANDIDATE_COLUMNS}, NULL AS claim_state
+    FROM messages AS m
+    JOIN channels AS ch ON ch.id = m.channel_id
+    LEFT JOIN claims AS cl ON cl.message_id = m.id
+    WHERE m.channel_id = ?
+      AND m.id > ?
+      AND (m.expires_at IS NULL OR m.expires_at > {_NOW_SQL})
+      AND cl.message_id IS NULL
+    ORDER BY m.id
+    LIMIT {_CANDIDATE_BATCH}
+"""
 
 
 def _upsert_consumer(conn: sqlite3.Connection, consumer: str) -> None:
@@ -130,6 +200,48 @@ def _denied(message_id: int, consumer: str) -> ClaimDeniedError:
     )
 
 
+def _frontier_db_key(conn: sqlite3.Connection) -> str:
+    """Identify the attached DB file for the ``_FRONTIER`` cache key.
+
+    ``PRAGMA database_list`` reflects the same read snapshot as any
+    other statement on this connection -- cheap (single row) and
+    avoids threading db_path through every caller."""
+    row = conn.execute("PRAGMA database_list").fetchone()
+    return "" if row is None else str(row[2])
+
+
+def _maybe_advance_frontier(
+    conn: sqlite3.Connection,
+    channel_id: int,
+    frontier_key: tuple[str, int],
+    frontier: int,
+    fresh_rows: list[sqlite3.Row],
+) -> None:
+    """Advance the cached frontier once a fresh-candidate scan proves
+    it reached the true end of the messages table for this channel.
+
+    Only call this once every row in ``fresh_rows`` has actually been
+    attempted (INSERTed) this round -- returning early with a winner
+    mid-batch would leave later fresh rows genuinely never-claimed,
+    and advancing the watermark past them would starve them forever.
+    ``len(fresh_rows) < _CANDIDATE_BATCH`` is what proves the scan hit
+    table end rather than stopping on LIMIT: SQLite only returns fewer
+    than the batch when there was nothing left to examine. Because
+    ``db.sweep``/``_upsert_consumer`` already opened a write
+    transaction earlier in this call, this MAX(id) read shares that
+    transaction's snapshot with the fresh-candidate scan -- no
+    concurrently-committed message can land at or below the ceiling
+    without also having been visible to the scan."""
+    if len(fresh_rows) >= _CANDIDATE_BATCH:
+        return
+    ceiling_row = conn.execute(
+        "SELECT MAX(id) FROM messages WHERE channel_id = ?", (channel_id,)
+    ).fetchone()
+    ceiling = ceiling_row[0]
+    if ceiling is not None and ceiling > frontier:
+        _FRONTIER[frontier_key] = int(ceiling)
+
+
 def claim_next(
     conn: sqlite3.Connection,
     consumer: str,
@@ -144,12 +256,16 @@ def claim_next(
     atomic INSERT) or a 'lapsed' row (won via the guarded UPDATE, which
     increments ``deliveries`` — durable dead-letter accounting). On a
     lost race, falls through to the next candidate; only returns None
-    when no candidate remains. Candidates are fetched in bounded
-    batches so a large backlog never runs an unbounded scan under the
-    write lock (finding verify-002)."""
+    when no candidate remains. Candidates are fetched as two bounded
+    batches — lapsed rows (always scanned) and fresh rows (scanned
+    from the cached claim frontier, see the module docstring) — so a
+    large terminal backlog never runs an unbounded scan under the
+    write lock (finding verify-002), and a warm frontier skips it
+    entirely on repeat calls."""
     db.sweep(conn)
     _upsert_consumer(conn, consumer)
     channel_id = _queue_channel_id(conn, channel)
+    frontier_key = (_frontier_db_key(conn), channel_id)
 
     after_id = 0
     while True:
@@ -158,28 +274,27 @@ def claim_next(
         # could otherwise write an already-expired lease_until
         # (re-verify wave finding).
         lease_until = _lease_until(lease_s)
-        candidates = conn.execute(
-            f"""
-            SELECT m.id, ch.name, m.sender, m.type, m.urgency, m.body, m.tags,
-                   m.reply_to, m.thread_id, m.expires_at, m.created_at,
-                   cl.state AS claim_state
-            FROM messages AS m
-            JOIN channels AS ch ON ch.id = m.channel_id
-            LEFT JOIN claims AS cl ON cl.message_id = m.id
-            WHERE m.channel_id = ?
-              AND m.id > ?
-              AND (m.expires_at IS NULL OR m.expires_at > {_NOW_SQL})
-              AND (cl.message_id IS NULL OR cl.state = 'lapsed')
-            ORDER BY m.id
-            LIMIT {_CANDIDATE_BATCH}
-            """,
-            (channel_id, after_id),
+        frontier = _FRONTIER.get(frontier_key, 0)
+        fresh_after = max(after_id, frontier)
+
+        lapsed_rows = conn.execute(
+            _LAPSED_CANDIDATES_SQL, (channel_id, after_id)
         ).fetchall()
+        fresh_rows = conn.execute(
+            _FRESH_CANDIDATES_SQL, (channel_id, fresh_after)
+        ).fetchall()
+
+        candidates = sorted([*lapsed_rows, *fresh_rows], key=lambda r: r["id"])
         if not candidates:
+            # Vacuously "every fresh row was attempted" (there were
+            # none) — safe to advance before returning.
+            _maybe_advance_frontier(
+                conn, channel_id, frontier_key, frontier, fresh_rows
+            )
             return None
 
         for row in candidates:
-            message_id = int(row[0])
+            message_id = int(row["id"])
             after_id = message_id
             if row["claim_state"] == "lapsed":
                 # Re-claim: the guarded UPDATE is the atomic winner test
@@ -206,6 +321,12 @@ def claim_next(
                 )
             if cursor.rowcount == 1:
                 return _message_from_row(row)
+
+        # Reached only when every candidate this round (including
+        # every fresh row) lost its race — each now genuinely carries
+        # a claims row, so it is safe to advance the frontier past
+        # them before the next iteration re-queries.
+        _maybe_advance_frontier(conn, channel_id, frontier_key, frontier, fresh_rows)
 
 
 def renew(
