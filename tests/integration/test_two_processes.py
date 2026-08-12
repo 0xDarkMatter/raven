@@ -111,7 +111,25 @@ def test_two_consumers_split_five_tasks_with_no_double_delivery(tmp_path: Path) 
     overlap = claimed_ids_by_consumer[0] & claimed_ids_by_consumer[1]
     assert not overlap, f"task(s) {overlap} were claimed by both consumers"
 
-    with sqlite3.connect(db) as conn:
+    # The consumers were just terminate()d; on Windows their -shm/-wal
+    # handles release asynchronously, and a read that triggers WAL
+    # recovery in that window intermittently raises 'disk I/O error'.
+    # Retry briefly — the DB itself is intact.
+    conn = None
+    deadline = time.time() + 5.0
+    while True:
+        try:
+            conn = sqlite3.connect(db, timeout=5.0)
+            conn.execute("SELECT count(*) FROM messages").fetchone()
+            break
+        except sqlite3.OperationalError:
+            if conn is not None:
+                conn.close()
+                conn = None
+            if time.time() >= deadline:
+                raise
+            time.sleep(0.1)
+    try:
         assert conn.execute(
             "SELECT count(*) FROM messages WHERE type = 'task'"
         ).fetchone()[0] == 5
@@ -122,3 +140,5 @@ def test_two_consumers_split_five_tasks_with_no_double_delivery(tmp_path: Path) 
         # One claim row per message: the schema's message_id PK already
         # forbids double-claiming, but assert the count explicitly too.
         assert conn.execute("SELECT count(*) FROM claims").fetchone()[0] == 5
+    finally:
+        conn.close()

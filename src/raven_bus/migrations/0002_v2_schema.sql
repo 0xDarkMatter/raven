@@ -42,10 +42,16 @@ CREATE TABLE IF NOT EXISTS cursors (
     PRIMARY KEY (consumer, channel_id)
 );
 
+-- 'lapsed' keeps the deliveries count DURABLE across requeue: a lapsed
+-- lease is re-claimable (claims.claim_next does a conditional UPDATE that
+-- increments deliveries) instead of being deleted — deleting it was how
+-- attempt counts reset and dead-lettering became unreachable (finding
+-- verify-001, raven2-p1 verify wave). Pre-release schema edit: no deployed
+-- DBs existed when 'lapsed' was added.
 CREATE TABLE IF NOT EXISTS claims (
     message_id  INTEGER PRIMARY KEY REFERENCES messages(id),
     consumer    TEXT NOT NULL,
-    state       TEXT NOT NULL CHECK (state IN ('leased','done','dead')),
+    state       TEXT NOT NULL CHECK (state IN ('leased','lapsed','done','dead')),
     deliveries  INTEGER NOT NULL DEFAULT 1,
     lease_until TEXT NOT NULL,
     updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))

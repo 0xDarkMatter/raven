@@ -16,6 +16,7 @@ Contract (frozen):
 from __future__ import annotations
 
 import sqlite3
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -47,22 +48,68 @@ def init_db(db_path: str | Path | None = None, *, force: bool = False) -> Path:
         return resolved
 
     resolved.parent.mkdir(parents=True, exist_ok=True)
+
+    # Fast path: an already-migrated DB needs no executescript at all.
+    # This is a concurrency fix, not an optimisation — re-running the
+    # script (incl. its WAL pragma) on a file other processes are
+    # actively writing raced into 'database is locked' at process
+    # startup (finding verify-004). Only genuine first-creation runs
+    # the script, and that residual race gets a bounded retry.
+    if not force and _schema_current(resolved):
+        _init_cache.add(resolved)
+        return resolved
+
     schema_sql = _V2_MIGRATION.read_text(encoding="utf-8")
+    last_error: sqlite3.OperationalError | None = None
+    for _attempt in range(5):
+        try:
+            conn = sqlite3.connect(str(resolved), timeout=DEFAULT_BUSY_TIMEOUT_S)
+            try:
+                conn.executescript(schema_sql)
+                conn.execute(
+                    "INSERT INTO bus_meta (key, value) VALUES ('schema_version', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (SCHEMA_VERSION,),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except sqlite3.OperationalError as exc:
+            # Another process is initialising the same file right now.
+            # If it finished the job, the fast path accepts its work.
+            last_error = exc
+            time.sleep(0.1)
+            if not force and _schema_current(resolved):
+                _init_cache.add(resolved)
+                return resolved
+            continue
+        _init_cache.add(resolved)
+        return resolved
 
-    conn = sqlite3.connect(str(resolved), timeout=DEFAULT_BUSY_TIMEOUT_S)
+    raise last_error if last_error is not None else RuntimeError(
+        "init_db retry loop exited without an error"
+    )  # pragma: no cover -- loop always sets last_error before exhausting
+
+
+def _schema_current(resolved: Path) -> bool:
+    """True if ``resolved`` already carries the current schema version.
+
+    Read-only probe; never creates the file (sqlite3.connect would, so
+    check existence first) and treats any error as "not initialised".
+    """
+    if not resolved.exists():
+        return False
     try:
-        conn.executescript(schema_sql)
-        conn.execute(
-            "INSERT INTO bus_meta (key, value) VALUES ('schema_version', ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (SCHEMA_VERSION,),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-    _init_cache.add(resolved)
-    return resolved
+        conn = sqlite3.connect(str(resolved), timeout=DEFAULT_BUSY_TIMEOUT_S)
+        try:
+            row = conn.execute(
+                "SELECT value FROM bus_meta WHERE key = 'schema_version'"
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
+    return row is not None and str(row[0]) == SCHEMA_VERSION
 
 
 @contextmanager
@@ -99,46 +146,44 @@ def data_version(conn: sqlite3.Connection) -> int:
 def sweep(conn: sqlite3.Connection) -> SweepResult:
     """Enforce time-based state, in one pass (ADR-001):
 
-    1. **Lease reaping**: DELETE claims where ``state='leased' AND
-       lease_until < now AND deliveries < channel.max_deliveries``
-       (message becomes claimable again → counts as ``requeued``);
-       claims at/over max_deliveries flip to ``state='dead'`` instead
-       (→ ``dead_lettered``).
+    1. **Lease reaping** — two single set-based UPDATEs whose WHERE
+       clauses re-check every predicate at write time (a SELECT-then-
+       write gap here clobbered concurrently-completed claims and could
+       double-lease — finding verify-000):
+       ``leased AND lease_until < now AND deliveries >= max_deliveries``
+       → ``dead`` (→ ``dead_lettered``); same but ``< max_deliveries``
+       → ``lapsed`` (→ ``requeued``). A lapsed claim keeps its
+       ``deliveries`` count durably and is re-claimed (count+1) by
+       ``claims.claim_next`` — never deleted, so no caller-side
+       snapshot is needed and dead-lettering cannot be evaded by other
+       sweep call sites (finding verify-001).
     2. **Expiry**: messages past ``expires_at`` are *not* deleted
-       (append-only log) — read paths must filter them. ``expired``
-       counts messages newly past expiry with no terminal claim, for
-       observability only.
+       (append-only log) — read paths must filter them. ``expired`` is
+       a RUNNING TOTAL of live-expired messages lacking a terminal
+       claim (observability only; it is not "newly expired this
+       sweep").
 
     Cheap when nothing is stale; safe to call on every read."""
     now = _now_iso()
 
-    stale = conn.execute(
-        """
-        SELECT c.message_id AS message_id, c.deliveries AS deliveries,
-               ch.max_deliveries AS max_deliveries
-        FROM claims AS c
-        JOIN messages AS m ON m.id = c.message_id
-        JOIN channels AS ch ON ch.id = m.channel_id
-        WHERE c.state = 'leased' AND c.lease_until < ?
-        """,
-        (now,),
-    ).fetchall()
+    _MAX_SUBQ = (
+        "(SELECT ch.max_deliveries FROM messages AS m "
+        " JOIN channels AS ch ON ch.id = m.channel_id "
+        " WHERE m.id = claims.message_id)"
+    )
+    dead_cur = conn.execute(
+        "UPDATE claims SET state = 'dead', updated_at = ? "
+        f"WHERE state = 'leased' AND lease_until < ? AND deliveries >= {_MAX_SUBQ}",
+        (now, now),
+    )
+    dead_lettered = dead_cur.rowcount if dead_cur.rowcount != -1 else 0
 
-    requeued = 0
-    dead_lettered = 0
-    for row in stale:
-        if row["deliveries"] < row["max_deliveries"]:
-            conn.execute(
-                "DELETE FROM claims WHERE message_id = ?", (row["message_id"],)
-            )
-            requeued += 1
-        else:
-            conn.execute(
-                "UPDATE claims SET state = 'dead', updated_at = ? "
-                "WHERE message_id = ?",
-                (now, row["message_id"]),
-            )
-            dead_lettered += 1
+    requeue_cur = conn.execute(
+        "UPDATE claims SET state = 'lapsed', updated_at = ? "
+        f"WHERE state = 'leased' AND lease_until < ? AND deliveries < {_MAX_SUBQ}",
+        (now, now),
+    )
+    requeued = requeue_cur.rowcount if requeue_cur.rowcount != -1 else 0
 
     expired_row = conn.execute(
         """

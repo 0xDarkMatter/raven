@@ -242,12 +242,17 @@ def test_sweep_requeues_lease_below_max_deliveries(db: Path) -> None:
     with bus_db.connection(db) as conn:
         result = bus_db.sweep(conn)
         remaining = conn.execute(
-            "SELECT * FROM claims WHERE message_id = ?", (mid,)
+            "SELECT state, deliveries FROM claims WHERE message_id = ?", (mid,)
         ).fetchone()
 
     assert result.requeued == 1
     assert result.dead_lettered == 0
-    assert remaining is None
+    # Requeue keeps the row as 'lapsed' with its attempt count intact —
+    # deleting it was how delivery counts reset and dead-lettering became
+    # evadable (verify-000/001 fix round).
+    assert remaining is not None
+    assert remaining["state"] == "lapsed"
+    assert remaining["deliveries"] == 2
 
 
 def test_sweep_dead_letters_at_max_deliveries_boundary(db: Path) -> None:
@@ -434,3 +439,80 @@ def test_teardown_run_returns_zero_for_unknown_run(db: Path) -> None:
     with bus_db.connection(db) as conn:
         deleted = bus_db.teardown_run(conn, "nonexistent")
     assert deleted == 0
+
+
+# --------------------------------------------------------------------------- #
+# init_db concurrency hardening (verify-004 fix round)
+# --------------------------------------------------------------------------- #
+
+
+def test_init_db_fast_path_skips_migration_read(db: Path, monkeypatch) -> None:
+    """An already-migrated DB must not re-run (or even read) the script —
+    re-applying it on a live file was the 'database is locked' race."""
+    bus_db._reset_init_cache()
+    monkeypatch.setattr(
+        bus_db, "_V2_MIGRATION", Path("does/not/exist/0002.sql")
+    )
+    resolved = bus_db.init_db(db)  # would raise if the script were read
+    assert resolved == db.resolve()
+
+
+class _LockedConn:
+    """Stand-in for sqlite3.connect whose executescript always hits the
+    lock — sqlite3.Connection is an immutable C type, so the lock is
+    simulated at the connect seam instead of by patching the method."""
+
+    def executescript(self, _sql: str) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    def close(self) -> None:  # pragma: no cover -- trivial stub
+        pass
+
+
+def test_init_db_accepts_peer_initialisation_after_lock(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A locked first-create retries, and succeeds by ACCEPTING a peer
+    process's completed initialisation rather than winning the lock."""
+    bus_db._reset_init_cache()
+    target = tmp_path / "peer.db"
+    probes = iter([False, True])
+    monkeypatch.setattr(bus_db, "_schema_current", lambda _p: next(probes))
+    monkeypatch.setattr(bus_db.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(bus_db.sqlite3, "connect", lambda *_a, **_k: _LockedConn())
+    assert bus_db.init_db(target) == target.resolve()
+
+
+def test_init_db_raises_after_retries_exhausted(tmp_path: Path, monkeypatch) -> None:
+    bus_db._reset_init_cache()
+    monkeypatch.setattr(bus_db, "_schema_current", lambda _p: False)
+    monkeypatch.setattr(bus_db.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(bus_db.sqlite3, "connect", lambda *_a, **_k: _LockedConn())
+    with pytest.raises(sqlite3.OperationalError):
+        bus_db.init_db(tmp_path / "never.db")
+
+
+def test_schema_current_probe_edges(tmp_path: Path, db: Path) -> None:
+    # Missing file: not initialised (and must not be created by probing).
+    ghost = tmp_path / "ghost.db"
+    assert bus_db._schema_current(ghost) is False
+    assert not ghost.exists()
+    # Garbage bytes: sqlite error -> not initialised.
+    garbage = tmp_path / "garbage.db"
+    garbage.write_bytes(b"definitely not a sqlite file")
+    assert bus_db._schema_current(garbage) is False
+    # Valid empty DB without bus_meta: not initialised.
+    bare = tmp_path / "bare.db"
+    sqlite3.connect(bare).close()
+    assert bus_db._schema_current(bare) is False
+    # Initialised DB with a stale version string: not current.
+    with bus_db.connection(db) as conn:
+        conn.execute("UPDATE bus_meta SET value = '0' WHERE key = 'schema_version'")
+    assert bus_db._schema_current(db) is False
+    # Restore and confirm the positive probe.
+    with bus_db.connection(db) as conn:
+        conn.execute(
+            "UPDATE bus_meta SET value = ? WHERE key = 'schema_version'",
+            (bus_db.SCHEMA_VERSION,),
+        )
+    assert bus_db._schema_current(db) is True

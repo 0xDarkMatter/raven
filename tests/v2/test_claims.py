@@ -406,3 +406,65 @@ def test_dead_letters_exactly_at_max_deliveries(raw_db: Path) -> None:
     assert terminal is not None
     assert (terminal["state"], terminal["deliveries"]) == ("dead", 2)
     conn.close()
+
+def test_delivery_count_survives_foreign_sweep(raw_db: Path) -> None:
+    """verify-001 regression: a sweep triggered ANYWHERE (another
+    channel's claimant, cursors.pending, raven doctor) between lapse and
+    re-claim must not reset the attempt count. The count is durable in
+    the 'lapsed' claim row, so dead-letter fires at max_deliveries even
+    when this channel's claimant never sweeps its own lapsed lease."""
+    conn = _connect(raw_db)
+    _insert_channel(conn, name="run/t/qa", kind="queue", max_deliveries=2)
+    qb_id = _insert_channel(conn, name="run/t/qb", kind="queue", max_deliveries=2)
+    mid = _insert_message(conn, qb_id)
+    conn.commit()
+
+    # Attempt 1 on qb lapses; a FOREIGN sweep (qa claimant) reaps it.
+    assert claim_next(conn, "w1@t", "run/t/qb").id == mid
+    _expire_claim(conn, mid)
+    assert claim_next(conn, "other@t", "run/t/qa") is None  # sweeps
+
+    row = conn.execute(
+        "SELECT state, deliveries FROM claims WHERE message_id = ?", (mid,)
+    ).fetchone()
+    assert (row["state"], row["deliveries"]) == ("lapsed", 1)
+
+    # Attempt 2 re-claims WITH the incremented count...
+    msg = claim_next(conn, "w2@t", "run/t/qb")
+    assert msg is not None and msg.id == mid
+    row = conn.execute(
+        "SELECT deliveries FROM claims WHERE message_id = ?", (mid,)
+    ).fetchone()
+    assert row["deliveries"] == 2
+
+    # ...so the next lapse dead-letters at max_deliveries=2, despite the
+    # sweep again coming from the foreign channel.
+    _expire_claim(conn, mid)
+    assert claim_next(conn, "other@t", "run/t/qa") is None  # sweeps
+    row = conn.execute(
+        "SELECT state, deliveries FROM claims WHERE message_id = ?", (mid,)
+    ).fetchone()
+    assert (row["state"], row["deliveries"]) == ("dead", 2)
+    conn.close()
+
+
+def test_sweep_never_touches_terminal_claims_with_stale_leases(raw_db: Path) -> None:
+    """verify-000 regression (predicate form): sweep's writes re-check
+    state at write time, so a claim that reached 'done' keeps its state
+    even when its lease_until is long past."""
+    from raven_bus import db as bus_db
+
+    conn = _connect(raw_db)
+    qid = _insert_channel(conn, name="run/t/q", kind="queue")
+    mid = _insert_message(conn, qid)
+    _insert_claim(conn, mid, state="done", lease_until="2000-01-01T00:00:00.000Z")
+    conn.commit()
+
+    result = bus_db.sweep(conn)
+    assert result.requeued == 0
+    assert result.dead_lettered == 0
+    row = conn.execute(
+        "SELECT state FROM claims WHERE message_id = ?", (mid,)
+    ).fetchone()
+    assert row["state"] == "done"
+    conn.close()

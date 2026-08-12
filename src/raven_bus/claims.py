@@ -4,15 +4,16 @@ ADR-001: exactly-one-winner claiming uses
 ``INSERT INTO claims ... ON CONFLICT DO NOTHING``; rowcount 1 wins. Queue
 state never mutates the append-only message log.
 
-The frozen sweep contract deletes a sub-threshold lapsed claim. To retain
-its attempt count without adding state to ``messages``, :func:`claim_next`
-snapshots lapsed claims for its channel immediately before calling
-``db.sweep``. A winning re-claim inserts ``deliveries=prior+1``. Once the
-stored count reaches ``channel.max_deliveries``, the next sweep changes the
-claim to ``dead`` instead of deleting it. A voluntary release is not in the
-snapshot and its later claim therefore starts at one. This bookkeeping is
-deliberately scoped to the same claim operation and transaction as the
-sweep; the claims row remains the sole durable queue state.
+``db.sweep`` flips a lapsed lease to state='lapsed' (verify-000/001 fix
+round), so the ``deliveries`` count survives requeue DURABLY in the
+claims row. A lapsed claim is re-won atomically by
+``UPDATE ... SET state='leased', consumer=?, deliveries=deliveries+1
+WHERE message_id=? AND state='lapsed'`` (rowcount 1 wins); a
+never-claimed message by the INSERT above. There is no caller-side
+snapshot, so any sweep call site (cursors, doctor, other channels) is
+harmless to dead-letter accounting. A voluntary ``release`` deletes the
+row, deliberately forgetting attempts — cooperative hand-back is not a
+failure signal.
 
 Every public operation invokes ``db.sweep`` before observing actionable
 claim state. Valid only on ``queue`` channels
@@ -35,6 +36,12 @@ from raven_bus.exceptions import (
 from raven_bus.models import Claim, Message, parse_consumer_id, validate_channel_name
 
 DEFAULT_LEASE_S = 300
+
+# Candidate batch bound: keeps claim_next's scan O(batch) per round trip
+# instead of loading an entire backlog (with bodies) under the write
+# lock (finding verify-002). Losing a full batch to racing claimants
+# just advances the id watermark and re-queries.
+_CANDIDATE_BATCH = 32
 
 _NOW_SQL = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
 
@@ -67,25 +74,6 @@ def _queue_channel_id(conn: sqlite3.Connection, channel: str) -> int:
             f"channel {channel!r} has kind {row[1]!r}, expected 'queue'"
         )
     return int(row[0])
-
-
-def _lapsed_deliveries(conn: sqlite3.Connection, channel: str) -> dict[int, int]:
-    """Capture counts that the frozen sweep is about to delete."""
-    validate_channel_name(channel)
-    rows = conn.execute(
-        f"""
-        SELECT cl.message_id, cl.deliveries
-        FROM claims AS cl
-        JOIN messages AS m ON m.id = cl.message_id
-        JOIN channels AS ch ON ch.id = m.channel_id
-        WHERE ch.name = ?
-          AND cl.state = 'leased'
-          AND cl.lease_until < {_NOW_SQL}
-          AND cl.deliveries < ch.max_deliveries
-        """,
-        (channel,),
-    ).fetchall()
-    return {int(row[0]): int(row[1]) for row in rows}
 
 
 def _lease_until(lease_s: int) -> str:
@@ -151,46 +139,69 @@ def claim_next(
 ) -> Message | None:
     """Claim the oldest live unclaimed message on ``channel``, or None.
 
-    Skips expired messages and messages with any claim row (leased,
-    done, or dead). On a lost race (another consumer inserted first),
-    retries the next candidate rather than returning None early.
-    Re-claiming after a lease lapse increments ``deliveries``."""
-    prior_deliveries = _lapsed_deliveries(conn, channel)
+    Skips expired messages and messages whose claim row is terminal or
+    live (done, dead, leased). Claimable = no claim row (won via the
+    atomic INSERT) or a 'lapsed' row (won via the guarded UPDATE, which
+    increments ``deliveries`` — durable dead-letter accounting). On a
+    lost race, falls through to the next candidate; only returns None
+    when no candidate remains. Candidates are fetched in bounded
+    batches so a large backlog never runs an unbounded scan under the
+    write lock (finding verify-002)."""
     db.sweep(conn)
     _upsert_consumer(conn, consumer)
     channel_id = _queue_channel_id(conn, channel)
 
-    candidates = conn.execute(
-        f"""
-        SELECT m.id, ch.name, m.sender, m.type, m.urgency, m.body, m.tags,
-               m.reply_to, m.thread_id, m.expires_at, m.created_at
-        FROM messages AS m
-        JOIN channels AS ch ON ch.id = m.channel_id
-        LEFT JOIN claims AS cl ON cl.message_id = m.id
-        WHERE m.channel_id = ?
-          AND (m.expires_at IS NULL OR m.expires_at > {_NOW_SQL})
-          AND cl.message_id IS NULL
-        ORDER BY m.id
-        """,
-        (channel_id,),
-    ).fetchall()
-
     lease_until = _lease_until(lease_s)
-    for row in candidates:
-        message_id = int(row[0])
-        attempts = prior_deliveries.get(message_id, 0) + 1
-        cursor = conn.execute(
-            """
-            INSERT INTO claims(
-                message_id, consumer, state, deliveries, lease_until
-            ) VALUES (?, ?, 'leased', ?, ?)
-            ON CONFLICT(message_id) DO NOTHING
+    after_id = 0
+    while True:
+        candidates = conn.execute(
+            f"""
+            SELECT m.id, ch.name, m.sender, m.type, m.urgency, m.body, m.tags,
+                   m.reply_to, m.thread_id, m.expires_at, m.created_at,
+                   cl.state AS claim_state
+            FROM messages AS m
+            JOIN channels AS ch ON ch.id = m.channel_id
+            LEFT JOIN claims AS cl ON cl.message_id = m.id
+            WHERE m.channel_id = ?
+              AND m.id > ?
+              AND (m.expires_at IS NULL OR m.expires_at > {_NOW_SQL})
+              AND (cl.message_id IS NULL OR cl.state = 'lapsed')
+            ORDER BY m.id
+            LIMIT {_CANDIDATE_BATCH}
             """,
-            (message_id, consumer, attempts, lease_until),
-        )
-        if cursor.rowcount == 1:
-            return _message_from_row(row)
-    return None
+            (channel_id, after_id),
+        ).fetchall()
+        if not candidates:
+            return None
+
+        for row in candidates:
+            message_id = int(row[0])
+            after_id = message_id
+            if row["claim_state"] == "lapsed":
+                # Re-claim: the guarded UPDATE is the atomic winner test
+                # AND the durable attempt increment in one statement.
+                cursor = conn.execute(
+                    f"""
+                    UPDATE claims
+                    SET consumer = ?, state = 'leased',
+                        deliveries = deliveries + 1,
+                        lease_until = ?, updated_at = {_NOW_SQL}
+                    WHERE message_id = ? AND state = 'lapsed'
+                    """,
+                    (consumer, lease_until, message_id),
+                )
+            else:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO claims(
+                        message_id, consumer, state, deliveries, lease_until
+                    ) VALUES (?, ?, 'leased', 1, ?)
+                    ON CONFLICT(message_id) DO NOTHING
+                    """,
+                    (message_id, consumer, lease_until),
+                )
+            if cursor.rowcount == 1:
+                return _message_from_row(row)
 
 
 def renew(

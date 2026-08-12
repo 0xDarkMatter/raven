@@ -132,7 +132,7 @@ class Claim(BaseModel):
 
     message_id: int
     consumer: str
-    state: Literal["leased", "done", "dead"]
+    state: Literal["leased", "lapsed", "done", "dead"]
     deliveries: int
     lease_until: datetime
     updated_at: datetime
