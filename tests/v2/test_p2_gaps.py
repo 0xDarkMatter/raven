@@ -251,3 +251,100 @@ def test_send_rejects_non_object_body_field(client: TestClient) -> None:
     )
     assert resp.status_code == 400
     assert "must be a JSON object" in resp.json()["detail"]
+
+
+def test_claim_action_path_id_beyond_int64_is_400(client: TestClient) -> None:
+    resp = client.post(f"/claims/{2**63}/done", json={"consumer": "r@g"})
+    assert resp.status_code == 400
+
+
+def test_send_rejects_non_string_scalars(client: TestClient) -> None:
+    resp = client.post(
+        "/send",
+        json={"channel": "run/g/s", "sender": "r@g", "type": False, "body": {}},
+    )
+    assert resp.status_code == 400
+    assert "non-empty string" in resp.json()["detail"]
+
+    resp = client.post(
+        "/send",
+        json={
+            "channel": "run/g/s", "sender": "r@g", "type": "t",
+            "body": {}, "kind": True,
+        },
+    )
+    assert resp.status_code == 400
+
+
+def test_send_rejects_nan_in_body(client: TestClient, db: Path) -> None:
+    """NaN passed python-json ingest, committed, then blew up in the
+    response encoder — the row must never commit now."""
+    resp = client.post(
+        "/send",
+        content='{"channel":"run/g/nan","sender":"r@g","type":"t","body":{"x":NaN}}',
+        headers={"content-type": "application/json"},
+    )
+    assert resp.status_code == 400
+    with bus_db.connection(db) as conn:
+        count = conn.execute("SELECT count(*) FROM messages").fetchone()[0]
+    assert count == 0
+
+
+def test_405_envelope_keeps_allow_header(client: TestClient) -> None:
+    resp = client.get("/send")
+    assert resp.status_code == 405
+    assert "POST" in resp.headers.get("allow", "")
+
+
+def test_sse_drain_cap_forces_reread_not_livelock(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Hitting _MAX_BATCHES_PER_POLL must yield what was read and force
+    an immediate re-read — unbounded draining livelocked against a hot
+    producer (re-verify finding). Tiny batch/cap makes 3 messages span
+    several capped polls."""
+    import threading
+    import time as time_mod
+
+    import httpx
+    import uvicorn
+
+    from raven_bus.http import sse
+
+    monkeypatch.setattr(sse, "POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr(sse, "PING_INTERVAL_S", 5.0)
+    monkeypatch.setattr(sse, "_READ_BATCH", 1)
+    monkeypatch.setattr(sse, "_MAX_BATCHES_PER_POLL", 1)
+
+    with bus_db.connection(db) as conn:
+        for n in range(3):
+            log.append(conn, channel="run/g/cap", sender="w@g", type="t", body={"n": n})
+
+    app = http_app.create_app(db)
+    config = uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning")
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time_mod.time() + 10.0
+    while not server.started:
+        assert time_mod.time() < deadline, "uvicorn did not start"
+        time_mod.sleep(0.02)
+    port = server.servers[0].sockets[0].getsockname()[1]
+
+    seen = 0
+    try:
+        with (
+            httpx.Client(timeout=httpx.Timeout(10.0)) as http,
+            http.stream(
+                "GET", f"http://127.0.0.1:{port}/tail?channel=run/g/cap"
+            ) as response,
+        ):
+            for line in response.iter_lines():
+                if line.startswith("event: message"):
+                    seen += 1
+                    if seen == 3:
+                        break
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5.0)
+    assert seen == 3

@@ -26,6 +26,7 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 
+import anyio
 from anyio import to_thread
 
 from raven_bus import channels, db, log
@@ -47,6 +48,12 @@ PING_INTERVAL_S = 15.0
 # on data_version CHANGING — hence the drain loop in _collect_batch.
 _MAX_SQLITE_INT = 2**63 - 1
 _READ_BATCH = 100
+
+# Drain bound per poll: without it, a producer keeping >= 1 full batch
+# unread livelocks the collect loop (nothing ever yields — re-verify
+# finding). Hitting the bound forces an immediate re-read next tick
+# instead of waiting on data_version.
+_MAX_BATCHES_PER_POLL = 10
 
 
 async def tail(request: Request) -> Response:
@@ -72,9 +79,15 @@ async def tail(request: Request) -> Response:
 
     db_path = request.app.state.db_path
     if channel is not None:
-        try:
+        def _preflight() -> None:
             with db.connection(db_path) as conn:
                 channels.get_channel(conn, channel)
+
+        try:
+            # Off-loop like every other store call (re-verify finding:
+            # this preflight could freeze the process behind a busy
+            # timeout).
+            await to_thread.run_sync(_preflight)
         except Exception as exc:  # noqa: BLE001 -- ADR-005: every failure routes through map_exception
             return map_exception(exc)
 
@@ -92,11 +105,15 @@ async def _events(
     last_version: int | None = None
     idle_s = 0.0
 
-    def _collect_batch(conn) -> list:
-        """Blocking read pass (runs in a worker thread): DRAINS each
-        channel — read_after loops until a short batch, so a burst
-        larger than one batch committed in a single txn cannot strand
-        messages behind an unchanged data_version (verify finding)."""
+    def _collect_batch(conn) -> tuple[list, bool]:
+        """Blocking read pass (runs in a worker thread): drains each
+        channel up to ``_MAX_BATCHES_PER_POLL`` batches — unbounded
+        draining livelocked against a producer that kept ≥1 full batch
+        unread (re-verify finding), while a single batch stranded
+        single-txn bursts (verify finding). Returns (messages, drained)
+        — ``drained=False`` means more rows are already known to exist,
+        so the caller must re-read WITHOUT waiting for data_version to
+        change again."""
         if channel is None:
             # Deliberately O(channels) per changed poll: the HTTP bridge
             # composes public store contracts instead of adding log APIs.
@@ -105,8 +122,9 @@ async def _events(
             names = [channel]
 
         collected = []
+        drained = True
         for name in names:
-            while True:
+            for _round in range(_MAX_BATCHES_PER_POLL):
                 channel_after = last_ids.setdefault(name, after)
                 batch = log.read_after(
                     conn, name, channel_after,
@@ -117,18 +135,30 @@ async def _events(
                     last_ids[name] = batch[-1].id
                 if len(batch) < _READ_BATCH:
                     break
-        return sorted(collected, key=lambda item: item.id)
+            else:
+                drained = False
+        return sorted(collected, key=lambda item: item.id), drained
 
+    conn_cm = db.connection(db_path, cross_thread=True)
     try:
         # cross_thread: the connection lives on this task but every
-        # blocking call runs via to_thread; calls are awaited serially,
-        # so no two threads ever touch it at once (db.connection docs).
-        with db.connection(db_path, cross_thread=True) as conn:
+        # blocking call (INCLUDING open/close — re-verify finding) runs
+        # via to_thread; calls are awaited serially, so no two threads
+        # ever touch it at once (db.connection docs).
+        conn = await to_thread.run_sync(conn_cm.__enter__)
+        try:
             while not await request.is_disconnected():
                 version = await to_thread.run_sync(db.data_version, conn)
                 if last_version is None or version != last_version:
                     last_version = version
-                    messages = await to_thread.run_sync(_collect_batch, conn)
+                    messages, drained = await to_thread.run_sync(
+                        _collect_batch, conn
+                    )
+                    if not drained:
+                        # Force an immediate re-read next tick — rows we
+                        # already know about must not wait for another
+                        # commit to move data_version.
+                        last_version = None
 
                     for message in messages:
                         payload = json.dumps(
@@ -148,6 +178,13 @@ async def _events(
                 if idle_s >= PING_INTERVAL_S:
                     yield ": ping\n\n"
                     idle_s = 0.0
+        finally:
+            # Close off-loop too; shielded so a disconnect-cancellation
+            # arriving mid-close cannot leak the connection.
+            with anyio.CancelScope(shield=True):
+                await to_thread.run_sync(
+                    conn_cm.__exit__, None, None, None
+                )
     except asyncio.CancelledError:
         return
 

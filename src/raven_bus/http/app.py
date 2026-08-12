@@ -72,11 +72,15 @@ async def run_db(fn):
 async def _http_exception(request: Request, exc: HTTPException) -> JSONResponse:
     """Router-level errors (404 no-route, 405 method) wear the same
     envelope as handler errors — plain-text bodies from the router were
-    a verify finding."""
+    a verify finding. exc.headers pass through (405's Allow header —
+    re-verify finding)."""
     code = "not_found" if exc.status_code == 404 else "error"
     if exc.status_code == 405:
         code = "method_not_allowed"
-    return error_response(code, exc.detail or "", exc.status_code)
+    response = error_response(code, exc.detail or "", exc.status_code)
+    for key, value in (exc.headers or {}).items():
+        response.headers[key] = value
+    return response
 
 
 def create_app(db_path: str | Path | None = None) -> Starlette:

@@ -11,6 +11,7 @@ render every failure through ``map_exception``.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from starlette.responses import JSONResponse
@@ -58,6 +59,37 @@ def _int_field(
     return value
 
 
+def _str_fields(payload: dict, *keys: str) -> None:
+    """Present keys among ``keys`` must be non-empty strings — JSON
+    scalars like ``false`` were silently coerced downstream (re-verify
+    finding: type:false stored as '0', kind:true hit an IntegrityError)."""
+    for key in keys:
+        if key in payload:
+            value = payload[key]
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{key!r} must be a non-empty string")
+
+
+def _finite_body(body: dict) -> None:
+    """Reject NaN/Infinity anywhere in the body BEFORE the store commit —
+    python json accepts them on ingest but the response encoder refuses,
+    which used to commit the row and then 500 (re-verify finding)."""
+    try:
+        json.dumps(body, allow_nan=False)
+    except ValueError as exc:
+        raise ValueError(f"'body' must contain only finite numbers: {exc}") from exc
+
+
+def _path_message_id(request: Request) -> int:
+    """Path message ids must fit SQLite's int64 — the {message_id:int}
+    converter happily matches larger digits (re-verify finding:
+    OverflowError as a 500)."""
+    message_id = request.path_params["message_id"]
+    if not 0 <= message_id <= MAX_SQLITE_INT:
+        raise ValueError(f"message_id must be between 0 and {MAX_SQLITE_INT}")
+    return message_id
+
+
 def _tags_field(payload: dict) -> list[str] | None:
     """``tags`` must be a list of strings — a bare string would be
     iterated character-wise by the store (verify finding)."""
@@ -79,8 +111,10 @@ async def send(request: Request) -> Response:
             {"channel", "sender", "type", "body"},
             {"urgency", "tags", "reply_to", "thread_id", "expires_in_s", "kind"},
         )
+        _str_fields(payload, "channel", "sender", "type", "urgency", "kind")
         if not isinstance(payload["body"], dict):
             raise ValueError("'body' must be a JSON object")
+        _finite_body(payload["body"])
         tags = _tags_field(payload)
         reply_to = _int_field(payload, "reply_to", minimum=1, maximum=MAX_SQLITE_INT)
         thread_id = _int_field(payload, "thread_id", minimum=1, maximum=MAX_SQLITE_INT)
@@ -123,6 +157,7 @@ async def claim(request: Request) -> Response:
     try:
         payload = await read_json_body(request)
         _strict(payload, {"channel", "consumer"}, {"lease_s"})
+        _str_fields(payload, "channel", "consumer")
         lease_s = _int_field(
             payload, "lease_s", minimum=1, maximum=MAX_LEASE_S,
             default=claims.DEFAULT_LEASE_S,
@@ -145,7 +180,7 @@ async def claim(request: Request) -> Response:
 
 def _claim_action(request: Request, payload: dict, fn):
     """Build the store closure for renew/done/release (run via run_db)."""
-    message_id = request.path_params["message_id"]
+    message_id = _path_message_id(request)
 
     def work() -> dict[str, Any] | None:
         with db.connection(request.app.state.db_path) as conn:
@@ -160,6 +195,7 @@ async def claim_renew(request: Request) -> Response:
     try:
         payload = await read_json_body(request)
         _strict(payload, {"consumer"}, {"lease_s"})
+        _str_fields(payload, "consumer")
         lease_s = _int_field(
             payload, "lease_s", minimum=1, maximum=MAX_LEASE_S,
             default=claims.DEFAULT_LEASE_S,
@@ -179,6 +215,7 @@ async def claim_done(request: Request) -> Response:
     try:
         payload = await read_json_body(request)
         _strict(payload, {"consumer"})
+        _str_fields(payload, "consumer")
         dumped = await run_db(_claim_action(request, payload, claims.complete))
     except Exception as exc:  # noqa: BLE001 -- map_exception re-raises anything it does not recognize
         return map_exception(exc)
@@ -190,6 +227,7 @@ async def claim_release(request: Request) -> Response:
     try:
         payload = await read_json_body(request)
         _strict(payload, {"consumer"})
+        _str_fields(payload, "consumer")
         await run_db(_claim_action(request, payload, claims.release))
     except Exception as exc:  # noqa: BLE001 -- map_exception re-raises anything it does not recognize
         return map_exception(exc)
@@ -202,6 +240,7 @@ async def ack(request: Request) -> Response:
     try:
         payload = await read_json_body(request)
         _strict(payload, {"channel", "consumer", "up_to_id"})
+        _str_fields(payload, "channel", "consumer")
         up_to_id = _int_field(payload, "up_to_id", minimum=0, maximum=MAX_SQLITE_INT)
 
         def work() -> dict[str, Any]:
@@ -222,6 +261,7 @@ async def heartbeat(request: Request) -> Response:
     try:
         payload = await read_json_body(request)
         _strict(payload, {"consumer"})
+        _str_fields(payload, "consumer")
 
         def work() -> None:
             with db.connection(request.app.state.db_path) as conn:
