@@ -489,6 +489,69 @@ def test_cli_double_dash_parsing_and_exit_code(
     assert config.mode == "bypassPermissions"
 
 
+def test_cli_initial_prompt_file_read_and_passed_verbatim(
+    db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    packet = tmp_path / "packet.md"
+    packet.write_text("do the thing\n", encoding="utf-8")
+    captured: dict = {}
+
+    class _FakeProc:
+        def __init__(self, argv, **kwargs) -> None:
+            pass
+
+        def poll(self):
+            return 0
+
+        def terminate(self) -> None:
+            pass  # pragma: no cover -- child already exited
+
+    def _fake_run_harness(config, child, **kwargs) -> int:
+        captured["config"] = config
+        return 0
+
+    monkeypatch.setattr("raven_bus.cli.acp.subprocess.Popen", _FakeProc)
+    monkeypatch.setattr("raven_bus.cli.acp.run_harness", _fake_run_harness)
+
+    result = runner.invoke(
+        app,
+        [
+            "acp", "--as", CONSUMER, "--channel", CHANNEL, "--db", str(db),
+            "--initial-prompt-file", str(packet), "--", "agent",
+        ],
+    )
+    assert result.exit_code == 0
+    assert captured["config"].initial_prompt == "do the thing\n"
+
+
+def test_cli_initial_prompt_file_missing_is_usage_error(
+    db: Path, tmp_path: Path
+) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "acp", "--as", CONSUMER, "--channel", CHANNEL, "--db", str(db),
+            "--initial-prompt-file", str(tmp_path / "nope.md"), "--", "agent",
+        ],
+    )
+    assert result.exit_code == 2
+
+
+def test_cli_initial_prompt_file_empty_is_usage_error(
+    db: Path, tmp_path: Path
+) -> None:
+    packet = tmp_path / "blank.md"
+    packet.write_text("   \n", encoding="utf-8")
+    result = runner.invoke(
+        app,
+        [
+            "acp", "--as", CONSUMER, "--channel", CHANNEL, "--db", str(db),
+            "--initial-prompt-file", str(packet), "--", "agent",
+        ],
+    )
+    assert result.exit_code == 2
+
+
 def test_cli_blank_mode_is_usage_error(db: Path) -> None:
     result = runner.invoke(
         app,
@@ -534,6 +597,41 @@ def test_mode_none_never_sends_set_mode(
     assert rc == 0
     assert client.modes == []
     assert "set_mode" not in client.calls
+
+
+def test_initial_prompt_sent_verbatim_first_with_boundary_zero_telemetry(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with db_mod.connection(db) as conn:
+        msg = _append(conn)
+    _stub_plan(monkeypatch, InjectionPlan(batch=[msg], ack_up_to=msg.id))
+
+    packet = "GUARD PREAMBLE\n\nDo the task.\n"
+    client = FakeAcpClient()
+    rc = run_harness(
+        _config(
+            db_path=db,
+            reply_channel="run/run1/telemetry",
+            mode="bypassPermissions",
+            initial_prompt=packet,
+        ),
+        _never_dies(),
+        client=client,
+        max_boundaries=1,
+    )
+
+    assert rc == 0
+    # verbatim — never through policy.render (trusted spawner input),
+    # sent after set_mode and before the first bus boundary
+    assert client.prompts[0] == ("sess-1", packet)
+    assert client.calls[:4] == ["initialize", "new_session", "set_mode", "prompt"]
+    with db_mod.connection(db) as conn:
+        replies = [
+            (m.body["boundary"], m.type)
+            for m in log.read_after(conn, "run/run1/telemetry", after_id=0)
+            if m.type == "acp-reply"
+        ]
+    assert replies == [(0, "acp-reply"), (1, "acp-reply")]
 
 
 def test_set_mode_error_returns_10_and_delivers_nothing(

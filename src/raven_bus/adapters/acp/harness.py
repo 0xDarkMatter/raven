@@ -75,6 +75,18 @@ class HarnessConfig(BaseModel):
     lane's cage. The mode string is agent-defined; raven does not
     validate it beyond non-emptiness at the CLI."""
 
+    initial_prompt: str | None = None
+    """Sent VERBATIM as the session's first prompt (boundary 0), before
+    the bus loop starts. This is the lane's task packet — TRUSTED
+    spawner input, deliberately NOT run through ``policy.render``: the
+    data framing exists to stop *bus messages* acting as instructions
+    (ADR-003), and framing the task itself as data makes a well-behaved
+    agent refuse its own assignment (observed live: a claude lane
+    declined a task delivered as a data-framed bus message, citing
+    injection hygiene). Trust boundary: initial_prompt comes from the
+    process that spawned the harness; everything arriving via the bus
+    stays data-framed."""
+
     @model_validator(mode="after")
     def _no_reply_feedback_loop(self) -> HarnessConfig:
         if self.reply_channel is not None and self.reply_channel in self.channels:
@@ -105,6 +117,12 @@ def run_harness(
         session_id = acp.new_session(cwd=config.cwd)
         if config.mode is not None:
             acp.set_mode(session_id, config.mode)
+        if config.initial_prompt is not None:
+            # Boundary 0: the task packet, verbatim (see the field's
+            # trust-boundary note). Telemetry is posted like any other
+            # boundary so the orchestrator sees the lane accept its task.
+            result = acp.prompt(session_id, config.initial_prompt)
+            _post_telemetry(config, result, 0)
     except AcpError:
         return 10
 

@@ -116,6 +116,13 @@ replaces v1's per-message delivery state with an append-only log + per-channel
   `bypassPermissions`, `dontAsk` for zed's `claude-code-acp`) or it cannot
   use tools. The mode string is agent-defined and passed through opaque;
   a null `session/set_mode` result is tolerated (zed's adapter sends one).
+  `--initial-prompt-file` (added for P4b) sends the lane's task packet
+  verbatim as boundary 0, before the bus loop: trusted spawner input,
+  deliberately not data-framed — a task delivered as a data-framed bus
+  message reads as data, and a well-behaved agent refuses it (observed
+  live: a claude lane declined its own assignment citing injection
+  hygiene). Bus messages remain data-framed; only the spawner's packet
+  is trusted.
 - **Claude Code PreToolUse hook** (`src/raven_bus/adapters/hooks/`) — a
   **peek-only** adapter for interactive sessions (ADR-006): on every tool call
   it reads pending, renders via `policy`, prints a compact block when anything

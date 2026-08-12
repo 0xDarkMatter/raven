@@ -66,6 +66,17 @@ def acp(
             "prompting cannot use tools."
         ),
     ),
+    initial_prompt_file: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--initial-prompt-file",
+        help=(
+            "File whose contents are sent VERBATIM as the session's first "
+            "prompt (the lane's task packet) before the bus loop starts. "
+            "Trusted spawner input — bus messages stay data-framed; a task "
+            "delivered as a bus message reads as data and a well-behaved "
+            "agent refuses it."
+        ),
+    ),
 ) -> None:
     """Spawn an agent (everything after ``--``) under the bus<->ACP
     harness: a dumb pipe (ADR-006) — no respawn, exit when the child
@@ -86,6 +97,14 @@ def acp(
             models.validate_channel_name(reply_to)
         if mode is not None and not mode.strip():
             die("--mode must be a non-empty mode id", EXIT_USAGE)
+        initial_prompt: str | None = None
+        if initial_prompt_file is not None:
+            try:
+                initial_prompt = initial_prompt_file.read_text(encoding="utf-8")
+            except OSError as exc:
+                die(f"cannot read --initial-prompt-file: {exc}", EXIT_USAGE)
+            if initial_prompt is None or not initial_prompt.strip():
+                die("--initial-prompt-file is empty", EXIT_USAGE)
         db.init_db(db_path)
 
     config = HarnessConfig(
@@ -97,6 +116,7 @@ def acp(
         token_budget=budget,
         cwd=cwd,
         mode=mode,
+        initial_prompt=initial_prompt,
     )
 
     try:

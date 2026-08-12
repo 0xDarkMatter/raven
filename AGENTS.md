@@ -229,11 +229,15 @@ raven version
 raven serve    [--host 127.0.0.1] [--port 7713] [--db P]   (run ravend under uvicorn; `[http]` extra)
 raven acp      --as R@RUN --channel C [--channel C]... [--reply-to C]
                [--db P] [--poll-interval S] [--budget N] [--cwd .]
-               [--mode M] -- <agent cmd...>
+               [--mode M] [--initial-prompt-file F] -- <agent cmd...>
                                                             (dumb-pipe ACP harness; ADR-006.
                                                              --mode = session/set_mode after
                                                              session/new; headless lanes need a
-                                                             non-prompting permission mode)
+                                                             non-prompting permission mode.
+                                                             --initial-prompt-file = the task
+                                                             packet, VERBATIM boundary 0 —
+                                                             trusted spawner input, never
+                                                             data-framed; bus messages are)
 ```
 
 Exit codes (`cli/_common.py`): `0` ok / `2` usage / `3` not-found / `10` error.

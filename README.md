@@ -298,7 +298,7 @@ Runs an agent under the bus↔ACP loop (usage transcribed from `cli/acp.py`):
 raven acp --as lane-3@v0-2 --channel run/v0-2/lane/3 \
           [--channel run/v0-2/control]... [--reply-to run/v0-2/telemetry] \
           [--db PATH] [--poll-interval 1.0] [--budget 2000] [--cwd .] \
-          [--mode MODE] \
+          [--mode MODE] [--initial-prompt-file FILE] \
           -- <agent command...>
 ```
 
@@ -316,6 +316,14 @@ via `session/set_mode` right after `session/new` (agent-defined, e.g.
 The spawner picks a non-prompting mode it considers safe for the lane's cage
 (worktree + guard preamble, in fleetflow's case); raven passes the string
 through without interpreting it.
+
+`--initial-prompt-file` is the lane's **task packet**, sent verbatim as the
+session's first prompt (boundary 0) before the bus loop starts. It is trusted
+spawner input and deliberately bypasses the data framing: the framing exists
+to stop *bus messages* acting as instructions (ADR-003), and a task delivered
+as a data-framed bus message reads as data — a well-behaved agent refuses it
+(observed live during P4b). Trust boundary: the packet comes from the process
+that spawned the harness; everything arriving via the bus stays data-framed.
 
 The harness is a **dumb pipe** (ADR-006): it spawns the agent once, drives the
 loop, and **exits when the child exits** — it never respawns (lifecycle is the
