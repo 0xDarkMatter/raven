@@ -311,15 +311,33 @@ def test_peek_never_acks_cursor_does_not_move(tmp_path):
     assert cursor_exists(db_path, CONSUMER, CHANNEL) is False
 
 
-def test_peek_against_stubbed_policy_is_silent_exit_zero(tmp_path):
-    """Policy is stubbed (NotImplementedError) in this lane; the catch-all
-    must swallow that and stay silent + exit 0 — a broken policy never
-    blocks a tool call (ADR-006). This is the faithful pre-double state."""
+def test_peek_with_raising_policy_is_silent_exit_zero(tmp_path):
+    """A broken policy never blocks a tool call (ADR-006): patch
+    policy.plan to raise and require silence + exit 0. (Originally
+    written against the sibling lane's NotImplementedError stubs; the
+    guarantee outlived the stubs, so the raise is now explicit.)"""
     db_path = tmp_path / "bus.db"
     seed_channel(db_path, CHANNEL, [("a", "prompt", {})])
 
-    result = run_peek(
-        env=_env(RAVEN_CONSUMER=CONSUMER, RAVEN_CHANNELS=CHANNEL, RAVEN_DB=str(db_path))
+    driver = tmp_path / "raising_driver.py"
+    driver.write_text(
+        "from raven_bus import policy\n"
+        "def _boom(*a, **k):\n"
+        "    raise RuntimeError('policy exploded')\n"
+        "policy.plan = _boom\n"
+        "from raven_bus.adapters.hooks import peek\n"
+        "raise SystemExit(peek.main())\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [sys.executable, str(driver)],
+        env=_env(
+            RAVEN_CONSUMER=CONSUMER, RAVEN_CHANNELS=CHANNEL, RAVEN_DB=str(db_path)
+        ),
+        capture_output=True,
+        text=True,
+        timeout=30.0,
+        check=False,
     )
 
     assert result.returncode == 0
@@ -518,3 +536,77 @@ def test_wrapper_smoke_no_consumer_silent_exit_zero(tmp_path):
     # even if the module path were unreachable.
     assert result.returncode == 0
     assert result.stdout == ""
+
+
+# --------------------------------------------------------------------------- #
+# In-process coverage of peek's guard paths (the subprocess drivers above
+# exercise them for real, but a child process is invisible to coverage).
+# --------------------------------------------------------------------------- #
+def test_inprocess_no_consumer_is_inactive(monkeypatch):
+    from raven_bus.adapters.hooks import peek as peek_mod
+
+    monkeypatch.delenv("RAVEN_CONSUMER", raising=False)
+    assert peek_mod.peek() == 0
+
+
+def test_inprocess_consumer_without_channels_is_silent(monkeypatch, capsys):
+    from raven_bus.adapters.hooks import peek as peek_mod
+
+    monkeypatch.setenv("RAVEN_CONSUMER", CONSUMER)
+    monkeypatch.delenv("RAVEN_CHANNELS", raising=False)
+    assert peek_mod.peek() == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "RAVEN_CHANNELS empty" in captured.err
+
+
+def test_inprocess_bad_grammar_is_silent(monkeypatch, capsys):
+    from raven_bus.adapters.hooks import peek as peek_mod
+
+    monkeypatch.setenv("RAVEN_CONSUMER", "NOT VALID")
+    monkeypatch.setenv("RAVEN_CHANNELS", CHANNEL)
+    assert peek_mod.peek() == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "bad config" in captured.err
+
+
+def test_inprocess_catchall_swallows_everything(monkeypatch, capsys, tmp_path):
+    from raven_bus.adapters.hooks import peek as peek_mod
+
+    db_path = tmp_path / "bus.db"
+    seed_channel(db_path, CHANNEL, [("a", "prompt", {})])
+    monkeypatch.setenv("RAVEN_CONSUMER", CONSUMER)
+    monkeypatch.setenv("RAVEN_CHANNELS", CHANNEL)
+    monkeypatch.setenv("RAVEN_DB", str(db_path))
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("policy exploded")
+
+    # peek imports policy lazily inside the function body — patch the
+    # source module, not a (nonexistent) peek-module attribute.
+    from raven_bus import policy as policy_mod
+
+    monkeypatch.setattr(policy_mod, "plan", _boom)
+    assert peek_mod.peek() == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "RuntimeError" in captured.err
+
+
+def test_inprocess_main_exits_zero(monkeypatch):
+    from raven_bus.adapters.hooks import peek as peek_mod
+
+    monkeypatch.delenv("RAVEN_CONSUMER", raising=False)
+    with pytest.raises(SystemExit) as excinfo:
+        peek_mod.main()
+    assert excinfo.value.code == 0
+
+
+def test_dunder_main_delegates(monkeypatch):
+    import runpy
+
+    monkeypatch.delenv("RAVEN_CONSUMER", raising=False)
+    with pytest.raises(SystemExit) as excinfo:
+        runpy.run_module("raven_bus.adapters.hooks", run_name="__main__")
+    assert excinfo.value.code == 0
