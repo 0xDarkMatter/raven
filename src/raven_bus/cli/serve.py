@@ -42,7 +42,7 @@ def serve(
 
     try:
         db.init_db(db_path)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 -- any preflight failure renders as the one-line CLI error
         die(str(exc), EXIT_ERROR)
         return  # pragma: no cover -- die always raises
 

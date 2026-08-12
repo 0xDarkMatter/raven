@@ -64,7 +64,7 @@ async def tail(request: Request) -> Response:
         try:
             with db.connection(db_path) as conn:
                 channels.get_channel(conn, channel)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 -- ADR-005: every failure routes through map_exception
             return map_exception(exc)
 
     return StreamingResponse(
