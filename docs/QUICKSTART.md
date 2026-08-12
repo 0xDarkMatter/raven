@@ -142,6 +142,49 @@ Connections are short-lived context managers (WAL, foreign keys, auto
 commit/rollback). Cheap change-detection is `db.data_version(conn)` — poll it
 before running a full query.
 
+## 10. Optional: the HTTP bridge
+
+ravend exposes the same store over loopback HTTP — for consumers that can't
+share the filesystem or can't run Python (ADR-005). The file stays the primary
+transport; the bridge is an optional `[http]` extra.
+
+```bash
+pip install -e ".[http]"     # starlette + uvicorn
+raven serve                  # binds 127.0.0.1:7713 (loopback only, no auth)
+```
+
+The same flow as the CLI, three calls — send onto a broadcast channel, read a
+lane's pending, ack by cursor jump:
+
+```bash
+$ curl -s 127.0.0.1:7713/send -H 'content-type: application/json' \
+    -d '{"channel":"run/demo/control","sender":"orchestrator@demo","type":"steer","body":{"note":"hi"}}'
+{"id":1,"channel":"run/demo/control","sender":"orchestrator@demo","type":"steer",...}
+
+$ curl -s '127.0.0.1:7713/channels/run%2Fdemo%2Fcontrol/pending?consumer=lane-1@demo'
+{"messages":[{"id":1,...}]}
+
+$ curl -s 127.0.0.1:7713/ack -H 'content-type: application/json' \
+    -d '{"channel":"run/demo/control","consumer":"lane-1@demo","up_to_id":1}'
+{"consumer":"lane-1@demo","channel":"run/demo/control","last_ack_id":1}
+```
+
+Channel names contain `/`, so percent-encode them in paths (`run%2Fdemo%2Fcontrol`).
+Tail a channel as SSE (an observer — never consumes, like `raven tail`):
+
+```bash
+$ curl -N '127.0.0.1:7713/tail?channel=run/demo/control'
+event: message
+id: 1
+data: {"id":1,"channel":"run/demo/control",...}
+
+: ping
+```
+
+The full endpoint table and the loopback/no-auth posture live in
+[ADR-005](adr/ADR-005-ravend-http-contract.md); the [README](../README.md)
+HTTP-bridge section reproduces it.
+
 ## See also
 
 - [README.md](../README.md) — overview, the three channel kinds, delivery-semantics table

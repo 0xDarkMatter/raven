@@ -63,10 +63,11 @@ src/raven_bus/
 ├── cursors.py         broadcast read-state: pending() + cursor-jump ack()
 ├── claims.py          queue read-state: claim_next/renew/complete/release/get_claim
 ├── compat.py          v1 BusClient shim on the v2 store (ADR-004)
+├── http/              ravend — optional loopback HTTP bridge (the `[http]` extra; ADR-005)
 ├── migrations/
 │   └── 0002_v2_schema.sql   channels / messages / cursors / claims / consumers / bus_meta
 └── cli/               Typer app `raven` — send read ack claim done release
-                      tail channels doctor teardown version (see _common.py for exit codes)
+                      tail channels doctor teardown version serve (see _common.py for exit codes)
 ```
 
 ## Installation
@@ -145,6 +146,82 @@ done #2 as lane-2@v0-2
 See [docs/QUICKSTART.md](docs/QUICKSTART.md) for the full 5-minute walkthrough
 (send/read/ack, claim/done, tail, teardown).
 
+## HTTP bridge (optional)
+
+ravend is an **optional loopback HTTP bridge** over the same store, for consumers
+that can't share the filesystem or can't run Python — sandboxed lanes (Codex,
+docker agents) and non-Python harnesses. The primary transport stays the file;
+ravend is a sandbox escape hatch, not a daemon you need to run (design doc §4).
+
+It is a **thin bridge**: every endpoint maps 1:1 onto one module-contract call
+with no business logic in the HTTP layer, binds **loopback only, port 7713, no
+auth** (TLS/auth terminate at a reverse proxy for anything beyond one host), and
+errors use the envelope `{"error": <code>, "detail": <human>}` (ADR-005).
+
+Install the extra and run it:
+
+```bash
+pip install -e ".[http]"        # starlette + uvicorn
+raven serve                     # 127.0.0.1:7713; --host/--port/--db override
+```
+
+All v2 store operations are exposed. Send, read broadcast pending, ack, claim,
+and finish (the `done` claim):
+
+```bash
+# send onto a broadcast channel (201 → Message)
+curl -s 127.0.0.1:7713/send -H 'content-type: application/json' \
+  -d '{"channel":"run/v0-2/control","sender":"orchestrator@v0-2","type":"steer","body":{"note":"prefer streaming"}}'
+
+# broadcast pending for a consumer (does NOT move the cursor)
+curl -s '127.0.0.1:7713/channels/run%2Fv0-2%2Fcontrol/pending?consumer=lane-1@v0-2'
+
+# ack (cursor jump) → 200 Cursor
+curl -s 127.0.0.1:7713/ack -H 'content-type: application/json' \
+  -d '{"channel":"run/v0-2/control","consumer":"lane-1@v0-2","up_to_id":1}'
+
+# claim the oldest packet from a queue → 200 Message (204 when empty)
+curl -s 127.0.0.1:7713/claim -H 'content-type: application/json' \
+  -d '{"channel":"run/v0-2/queue","consumer":"lane-2@v0-2"}'
+
+# finish the claim → 200 Claim
+curl -s 127.0.0.1:7713/claims/2/done -H 'content-type: application/json' \
+  -d '{"consumer":"lane-2@v0-2"}'
+```
+
+Channel names appear **percent-encoded** in paths (they contain `/`). Tail a
+channel as SSE (an observer — never consumes, may serve expired, like
+`raven tail`):
+
+```bash
+curl -N '127.0.0.1:7713/tail?channel=run/v0-2/control'
+# event: message
+# id: 1
+# data: {"id":1,"channel":"run/v0-2/control",...}
+#
+# : ping                       ← comment line while idle
+```
+
+The wire surface is the endpoint table below (reproduced from
+[ADR-005](docs/adr/ADR-005-ravend-http-contract.md), which owns it as the wire
+format of record):
+
+| Method + path | Maps to | Notes |
+|---|---|---|
+| `GET /health` | db probe | `{status, db, version, schema}` |
+| `GET /channels?prefix=` | `channels.list_channels` | `{channels: [...]}` |
+| `GET /channels/{name}/messages?after=0&limit=100&include_expired=false` | `log.read_after` | forensic flag mirrors the Python arg |
+| `GET /channels/{name}/pending?consumer=&limit=` | `cursors.pending` | broadcast read; does not move the cursor |
+| `GET /channels/{name}/cursor?consumer=` | `cursors.get_cursor` | `null` body when absent |
+| `GET /tail?channel=&after=0` | `log.read_after` polling | SSE: `event: message`, message JSON per event; `: ping` comments while idle |
+| `POST /send` | `log.append` | body mirrors append kwargs (+`kind` for ensure); 201 |
+| `POST /claim` | `claims.claim_next` | 200 message, **204 when queue empty** |
+| `POST /claims/{id}/renew` | `claims.renew` | `{consumer, lease_s?}` |
+| `POST /claims/{id}/done` | `claims.complete` | `{consumer}` |
+| `POST /claims/{id}/release` | `claims.release` | 204 |
+| `POST /ack` | `cursors.ack` | `{channel, consumer, up_to_id}` → cursor |
+| `POST /heartbeat` | consumers upsert | `{consumer}` → 204; the fleet live-signal |
+
 ## Channel kinds & delivery semantics
 
 Three kinds, decided once at channel creation (`--kind`), immutable after
@@ -200,15 +277,18 @@ are documented loudly in `compat.py` and the CHANGELOG:
 - The **per-message `status` column** — read-state now lives in cursors/claims (ADR-001).
 - **Hash aliases** (`role + 6-hex-sha1`) — full `<role>@<run>` strings instead (ADR-002).
 - **Session fences** on sends — channels are host-global; run-scoping is a naming convention (ADR-002).
-- The **`raven init` / `session init`** commands and the v1 **HTTP bridge** — DB is created on first use; ravend HTTP is P2.
+- The **`raven init` / `session init`** commands and the v1 **HTTP bridge** (`GET /inbox`, `GET /message/{id}`) — the DB is created on first use; the v2 bridge is [ravend](#http-bridge-optional).
 
 ## Roadmap
 
-v0.2.0 ships P1 (core store + CLI + compat). Later phases are described in the
+v0.2.0 ships P1 (core store + CLI + compat) and P2 (the optional ravend HTTP
+bridge). Later phases are described in the
 design doc ([§8 Phasing](docs/design/raven2-architecture.md#8-phasing)); this
 section points rather than restates:
 
-- **P2 — ravend:** loopback HTTP read+write, SSE tail, Process-Compose registration.
+- **P2 — ravend:** shipped — the optional loopback HTTP bridge, `raven serve`,
+  read+write+SSE (see [HTTP bridge](#http-bridge-optional) and
+  [ADR-005](docs/adr/ADR-005-ravend-http-contract.md)).
 - **P3 — adapters:** `raven-acp` harness + Claude Code hook adapter; the shared
   injection-policy module (ADR-003 — injection policy lives in adapters, *not*
   the store; the bus never decides when a message enters an agent's context).

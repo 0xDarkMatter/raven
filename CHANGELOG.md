@@ -11,7 +11,8 @@ replaces v1's per-message delivery state with an append-only log + per-channel
 -kind read-state. Decisions of record: [ADR-001](docs/adr/ADR-001-append-only-log-channel-kind-read-state.md)
 (log + channel-kind read-state), [ADR-002](docs/adr/ADR-002-addressing-and-single-host-db.md)
 (full-string addressing + one host DB), [ADR-004](docs/adr/ADR-004-import-rename-compat-shim.md)
-(rename + compat shim).
+(rename + compat shim), [ADR-005](docs/adr/ADR-005-ravend-http-contract.md)
+(ravend thin loopback bridge).
 
 ### Added — the v2 store
 
@@ -43,6 +44,40 @@ replaces v1's per-message delivery state with an append-only log + per-channel
   as the rewrite's regression net. Deprecated from day one; removed after one
   minor release (ADR-004).
 
+### Added — ravend HTTP bridge (P2)
+
+- **Optional loopback HTTP bridge** (`ravend`) exposing the whole store over
+  JSON — **read+write+SSE**, where v1's bridge was read-only (ADR-005). Install
+  the `[http]` extra (`starlette` + `uvicorn`) and run `raven serve`; it binds
+  **loopback only, port 7713, no auth** (TLS/auth terminate at a reverse proxy).
+  It exists for sandboxed and non-Python workers (Codex lanes, docker agents,
+  grok/pi harnesses) that can reach loopback but not the filesystem — the file
+  stays the primary transport.
+- **Thin-bridge wire surface.** Every endpoint maps 1:1 onto one
+  module-contract call with no business logic in the HTTP layer; the route
+  table in `http/app.py` **is** ADR-005's endpoint table (the wire format of
+  record). Errors use the envelope `{"error","detail"}` with 400 (invalid
+  input) / 404 (unknown channel or message) / 409 (claim denied, wrong kind).
+- **`raven serve`** subcommand: runs ravend under uvicorn, with a loopback
+  default and a one-line warning on a non-loopback `--host`. Missing the
+  `[http]` extra fails fast with the CLI's normal one-line `error: …`.
+- **SSE tail** at `GET /tail` — an observer like `raven tail`: never consumes,
+  never mutates, may serve expired; `event: message` per row, `: ping`
+  comments while idle.
+- **Claim frontier** (`claims._FRONTIER`): a pure per-process, in-memory
+  watermark that lets a warm `claim_next` skip a cold terminal-backlog scan
+  (the verify-002 cost). Never persisted, never read for correctness — a fresh
+  process re-derives it on first call; correctness never depends on it.
+
+### Fixed
+
+- **Per-batch lease deadline.** `claim_next` now computes `lease_until` per
+  batch rather than once up front, so a slow scan can't stamp an
+  already-expired lease onto the rows it eventually writes.
+- **Foreign-schema-version refusal.** `init_db` refuses to "init" over a DB
+  carrying an unknown `schema_version` (loud error) instead of silently
+  treating it as a fresh DB.
+
 ### Changed
 
 - **Import root renamed `claude_bus` → `raven_bus`** (ADR-004). The CLI stays
@@ -62,7 +97,7 @@ replaces v1's per-message delivery state with an append-only log + per-channel
   naming convention, not a fence (ADR-002).
 - The **`raven init` / `session init`** commands and the v1 **HTTP bridge**
   (`serve`, `GET /inbox`, `GET /message/{id}`) — the DB is created on first
-  use; ravend HTTP is a P2 item.
+  use; the v2 bridge (ravend, above) supersedes it.
 
 ### v1-compat narrowings
 
