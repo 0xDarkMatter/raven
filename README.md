@@ -298,14 +298,24 @@ Runs an agent under the bus↔ACP loop (usage transcribed from `cli/acp.py`):
 raven acp --as lane-3@v0-2 --channel run/v0-2/lane/3 \
           [--channel run/v0-2/control]... [--reply-to run/v0-2/telemetry] \
           [--db PATH] [--poll-interval 1.0] [--budget 2000] [--cwd .] \
+          [--mode MODE] \
           -- <agent command...>
 ```
 
 Flags: `--as` consumer id driving the agent (required); `--channel` to watch
 (repeatable, ≥1 required); `--reply-to` channel for agent replies/telemetry;
 `--db` DB override; `--poll-interval` idle poll seconds; `--budget` per-boundary
-token budget; `--cwd` passed to `session/new`. Everything after `--` is the
-agent command (tokens that look like flags, e.g. `-y`, pass through untouched).
+token budget; `--cwd` passed to `session/new`; `--mode` a session mode selected
+via `session/set_mode` right after `session/new` (agent-defined, e.g.
+`bypassPermissions`, `dontAsk`). Everything after `--` is the agent command
+(tokens that look like flags, e.g. `-y`, pass through untouched).
+
+`--mode` exists because the harness grants no capabilities and refuses
+`session/request_permission` — an agent left in a prompting permission mode
+(zed's `claude-code-acp` defaults sessions to `default`) cannot use tools.
+The spawner picks a non-prompting mode it considers safe for the lane's cage
+(worktree + guard preamble, in fleetflow's case); raven passes the string
+through without interpreting it.
 
 The harness is a **dumb pipe** (ADR-006): it spawns the agent once, drives the
 loop, and **exits when the child exits** — it never respawns (lifecycle is the

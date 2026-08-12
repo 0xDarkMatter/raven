@@ -79,6 +79,9 @@ def prompt_text(request: dict[str, Any]) -> str:
 
 
 def serve(scenario: str, stdin: TextIO, stdout: TextIO) -> int:
+    # Set via session/set_mode; when present, echoes are prefixed
+    # "[mode=<id>] " so tests can assert the mode round-tripped.
+    mode: str | None = None
     if scenario == "garbage":
         stdout.write("this is not json\n")
         stdout.flush()
@@ -99,6 +102,13 @@ def serve(scenario: str, stdin: TextIO, stdout: TextIO) -> int:
             continue
         if method == "session/new":
             send(stdout, response(request, {"sessionId": SESSION_ID}))
+            continue
+        if method == "session/set_mode":
+            # Result is deliberately null: zed's claude-code-acp answers
+            # set_mode with a null result, and the client must tolerate it.
+            params = request.get("params", {})
+            mode = params.get("modeId") if isinstance(params, dict) else None
+            send(stdout, {"jsonrpc": "2.0", "id": request["id"], "result": None})
             continue
         if method == "session/cancel":
             continue
@@ -140,7 +150,8 @@ def serve(scenario: str, stdin: TextIO, stdout: TextIO) -> int:
                 },
             )
 
-        rendered = f"echo: {prompt_text(request)}"
+        prefix = f"[mode={mode}] " if mode is not None else ""
+        rendered = f"{prefix}echo: {prompt_text(request)}"
         midpoint = len(rendered) // 2
         send(stdout, update(rendered[:midpoint], ordinal=1))
         if scenario == "die-mid-prompt":

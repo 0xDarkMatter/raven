@@ -49,25 +49,42 @@ class FakeAcpClient:
     """Plain double for protocol.AcpClient's surface — no dependency on
     the (parallel-lane, possibly still-stub) real implementation."""
 
-    def __init__(self, *, init_error: AcpError | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        init_error: AcpError | None = None,
+        set_mode_error: AcpError | None = None,
+    ) -> None:
         self.init_error = init_error
+        self.set_mode_error = set_mode_error
         self.initialized = False
         self.session_cwd: str | None = None
+        self.modes: list[tuple[str, str]] = []  # (session_id, mode_id)
         self.prompts: list[tuple[str, str]] = []  # (session_id, text)
         self.cancelled: list[str] = []
         self.next_results: list[PromptResult | AcpError] = []
+        self.calls: list[str] = []  # method-call order
 
     def initialize(self) -> dict:
+        self.calls.append("initialize")
         if self.init_error is not None:
             raise self.init_error
         self.initialized = True
         return {}
 
     def new_session(self, *, cwd: str) -> str:
+        self.calls.append("new_session")
         self.session_cwd = cwd
         return "sess-1"
 
+    def set_mode(self, session_id: str, mode_id: str) -> None:
+        self.calls.append("set_mode")
+        if self.set_mode_error is not None:
+            raise self.set_mode_error
+        self.modes.append((session_id, mode_id))
+
     def prompt(self, session_id: str, text: str) -> PromptResult:
+        self.calls.append("prompt")
         self.prompts.append((session_id, text))
         if self.next_results:
             outcome = self.next_results.pop(0)
@@ -451,6 +468,8 @@ def test_cli_double_dash_parsing_and_exit_code(
             "111",
             "--cwd",
             "/tmp/agent",
+            "--mode",
+            "bypassPermissions",
             "--",
             "some-agent",
             "--flag",
@@ -467,6 +486,75 @@ def test_cli_double_dash_parsing_and_exit_code(
     assert config.poll_interval_s == 0.5
     assert config.token_budget == 111
     assert config.cwd == "/tmp/agent"
+    assert config.mode == "bypassPermissions"
+
+
+def test_cli_blank_mode_is_usage_error(db: Path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "acp", "--as", CONSUMER, "--channel", CHANNEL,
+            "--db", str(db), "--mode", "  ", "--", "echo",
+        ],
+    )
+    assert result.exit_code == 2
+
+
+def test_mode_sent_once_after_session_new_before_any_prompt(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with db_mod.connection(db) as conn:
+        msg = _append(conn)
+    _stub_plan(monkeypatch, InjectionPlan(batch=[msg], ack_up_to=msg.id))
+
+    client = FakeAcpClient()
+    rc = run_harness(
+        _config(db_path=db, mode="bypassPermissions"),
+        _never_dies(),
+        client=client,
+        max_boundaries=1,
+    )
+
+    assert rc == 0
+    assert client.modes == [("sess-1", "bypassPermissions")]
+    assert client.calls[:3] == ["initialize", "new_session", "set_mode"]
+    assert client.calls.count("set_mode") == 1
+
+
+def test_mode_none_never_sends_set_mode(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with db_mod.connection(db) as conn:
+        msg = _append(conn)
+    _stub_plan(monkeypatch, InjectionPlan(batch=[msg], ack_up_to=msg.id))
+
+    client = FakeAcpClient()
+    rc = run_harness(_config(db_path=db), _never_dies(), client=client, max_boundaries=1)
+
+    assert rc == 0
+    assert client.modes == []
+    assert "set_mode" not in client.calls
+
+
+def test_set_mode_error_returns_10_and_delivers_nothing(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with db_mod.connection(db) as conn:
+        msg = _append(conn)
+    _stub_plan(monkeypatch, InjectionPlan(batch=[msg], ack_up_to=msg.id))
+
+    client = FakeAcpClient(set_mode_error=AcpError("mode refused"))
+    rc = run_harness(
+        _config(db_path=db, mode="no-such-mode"),
+        _never_dies(),
+        client=client,
+    )
+
+    assert rc == 10
+    assert client.prompts == []
+    # the message was never delivered, so it must still be pending
+    with db_mod.connection(db) as conn:
+        assert [m.id for m in cursors.pending(conn, CONSUMER, CHANNEL)] == [msg.id]
 
 
 def test_cli_rejects_bad_consumer_id(db: Path) -> None:

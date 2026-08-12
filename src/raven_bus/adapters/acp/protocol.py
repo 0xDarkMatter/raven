@@ -7,6 +7,10 @@ per line — the ACP stdio transport). Supported calls:
 
 - ``initialize``      (client → agent; advertise no fs/terminal caps)
 - ``session/new``     (client → agent)
+- ``session/set_mode`` (client → agent; optional, select a session mode
+  the agent advertised, e.g. a permission mode — a headless harness
+  refuses ``session/request_permission``, so lanes that need tools must
+  be switched into a non-prompting mode up front)
 - ``session/prompt``  (client → agent; text content blocks)
 - ``session/update``  (agent → client notification; streamed chunks)
 - ``session/cancel``  (client → agent notification)
@@ -95,6 +99,17 @@ class AcpClient:
             raise AcpError("session/new returned invalid sessionId")
         return session_id
 
+    def set_mode(self, session_id: str, mode_id: str) -> None:
+        """session/set_mode → select an agent-advertised session mode.
+
+        The spec allows a null result (zed's adapter returns one), so
+        this is the one request that tolerates a non-object result."""
+        self._request(
+            "session/set_mode",
+            {"sessionId": session_id, "modeId": mode_id},
+            allow_null_result=True,
+        )
+
     def prompt(self, session_id: str, text: str) -> PromptResult:
         """session/prompt with one text content block; pumps
         notifications (and rejects agent-initiated requests) until the
@@ -154,6 +169,7 @@ class AcpClient:
         *,
         updates: list[dict[str, Any]] | None = None,
         text_chunks: list[str] | None = None,
+        allow_null_result: bool = False,
     ) -> dict[str, Any]:
         request_id = self._next_id
         self._next_id += 1
@@ -185,6 +201,8 @@ class AcpClient:
                 raise AcpError(f"JSON-RPC error: {error!r}")
             result = message.get("result")
             if not isinstance(result, dict):
+                if allow_null_result and result is None:
+                    return {}
                 raise AcpError("JSON-RPC response result must be an object")
             return result
 

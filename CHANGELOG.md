@@ -109,7 +109,13 @@ replaces v1's per-message delivery state with an append-only log + per-channel
   verify finding), so a crash mid-boundary redelivers at-least-once and
   never drops. Replies/telemetry post to `--reply-to` as
   `acp-reply`/`acp-activity` (which must not be a watched channel — the
-  config refuses the feedback loop).
+  config refuses the feedback loop). `--mode` selects an agent-advertised
+  session mode via `session/set_mode` right after `session/new` (added for
+  P4b): the harness refuses `session/request_permission`, so a headless
+  lane must be switched into a non-prompting permission mode (e.g.
+  `bypassPermissions`, `dontAsk` for zed's `claude-code-acp`) or it cannot
+  use tools. The mode string is agent-defined and passed through opaque;
+  a null `session/set_mode` result is tolerated (zed's adapter sends one).
 - **Claude Code PreToolUse hook** (`src/raven_bus/adapters/hooks/`) — a
   **peek-only** adapter for interactive sessions (ADR-006): on every tool call
   it reads pending, renders via `policy`, prints a compact block when anything

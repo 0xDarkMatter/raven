@@ -55,6 +55,17 @@ def acp(
     cwd: str = typer.Option(
         ".", "--cwd", help="Working directory passed to session/new."
     ),
+    mode: str | None = typer.Option(
+        None,
+        "--mode",
+        help=(
+            "Session mode to select via session/set_mode after session/new "
+            "(agent-defined, e.g. bypassPermissions, dontAsk, acceptEdits). "
+            "Headless lanes need a non-prompting permission mode: the "
+            "harness refuses session/request_permission, so an agent left "
+            "prompting cannot use tools."
+        ),
+    ),
 ) -> None:
     """Spawn an agent (everything after ``--``) under the bus<->ACP
     harness: a dumb pipe (ADR-006) — no respawn, exit when the child
@@ -73,6 +84,8 @@ def acp(
         channels = parse_channels(channel)
         if reply_to is not None:
             models.validate_channel_name(reply_to)
+        if mode is not None and not mode.strip():
+            die("--mode must be a non-empty mode id", EXIT_USAGE)
         db.init_db(db_path)
 
     config = HarnessConfig(
@@ -83,6 +96,7 @@ def acp(
         poll_interval_s=poll_interval,
         token_budget=budget,
         cwd=cwd,
+        mode=mode,
     )
 
     try:

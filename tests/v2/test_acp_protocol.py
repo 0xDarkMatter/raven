@@ -76,6 +76,17 @@ def test_echo_round_trip_collects_chunks_and_update_order(children) -> None:
     assert seen == result.raw_updates
 
 
+def test_set_mode_round_trips_and_tolerates_null_result(children) -> None:
+    _, client, session_id = ready_client(children)
+
+    # The fake agent answers session/set_mode with a null result (as
+    # zed's claude-code-acp does); the client must treat that as success.
+    assert client.set_mode(session_id, "bypassPermissions") is None
+
+    result = client.prompt(session_id, "hi")
+    assert result.text == "[mode=bypassPermissions] echo: hi"
+
+
 def test_multiple_prompts_use_monotonic_ids_and_correlate_responses(children) -> None:
     _, client, session_id = ready_client(children)
 

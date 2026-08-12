@@ -65,6 +65,16 @@ class HarnessConfig(BaseModel):
     cwd: str = "."
     """cwd passed to session/new (the agent's working directory)."""
 
+    mode: str | None = None
+    """Session mode selected via ``session/set_mode`` right after
+    ``session/new`` (None = never sent). Needed for headless lanes:
+    this harness refuses ``session/request_permission`` (no
+    capabilities granted), so an agent left in a prompting permission
+    mode cannot use tools — the spawner selects a non-prompting mode
+    (e.g. ``bypassPermissions``, ``dontAsk``) it considers safe for the
+    lane's cage. The mode string is agent-defined; raven does not
+    validate it beyond non-emptiness at the CLI."""
+
     @model_validator(mode="after")
     def _no_reply_feedback_loop(self) -> HarnessConfig:
         if self.reply_channel is not None and self.reply_channel in self.channels:
@@ -93,6 +103,8 @@ def run_harness(
     try:
         acp.initialize()
         session_id = acp.new_session(cwd=config.cwd)
+        if config.mode is not None:
+            acp.set_mode(session_id, config.mode)
     except AcpError:
         return 10
 

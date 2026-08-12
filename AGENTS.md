@@ -228,8 +228,12 @@ raven teardown  --run RUN [--yes]
 raven version
 raven serve    [--host 127.0.0.1] [--port 7713] [--db P]   (run ravend under uvicorn; `[http]` extra)
 raven acp      --as R@RUN --channel C [--channel C]... [--reply-to C]
-               [--db P] [--poll-interval S] [--budget N] [--cwd .] -- <agent cmd...>
-                                                            (dumb-pipe ACP harness; ADR-006)
+               [--db P] [--poll-interval S] [--budget N] [--cwd .]
+               [--mode M] -- <agent cmd...>
+                                                            (dumb-pipe ACP harness; ADR-006.
+                                                             --mode = session/set_mode after
+                                                             session/new; headless lanes need a
+                                                             non-prompting permission mode)
 ```
 
 Exit codes (`cli/_common.py`): `0` ok / `2` usage / `3` not-found / `10` error.
