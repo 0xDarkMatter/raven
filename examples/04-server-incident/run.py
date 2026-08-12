@@ -63,7 +63,7 @@ async def amain(db_path: Path, faults: list[str]) -> None:
 
     try:
         await asyncio.wait_for(stop.wait(), timeout=15.0)
-    except asyncio.TimeoutError:  # pragma: no cover -- only if pipeline stalls
+    except TimeoutError:  # pragma: no cover -- only if pipeline stalls
         transcript.line("setup", "TIMEOUT — pipeline stalled")
         stop.set()
 

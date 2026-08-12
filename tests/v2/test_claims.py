@@ -11,6 +11,7 @@ from raven_bus.claims import claim_next, complete, get_claim, release, renew
 from raven_bus.exceptions import (
     ClaimDeniedError,
     InvalidAddressError,
+    UnknownChannelError,
     WrongChannelKindError,
 )
 
@@ -114,7 +115,7 @@ def test_two_connections_have_exactly_one_winner(raw_db: Path) -> None:
             message = claim_next(conn, consumer, QUEUE)
             conn.commit()
             results.append((consumer, None if message is None else message.id))
-        except BaseException as exc:  # surfaced in the test thread below
+        except BaseException as exc:  # noqa: BLE001 -- race-harness thread re-raises in the main test
             failures.append(exc)
         finally:
             conn.close()
@@ -213,6 +214,14 @@ def test_claim_returns_none_for_empty_queue(raw_db: Path) -> None:
     conn.commit()
 
     assert claim_next(conn, CONSUMER, QUEUE) is None
+    conn.close()
+
+
+def test_claim_rejects_unknown_channel(raw_db: Path) -> None:
+    conn = _connect(raw_db)
+
+    with pytest.raises(UnknownChannelError):
+        claim_next(conn, CONSUMER, QUEUE)
     conn.close()
 
 

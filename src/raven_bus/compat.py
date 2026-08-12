@@ -172,12 +172,14 @@ def _to_public(
 
     # Sender is a v2 consumer id '<role>@<run>'; fall back to the raw
     # string if it isn't one (e.g. a foreign producer) so we never drop
-    # information.
+    # information. session_id also falls back to the reader's own session
+    # in that case — there is no run to recover it from.
     try:
         sender_role, sender_session = parse_consumer_id(v2.sender)
         sender = _format_v1_address(sender_role, sender_session)
     except ValueError:
         sender = v2.sender
+        sender_session = own_session
 
     body, task_id = _strip_task_id(v2.body)
 

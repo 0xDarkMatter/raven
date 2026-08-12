@@ -289,6 +289,34 @@ class TestInboxReadAck:
         assert msgs[0].recipient == "bob:s1"
 
     @pytest.mark.usefixtures("stub_store")
+    def test_inbox_foreign_sender_falls_back_to_raw_string(self) -> None:
+        """A row whose sender isn't a valid '<role>@<run>' consumer id (a
+        foreign producer, not sent via BusClient) still surfaces — with
+        the raw string preserved as ``sender`` — instead of raising."""
+        c = BusClient(session_id="s1", role="bob")
+        with patch(_CURSORS) as cur_mod:
+            cur_mod.pending.return_value = [
+                _v2msg(mid=1, channel="compat/s1/bob", sender="not-a-consumer-id"),
+            ]
+            msgs = c.inbox()
+        assert msgs[0].sender == "not-a-consumer-id"
+
+    @pytest.mark.usefixtures("stub_store")
+    def test_inbox_non_compat_channel_falls_back_to_own_identity(self) -> None:
+        """A row on a channel that isn't ``compat/<session>/<role>`` shaped
+        (defensive: only compat channels are ever read here in practice)
+        falls back to the reader's own identity as the recipient."""
+        c = BusClient(session_id="s1", role="bob")
+        with patch(_CURSORS) as cur_mod:
+            cur_mod.pending.return_value = [
+                _v2msg(mid=1, channel="not/compat/shaped", sender="alice@s1"),
+            ]
+            msgs = c.inbox()
+        assert msgs[0].recipient == "bob:s1"
+        assert msgs[0].recipient_role == "bob"
+        assert msgs[0].recipient_session == "s1"
+
+    @pytest.mark.usefixtures("stub_store")
     def test_inbox_max_passes_through_as_limit(self) -> None:
         c = BusClient(session_id="s1", role="bob")
         with patch(_CURSORS) as cur_mod:

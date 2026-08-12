@@ -22,12 +22,12 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 from pydantic import BaseModel, Field
 
-from claude_bus import BusClient, Message, SchemaRegistry
+from raven_bus.compat import BusClient, Message, SchemaRegistry
 
 # ----- session + addresses -------------------------------------------
 
