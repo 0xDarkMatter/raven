@@ -530,3 +530,16 @@ def test_store_error_exits_ten_not_traceback(
     client = FakeAcpClient()
     code = run_harness(_config(db_path=db), _never_dies(), client=client)
     assert code == 10
+
+
+def test_cli_unlaunchable_agent_is_one_line_error() -> None:
+    """Found by the live P3 smoke: a missing agent binary tracebacked."""
+    result = runner.invoke(
+        app,
+        ["acp", "--as", CONSUMER, "--channel", CHANNEL, "--",
+         "definitely-not-a-real-binary-xyz"],
+    )
+    assert result.exit_code == 10
+    assert "error:" in result.output
+    assert "cannot launch agent" in result.output
+    assert "Traceback" not in result.output

@@ -21,7 +21,7 @@ import typer
 
 from raven_bus import db, models
 from raven_bus.adapters.acp.harness import HarnessConfig, parse_channels, run_harness
-from raven_bus.cli._common import EXIT_USAGE, die, handle_errors
+from raven_bus.cli._common import EXIT_ERROR, EXIT_USAGE, die, handle_errors
 
 # Registration note (mirrors cli/main.py's pattern for other commands):
 #   app.command(
@@ -85,11 +85,17 @@ def acp(
         cwd=cwd,
     )
 
-    child = subprocess.Popen(
-        agent_argv,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-    )
+    try:
+        child = subprocess.Popen(
+            agent_argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+        )
+    except OSError as exc:
+        # A missing/unlaunchable agent must render as the CLI's one-line
+        # error, not a traceback (found by the live P3 smoke).
+        die(f"cannot launch agent {agent_argv[0]!r}: {exc}", EXIT_ERROR)
+        return  # pragma: no cover -- die always raises
     try:
         exit_code = run_harness(config, child)
     finally:
