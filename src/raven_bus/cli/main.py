@@ -38,6 +38,7 @@ from raven_bus.cli import done as done_cmd
 from raven_bus.cli import read as read_cmd
 from raven_bus.cli import release as release_cmd
 from raven_bus.cli import send as send_cmd
+from raven_bus.cli import serve as serve_cmd
 from raven_bus.cli import tail as tail_cmd
 from raven_bus.cli import teardown as teardown_cmd
 from raven_bus.cli._common import EXIT_ERROR
@@ -74,6 +75,7 @@ app.command("doctor", help="Run health checks against the local environment.")(
 app.command("teardown", help="Delete all data for a run.")(
     teardown_cmd.cmd_teardown
 )
+app.command("serve", help="Run the loopback HTTP bridge.")(serve_cmd.serve)
 
 
 @app.command("version", help="Print raven version and exit.")
