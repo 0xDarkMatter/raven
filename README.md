@@ -5,6 +5,12 @@ runs. One SQLite file holds an append-only message log partitioned into
 **channels**; read-state lives per channel *kind*. Same-filesystem consumers
 (Python API or CLI) open the file directly — no broker, no daemon.
 
+Its first production consumer is
+[fleetflow](https://github.com/0xDarkMatter/fleetflow), the cross-provider
+fleet orchestrator: workers post opt-in telemetry heartbeats onto
+`run/<run>/telemetry`, and `raven acp` hosts fleetflow's steerable claude
+lanes (fleetflow ADR-022/ADR-023 record that integration's contract).
+
 > The org-scoped human+agent chat layer — Slack-style threads, identity, keys,
 > cross-project reach — lives in [Buzz](https://github.com/block/buzz). raven
 > is the in-run coordination layer fleetflow and similar runners need; a Buzz
