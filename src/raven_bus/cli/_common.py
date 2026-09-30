@@ -20,7 +20,10 @@ from pydantic import BaseModel
 
 from raven_bus.exceptions import (
     InvalidAddressError,
+    InvalidBodyError,
     RavenBusError,
+    SchemaMismatchError,
+    TeardownBlockedError,
     UnknownChannelError,
     UnknownMessageError,
 )
@@ -42,17 +45,22 @@ def die(message: str, code: int = EXIT_ERROR) -> None:
 def handle_errors() -> Iterator[None]:
     """Map the raven_bus exception hierarchy to the frozen exit codes.
 
-    InvalidAddressError (bad role/run/channel/tag) is a usage error;
-    unknown channel/message is a not-found error; every other
+    InvalidAddressError (bad role/run/channel/tag/kind/urgency) and
+    InvalidBodyError (body nested too deep) are usage errors; unknown
+    channel/message is a not-found error; SchemaMismatchError (the DB
+    file is foreign) and TeardownBlockedError (outside messages
+    reference the run) are named store errors; every other
     RavenBusError is a generic store error. Wrap the store calls a
     command makes in ``with handle_errors():``.
     """
     try:
         yield
-    except InvalidAddressError as exc:
+    except (InvalidAddressError, InvalidBodyError) as exc:
         die(str(exc), EXIT_USAGE)
     except (UnknownChannelError, UnknownMessageError) as exc:
         die(str(exc), EXIT_NOT_FOUND)
+    except (SchemaMismatchError, TeardownBlockedError) as exc:
+        die(str(exc), EXIT_ERROR)
     except RavenBusError as exc:
         die(str(exc), EXIT_ERROR)
 

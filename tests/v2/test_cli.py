@@ -778,3 +778,31 @@ def test_cli_main_ravenbuserror_exits_error(capsys) -> None:
         cli_main()
     assert excinfo.value.code == EXIT_ERROR
     assert "error: boom" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------
+# QA store lane: typed store refusals reach the CLI as one-line errors
+# --------------------------------------------------------------------
+
+
+def test_teardown_blocked_by_outside_reply_is_a_one_line_error(tmp_path) -> None:
+    """QA store #6/#14 end to end: an outside reply used to crash
+    `raven teardown` with a FOREIGN KEY traceback."""
+    from raven_bus import db as bus_db
+    from raven_bus import log
+
+    target = tmp_path / "bus.db"
+    bus_db._reset_init_cache()
+    bus_db.init_db(target)
+    with bus_db.connection(target) as conn:
+        inside = log.append(conn, channel="run/gone/c", sender="a@gone", type="t", body={})
+        log.append(
+            conn, channel="run/kept/c", sender="b@kept", type="t", body={}, reply_to=inside.id
+        )
+
+    result = runner.invoke(app, ["teardown", "--run", "gone", "--yes", "--db", str(target)])
+
+    assert result.exit_code == 10
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "error: cannot tear down run 'gone'" in result.output
+    assert "Traceback" not in result.output
