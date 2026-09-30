@@ -17,6 +17,17 @@ dist/
 *.whl
 
 # raven runtime
+.raven/
+
+# Example runs write their SQLite DB next to the script
+# (examples/01-hello-world/hello.db, 02/bus.db, 03/newsdesk.db,
+# 04/incident.db) plus WAL/SHM/journal siblings.
+examples/**/*.db
+examples/**/*.db-wal
+examples/**/*.db-shm
+examples/**/*.db-journal
+
+# v1 legacy (local files may linger)
 claude-bus.db
 claude-bus.db-*
 raven.db
@@ -25,7 +36,6 @@ raven.db-wal
 raven.db-shm
 raven.yaml
 *.signal
-.raven/
 
 # Test / coverage artefacts
 .coverage
