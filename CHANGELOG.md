@@ -26,7 +26,7 @@ replaces v1's per-message delivery state with an append-only log + per-channel
   trivially correct.
 - **Three channel kinds.** `broadcast` (at-least-once, ack = cursor jump),
   `queue` (exactly-one-winner claim with lease + auto-requeue + dead-letter
-  after `max_deliveries`), `stream` (observe-only, ring retention, tail-only).
+  after `max_deliveries`), `stream` (observe-only, tail-only; `retention_s` is reserved — ring retention is not yet enforced).
   Kind is decided at creation and immutable after.
 - **Lease-backed queues.** Claim is `INSERT … ON CONFLICT DO NOTHING`
   (rowcount 1 wins); a lapsed lease is flipped to a durable `lapsed` state by

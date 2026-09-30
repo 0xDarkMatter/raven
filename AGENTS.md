@@ -82,7 +82,7 @@ Six tables: `channels`, `messages`, `cursors`, `claims`, `consumers`, `bus_meta`
 Treat each as a build-breaker if violated. The decision text owns the *why*.
 
 - **Append-only: never `UPDATE` or `DELETE` a `messages` row** outside
-  `db.teardown_run` (the one sanctioned prefix-scoped delete) and retention.
+  `db.teardown_run` (the one sanctioned prefix-scoped delete; stream retention would be the second, but is not implemented).
   `log.append` is the sole writer. Reads never mutate.
 - **Every liveness read filters `expires_at`.** `read_after` filters by default
   (`include_expired=True` is for `tail`/forensics only); `cursors.pending` and

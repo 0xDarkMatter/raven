@@ -98,7 +98,7 @@ CREATE TABLE consumers (                      -- identity + presence
 |---|---|---|---|
 | `broadcast` | every subscriber sees every message, at-least-once, ack = cursor advance | `cursors` | control/steer channels, announcements, findings mirror |
 | `queue` | exactly-one-winner claim, lease + auto-requeue + dead-letter | `claims` | work dispatch (packet queue), repair-lane triage |
-| `stream` | no acks, ring retention, tail-only | none | heartbeats, progress telemetry, tool-event firehose |
+| `stream` | no acks, ring retention (**not yet implemented** — `retention_s` is stored but never enforced), tail-only | none | heartbeats, progress telemetry, tool-event firehose |
 
 The claim on a `queue` channel is v1's proven atomic `UPDATE`-wins pattern,
 relocated: `INSERT INTO claims ... ON CONFLICT DO NOTHING` — rowcount 1 wins.

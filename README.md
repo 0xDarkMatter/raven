@@ -45,7 +45,7 @@ raven does this with one SQLite file and three channel semantics:
 
 - **broadcast** — every subscriber sees every message; ack = advance your cursor
 - **queue** — exactly-one-winner claim with a lease; crashes auto-requeue; dead-letter after N attempts
-- **stream** — observe-only firehose; no acks, ring retention
+- **stream** — observe-only firehose; no acks (retention is planned, not yet enforced)
 
 Key properties: append-only log (reads never mutate, so fan-out, replay, and
 `tail` are trivially correct); full-string `<role>@<run>` addressing (no
@@ -178,7 +178,7 @@ raven serve                     # 127.0.0.1:7713; --port/--db override
                                 # (non-loopback --host requires --yes-expose)
 ```
 
-All v2 store operations are exposed. Send, read broadcast pending, ack, claim,
+The core store operations are exposed (not: `get_claim`, `read_by_id`/`read_thread`, or teardown — use the CLI/Python API). Send, read broadcast pending, ack, claim,
 and finish (the `done` claim):
 
 ```bash
@@ -432,7 +432,7 @@ Three kinds, decided once at channel creation (`--kind`), immutable after
 |---|---|---|---|---|
 | `broadcast` | every subscriber sees every message, **at-least-once** | per-consumer `cursors` | cursor **jump** to highest id handled — acks everything up to it | un-acked messages stay pending; idempotent re-read |
 | `queue` | **exactly-one-winner** claim | `claims` rows with a lease | `done` (terminal) or `release` (voluntary) | lease expiry **auto-requeues**; `deliveries ≥ max_deliveries` → `dead` |
-| `stream` | observe-only, **no acks** | none | n/a | n/a (ring retention; tail-only) |
+| `stream` | observe-only, **no acks** | none | n/a | n/a (tail-only; `retention_s` is stored but not yet enforced) |
 
 The queue claim is v1's proven atomic-claim pattern relocated:
 `INSERT INTO claims … ON CONFLICT DO NOTHING` — rowcount 1 wins. A lapsed lease

@@ -39,6 +39,17 @@ but never invoked.
 - **External queue (Redis etc.)** — violates the zero-infra constraint that
   is raven's reason to exist.
 
+## Amendment (2026-09-30, QA pass)
+
+Stream "ring retention" is decided but **not implemented**: `channels.
+retention_s` is stored and never read, nothing prunes stream messages, and no
+CLI/HTTP surface sets it. Stream channels therefore grow without bound today.
+An implementation is a second sanctioned `messages` delete (beside
+`teardown_run`) and must first settle how pruned rows interact with
+`reply_to`/`thread_id` foreign keys from surviving messages — the same
+constraint that makes `teardown_run` refuse (`TeardownBlockedError`) when
+another run's message references it.
+
 ## Consequences
 
 - Fan-out, replay, and `tail` are trivially correct (reads never mutate).

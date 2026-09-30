@@ -99,7 +99,7 @@ claims, channels, and consumers — the one sanctioned bulk delete (ADR-001/002)
 
 ```bash
 $ raven teardown --run demo --yes
-removed 3 rows for run 'demo'
+removed N rows for run 'demo'
 ```
 
 (Drop `--yes` for a confirmation prompt.)
