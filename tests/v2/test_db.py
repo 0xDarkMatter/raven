@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from raven_bus import db as bus_db
-from raven_bus.exceptions import InvalidAddressError
+from raven_bus.exceptions import InvalidAddressError, TeardownBlockedError
 
 
 def _iso(dt: datetime) -> str:
@@ -441,6 +441,144 @@ def test_teardown_run_returns_zero_for_unknown_run(db: Path) -> None:
     with bus_db.connection(db) as conn:
         deleted = bus_db.teardown_run(conn, "nonexistent")
     assert deleted == 0
+
+
+def _insert_reply(
+    conn: sqlite3.Connection,
+    channel_id: int,
+    *,
+    reply_to: int | None = None,
+    thread_id: int | None = None,
+) -> int:
+    cur = conn.execute(
+        "INSERT INTO messages (channel_id, sender, type, body, reply_to, thread_id) "
+        "VALUES (?, 'role@run-a', 'test', '{}', ?, ?)",
+        (channel_id, reply_to, thread_id),
+    )
+    assert cur.lastrowid is not None
+    return int(cur.lastrowid)
+
+
+def _row_counts(db: Path) -> tuple[int, int]:
+    with bus_db.connection(db) as conn:
+        return (
+            conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0],
+            conn.execute("SELECT COUNT(*) FROM channels").fetchone()[0],
+        )
+
+
+@pytest.mark.parametrize("ref", ["reply_to", "thread_id"])
+def test_teardown_run_blocked_by_outside_reference_is_typed_and_atomic(
+    db: Path, ref: str
+) -> None:
+    """QA store #6: a message OUTSIDE the run referencing one inside it
+    made teardown die on a raw FOREIGN KEY IntegrityError (a traceback in
+    the CLI), so the run could never be torn down. Existing DBs keep the
+    FK (no migration chain), so teardown pre-checks and refuses with a
+    typed error naming the blockers — and deletes nothing."""
+    with bus_db.connection(db) as conn:
+        inside_cid = _insert_channel(conn, "run/target/c", kind="broadcast")
+        outside_cid = _insert_channel(conn, "run/other/c", kind="broadcast")
+        inside = _insert_message(conn, inside_cid)
+        outside = _insert_reply(conn, outside_cid, **{ref: inside})
+    before = _row_counts(db)
+
+    with pytest.raises(TeardownBlockedError) as info, bus_db.connection(db) as conn:
+        bus_db.teardown_run(conn, "target")
+
+    err = info.value
+    assert err.blockers == [(outside, "run/other/c")]
+    assert err.total == 1
+    assert f"#{outside}" in str(err)
+    assert "run/other/c" in str(err)
+    assert _row_counts(db) == before
+
+
+def test_teardown_run_blocker_list_is_capped(db: Path) -> None:
+    with bus_db.connection(db) as conn:
+        inside_cid = _insert_channel(conn, "run/target/c", kind="broadcast")
+        outside_cid = _insert_channel(conn, "ops/log", kind="broadcast")
+        inside = _insert_message(conn, inside_cid)
+        outside = [_insert_reply(conn, outside_cid, reply_to=inside) for _ in range(12)]
+
+    with pytest.raises(TeardownBlockedError) as info, bus_db.connection(db) as conn:
+        bus_db.teardown_run(conn, "target")
+
+    err = info.value
+    assert err.total == 12
+    assert [mid for mid, _ in err.blockers] == outside[:10]
+    assert "and 2 more" in str(err)
+    assert f"#{outside[10]}" not in str(err)
+
+
+def _blocked_fixture(db: Path) -> None:
+    """A run message with a claim, and an outside reply referencing it."""
+    with bus_db.connection(db) as conn:
+        inside_cid = _insert_channel(conn, "run/target/q")
+        outside_cid = _insert_channel(conn, "run/other/c", kind="broadcast")
+        inside = _insert_message(conn, inside_cid)
+        _insert_claim(
+            conn, inside, lease_until=_iso(datetime.now(UTC) + timedelta(hours=1))
+        )
+        _insert_reply(conn, outside_cid, reply_to=inside)
+
+
+def _claim_count(db: Path) -> int:
+    with bus_db.connection(db) as conn:
+        return conn.execute("SELECT COUNT(*) FROM claims").fetchone()[0]
+
+
+def test_teardown_run_race_backstop_is_typed_and_rolled_back(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pre-check runs before the transaction holds the write lock, so
+    a peer can commit a referencing message in between. Simulated by a
+    pre-check that sees nothing: the DELETE's FK failure must still come
+    out as the typed refusal, and db.connection's rollback must restore
+    the claims/cursors rows deleted before it."""
+    _blocked_fixture(db)
+    before = (_row_counts(db), _claim_count(db))
+    real = bus_db._teardown_blockers
+    calls: list[int] = []
+
+    def blind_first(conn: sqlite3.Connection, ids: list[int]):
+        calls.append(1)
+        return ([], 0) if len(calls) == 1 else real(conn, ids)
+
+    monkeypatch.setattr(bus_db, "_teardown_blockers", blind_first)
+    with pytest.raises(TeardownBlockedError), bus_db.connection(db) as conn:
+        bus_db.teardown_run(conn, "target")
+
+    assert len(calls) == 2
+    assert (_row_counts(db), _claim_count(db)) == before
+
+
+def test_teardown_run_reraises_an_unexplained_integrity_error(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _blocked_fixture(db)
+    monkeypatch.setattr(bus_db, "_teardown_blockers", lambda _c, _ids: ([], 0))
+    with pytest.raises(sqlite3.IntegrityError), bus_db.connection(db) as conn:
+        bus_db.teardown_run(conn, "target")
+
+
+def test_teardown_run_allows_references_within_the_run(db: Path) -> None:
+    """Replies inside the run (even across its channels) go with it."""
+    with bus_db.connection(db) as conn:
+        a = _insert_channel(conn, "run/target/a", kind="broadcast")
+        b = _insert_channel(conn, "run/target/b", kind="broadcast")
+        root = _insert_message(conn, a)
+        _insert_reply(conn, b, reply_to=root, thread_id=root)
+        # A run-internal message replying OUTWARD doesn't block either.
+        outside_cid = _insert_channel(conn, "run/other/c", kind="broadcast")
+        foreign = _insert_message(conn, outside_cid)
+        _insert_reply(conn, a, reply_to=foreign)
+
+    with bus_db.connection(db) as conn:
+        removed = bus_db.teardown_run(conn, "target")
+
+    assert removed > 0
+    assert _row_counts(db) == (1, 1)
 
 
 # --------------------------------------------------------------------------- #

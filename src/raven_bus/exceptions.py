@@ -34,6 +34,22 @@ class WrongChannelKindError(RavenBusError):
     broadcast channel, cursor-ack on a queue)."""
 
 
+class TeardownBlockedError(RavenBusError):
+    """``db.teardown_run`` refused: messages OUTSIDE the run reference
+    (reply_to/thread_id) messages inside it, and the schema's foreign
+    keys forbid orphaning them. Nothing was deleted.
+
+    ``blockers`` holds the first few ``(message_id, channel_name)``
+    referencing messages (id order); ``total`` is the full count."""
+
+    def __init__(
+        self, message: str, *, blockers: list[tuple[int, str]], total: int
+    ) -> None:
+        super().__init__(message)
+        self.blockers = blockers
+        self.total = total
+
+
 class InvalidBodyError(RavenBusError, ValueError):
     """A message body the store refuses to write — today, one nested
     deeper than ``log.MAX_BODY_DEPTH`` (readers could not re-serialise

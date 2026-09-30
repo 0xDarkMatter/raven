@@ -22,6 +22,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
+from raven_bus.exceptions import TeardownBlockedError
 from raven_bus.models import SweepResult
 from raven_bus.paths import resolve_db_path
 
@@ -226,11 +227,63 @@ def sweep(conn: sqlite3.Connection) -> SweepResult:
     return SweepResult(expired=expired, requeued=requeued, dead_lettered=dead_lettered)
 
 
+_TEARDOWN_BLOCKERS_SHOWN = 10
+
+
+def _teardown_blockers(
+    conn: sqlite3.Connection, channel_ids: list[int]
+) -> tuple[list[tuple[int, str]], int]:
+    """Messages OUTSIDE ``channel_ids`` whose reply_to/thread_id points at
+    a message INSIDE them: the first ``_TEARDOWN_BLOCKERS_SHOWN`` as
+    ``(id, channel_name)`` in id order, plus the full count (one scan —
+    ``COUNT(*) OVER ()`` is computed before LIMIT)."""
+    placeholders = ",".join("?" for _ in channel_ids)
+    rows = conn.execute(
+        f"""
+        SELECT o.id, ch.name, COUNT(*) OVER () AS total
+        FROM messages AS o
+        JOIN channels AS ch ON ch.id = o.channel_id
+        WHERE o.channel_id NOT IN ({placeholders})
+          AND EXISTS (
+              SELECT 1 FROM messages AS p
+              WHERE p.id IN (o.reply_to, o.thread_id)
+                AND p.channel_id IN ({placeholders})
+          )
+        ORDER BY o.id
+        LIMIT {_TEARDOWN_BLOCKERS_SHOWN}
+        """,
+        [*channel_ids, *channel_ids],
+    ).fetchall()
+    blockers = [(int(row[0]), str(row[1])) for row in rows]
+    return blockers, (int(rows[0][2]) if rows else 0)
+
+
+def _teardown_blocked(
+    run: str, blockers: list[tuple[int, str]], total: int
+) -> TeardownBlockedError:
+    shown = ", ".join(f"#{mid} in {name!r}" for mid, name in blockers)
+    more = f" and {total - len(blockers)} more" if total > len(blockers) else ""
+    return TeardownBlockedError(
+        f"cannot tear down run {run!r}: {total} message(s) outside it reply to "
+        f"or thread under its messages ({shown}{more}); deleting would orphan "
+        "them (the schema's foreign keys forbid it) — nothing was deleted",
+        blockers=blockers,
+        total=total,
+    )
+
+
 def teardown_run(conn: sqlite3.Connection, run: str) -> int:
     """Delete all rows for channels under ``run/<run>/`` (messages,
     cursors, claims, the channels themselves) plus ``consumers`` rows
     with this run. Returns total rows removed. The ONLY sanctioned
-    DELETE on messages besides retention (ADR-001/002)."""
+    DELETE on messages besides retention (ADR-001/002).
+
+    Raises :class:`TeardownBlockedError` — having deleted NOTHING — when
+    a message outside the run references (reply_to/thread_id) one inside
+    it: the schema's self-referencing foreign keys forbid orphaning it,
+    and that used to surface as a raw IntegrityError mid-teardown (QA
+    store #6). There is no migration chain, so existing DBs keep those
+    FKs; the refusal, not a schema change, is the fix."""
     from raven_bus.models import validate_atom
 
     validate_atom(run, what="run")
@@ -245,6 +298,11 @@ def teardown_run(conn: sqlite3.Connection, run: str) -> int:
 
     total = 0
     if channel_ids:
+        # Pre-check BEFORE the first DELETE, so a blocked teardown leaves
+        # the caller's transaction untouched.
+        blockers, count = _teardown_blockers(conn, channel_ids)
+        if count:
+            raise _teardown_blocked(run, blockers, count)
         placeholders = ",".join("?" for _ in channel_ids)
         cur = conn.execute(
             f"DELETE FROM claims WHERE message_id IN "
@@ -257,10 +315,20 @@ def teardown_run(conn: sqlite3.Connection, run: str) -> int:
             channel_ids,
         )
         total += cur.rowcount
-        cur = conn.execute(
-            f"DELETE FROM messages WHERE channel_id IN ({placeholders})",
-            channel_ids,
-        )
+        try:
+            cur = conn.execute(
+                f"DELETE FROM messages WHERE channel_id IN ({placeholders})",
+                channel_ids,
+            )
+        except sqlite3.IntegrityError:
+            # Race backstop: the pre-check ran before this transaction held
+            # the write lock, so a peer can add a referencing message in
+            # between. Same typed refusal; the claims/cursors deletes above
+            # are undone by the caller's rollback (db.connection does it).
+            blockers, count = _teardown_blockers(conn, channel_ids)
+            if not count:
+                raise
+            raise _teardown_blocked(run, blockers, count) from None
         total += cur.rowcount
         cur = conn.execute(
             f"DELETE FROM channels WHERE id IN ({placeholders})",
