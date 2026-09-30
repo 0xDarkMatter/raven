@@ -12,8 +12,10 @@ WHERE message_id=? AND state='lapsed'`` (rowcount 1 wins); a
 never-claimed message by the INSERT above. There is no caller-side
 snapshot, so any sweep call site (cursors, doctor, other channels) is
 harmless to dead-letter accounting. A voluntary ``release`` flips the
-row to lapsed with deliveries=0 (never delete: a deleted row becomes a
-never-claimed candidate below every process's frontier — see release()).
+row to lapsed and undoes only its OWN delivery (``deliveries - 1``,
+floor 0), keeping earlier involuntary lapses on the count (never
+delete: a deleted row becomes a never-claimed candidate below every
+process's frontier — see release()).
 
 Every public operation invokes ``db.sweep`` before observing actionable
 claim state. Valid only on ``queue`` channels
@@ -382,10 +384,16 @@ def complete(conn: sqlite3.Connection, message_id: int, consumer: str) -> Claim:
 
 def release(conn: sqlite3.Connection, message_id: int, consumer: str) -> None:
     """Voluntarily give a leased message back: flips the claim row to
-    'lapsed' with ``deliveries=0``, so the message is immediately
-    re-claimable and the next claim starts at deliveries=1 — voluntary
-    release is cooperative, not a failure signal, so it never counts
-    toward dead-lettering. Same denial rules as :func:`renew`.
+    'lapsed' with ``deliveries - 1`` (floor 0), so the message is
+    immediately re-claimable and the release itself never counts toward
+    dead-lettering — voluntary release is cooperative, not a failure
+    signal. Same denial rules as :func:`renew`.
+
+    WHY decrement, not reset (QA store #7): ``deliveries=0`` also erased
+    every EARLIER involuntary lapse, so a poison message never reached
+    ``max_deliveries`` as long as someone released it in between. The
+    release undoes exactly the one delivery its own claim added:
+    claim → release → reclaim still yields deliveries=1.
 
     WHY flip-not-delete (raven2-p2 refute-frontier finding): deleting
     the row turned the message back into a NEVER-CLAIMED candidate at
@@ -398,7 +406,8 @@ def release(conn: sqlite3.Connection, message_id: int, consumer: str) -> None:
     cursor = conn.execute(
         f"""
         UPDATE claims
-        SET state = 'lapsed', deliveries = 0, updated_at = {_NOW_SQL}
+        SET state = 'lapsed', deliveries = MAX(deliveries - 1, 0),
+            updated_at = {_NOW_SQL}
         WHERE message_id = ? AND consumer = ? AND state = 'leased'
         """,
         (message_id, consumer),
