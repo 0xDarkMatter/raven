@@ -71,14 +71,16 @@ def test_messages_accepts_explicit_false_bool(client: TestClient, db: Path) -> N
     assert len(response.json()["messages"]) == 1
 
 
-def test_frontier_not_advanced_on_full_batch(db: Path) -> None:
+def test_frontier_not_advanced_on_full_batch(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A full candidate batch proves nothing about the ids beyond it —
-    _maybe_advance_frontier must early-return without touching SQL."""
+    _maybe_advance_frontier must leave the watermark alone, however high
+    the (pre-scan) ceiling."""
+    monkeypatch.setattr(claims_mod, "_FRONTIER", {})
     fake_rows = [object()] * claims_mod._CANDIDATE_BATCH
-    poisoned = object()  # would explode if any SQL were attempted
-    claims_mod._maybe_advance_frontier(
-        poisoned, 1, ("k", 1), 0, fake_rows  # type: ignore[arg-type]
-    )
+    claims_mod._maybe_advance_frontier(("k", 1), 0, 99, fake_rows)  # type: ignore[arg-type]
+    assert claims_mod._FRONTIER == {}
 
 
 def test_all_lost_round_advances_frontier_then_returns_none(db: Path) -> None:

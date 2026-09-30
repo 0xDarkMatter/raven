@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -237,6 +238,35 @@ def connection(
         conn.close()
 
 
+def instance_id(conn: sqlite3.Connection) -> str | None:
+    """This DB FILE's durable identity: a uuid4 hex stored in
+    ``bus_meta('instance_id')``, backfilled on first use (DBs predate it;
+    ``INSERT OR IGNORE`` makes racing backfills converge on one winner).
+    Returns None when it can't be read or backfilled (e.g. a read-only
+    connection) — callers must then skip whatever they key on it.
+
+    WHY not (st_dev, st_ino): ext4 hands a replaced file the SAME inode
+    deterministically, so an inode can't tell a new file from the old one
+    (QA store #11). An id stored in the file travels with the file. It is
+    a bus_meta row, not a schema change. A byte-copy (restored backup)
+    carries the same id — restart long-lived processes after restoring."""
+    try:
+        row = conn.execute(
+            "SELECT value FROM bus_meta WHERE key = 'instance_id'"
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT OR IGNORE INTO bus_meta (key, value) VALUES ('instance_id', ?)",
+                (uuid.uuid4().hex,),
+            )
+            row = conn.execute(
+                "SELECT value FROM bus_meta WHERE key = 'instance_id'"
+            ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    return None if row is None else str(row[0])
+
+
 def data_version(conn: sqlite3.Connection) -> int:
     """Return ``PRAGMA data_version`` — changes whenever another
     connection commits. The cheap poll primitive."""
@@ -445,6 +475,7 @@ __all__ = [
     "connection",
     "data_version",
     "init_db",
+    "instance_id",
     "sweep",
     "teardown_run",
 ]

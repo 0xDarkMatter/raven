@@ -354,18 +354,233 @@ def test_frontier_goes_cold_when_db_file_is_replaced(tmp_path: Path) -> None:
     conn.close()
 
 
-def test_frontier_key_degrades_to_path_when_stat_fails(
+def test_frontier_key_drops_the_inode_when_stat_fails(
     raw_db: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Filesystems that cannot identify files degrade to the bare-path
-    key (worst case: the original staleness), never a crash."""
+    """A filesystem that can't stat the file only loses the inode
+    discriminator; the in-file instance id still names the file (QA
+    store #11) — never a crash, never a bare-path key."""
     conn = _connect(raw_db)
+    identity = claims.db.instance_id(conn)
 
-    def _no_stat(_path):
+    def _no_stat(_path, **_kwargs):
         raise OSError("stat unavailable")
 
     monkeypatch.setattr(claims.os, "stat", _no_stat)
     key = claims._frontier_db_key(conn)
-    assert key.endswith("claims.db")
-    assert "|" not in key
+    # Restore os.stat before asserting: it is the GLOBAL os module, and
+    # pytest's own failure rendering stats files.
+    monkeypatch.undo()
+    assert identity is not None
+    assert key is not None and key.endswith(f"claims.db|{identity}")
     conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# QA store-lane regressions (#10 ceiling order, #11 file identity)
+# --------------------------------------------------------------------------- #
+class _Rows:
+    def __init__(self, rows: list[sqlite3.Row]) -> None:
+        self._rows = rows
+
+    def fetchall(self) -> list[sqlite3.Row]:
+        return self._rows
+
+
+class _PeerCommitsAfterFreshScan:
+    """Connection proxy: right after claim_next's fresh-candidate scan, a
+    PEER commits a new message on the channel — the window an autocommit
+    connection leaves open before a post-scan ceiling read."""
+
+    def __init__(self, conn: sqlite3.Connection, inject) -> None:
+        self._conn = conn
+        self._inject = inject
+        self.injected: list[int] = []
+
+    def execute(self, sql: str, params=()):
+        cursor = self._conn.execute(sql, params)
+        if sql == claims._FRESH_CANDIDATES_SQL and not self.injected:
+            rows = cursor.fetchall()
+            self.injected.append(self._inject())
+            return _Rows(rows)
+        return cursor
+
+
+def test_frontier_ceiling_is_read_before_the_fresh_scan(raw_db: Path) -> None:
+    """QA store #10: the MAX(id) ceiling was read AFTER the fresh scan. On
+    an autocommit connection (no write transaction pinning a snapshot) a
+    message committed in between lies above everything the scan saw yet
+    at/below the ceiling — the frontier advanced past a never-claimed
+    message, which that process then never claimed."""
+    setup = _connect(raw_db)
+    channel_id = _insert_channel(setup)
+    first = _insert_message(setup, channel_id)
+    setup.commit()
+    assert claim_next(setup, CONSUMER, QUEUE).id == first
+    setup.commit()
+
+    def peer_append() -> int:
+        peer = _connect(raw_db)
+        try:
+            message_id = _insert_message(peer, channel_id)
+            peer.commit()
+            return message_id
+        finally:
+            peer.close()
+
+    auto = sqlite3.connect(raw_db, timeout=5.0, isolation_level=None)
+    auto.row_factory = sqlite3.Row
+    auto.execute("PRAGMA foreign_keys = ON")
+    proxy = _PeerCommitsAfterFreshScan(auto, peer_append)
+    assert claim_next(proxy, CONSUMER, QUEUE) is None  # scan saw nothing fresh
+    assert len(proxy.injected) == 1
+
+    late = claim_next(auto, OTHER_CONSUMER, QUEUE)
+    assert late is not None and late.id == proxy.injected[0]
+    auto.close()
+    setup.close()
+
+
+def test_frontier_not_reused_for_a_different_file_at_the_same_inode(
+    raw_db: Path,
+) -> None:
+    """QA store #11: the cache key was (path, st_dev, st_ino), but ext4
+    hands a replaced file the SAME inode deterministically, so a
+    long-lived process (ravend) kept the dead file's frontier and hid
+    every message at or below it in the new file. The key now carries a
+    durable identity stored IN the file. Simulated here (NTFS never
+    reuses inodes): same path + inode, different instance id, and the
+    early message unclaimed in the "new" file."""
+    conn = _connect(raw_db)
+    channel_id = _insert_channel(conn)
+    first = _insert_message(conn, channel_id)
+    conn.commit()
+    assert claim_next(conn, "a@r", QUEUE).id == first
+    assert claim_next(conn, "a@r", QUEUE) is None  # frontier warms past it
+    conn.commit()
+
+    conn.execute("DELETE FROM claims")
+    conn.execute("UPDATE bus_meta SET value = 'replaced' WHERE key = 'instance_id'")
+    conn.commit()
+
+    reborn = claim_next(conn, "b@r", QUEUE)
+    assert reborn is not None and reborn.id == first
+    conn.close()
+
+
+def test_instance_id_is_backfilled_once_and_stable(raw_db: Path) -> None:
+    """Pre-existing DBs have no instance id: claim_next backfills it
+    inside its own transaction, and it never changes afterwards."""
+    conn = _connect(raw_db)
+    channel_id = _insert_channel(conn)
+    _insert_message(conn, channel_id)
+    conn.commit()
+    assert conn.execute(
+        "SELECT 1 FROM bus_meta WHERE key = 'instance_id'"
+    ).fetchone() is None
+
+    claim_next(conn, CONSUMER, QUEUE)
+    conn.commit()
+    first = conn.execute(
+        "SELECT value FROM bus_meta WHERE key = 'instance_id'"
+    ).fetchone()["value"]
+    claim_next(conn, CONSUMER, QUEUE)
+    conn.commit()
+    again = conn.execute(
+        "SELECT value FROM bus_meta WHERE key = 'instance_id'"
+    ).fetchone()["value"]
+
+    assert first == again
+    assert len(first) == 32
+    conn.close()
+
+
+def test_frontier_cache_skipped_without_an_instance_id(
+    raw_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No readable identity = no cache: never fall back to trusting the
+    inode. Claiming stays correct (the cache was only ever a shortcut)."""
+    monkeypatch.setattr(claims.db, "instance_id", lambda _conn: None)
+    conn = _connect(raw_db)
+    channel_id = _insert_channel(conn)
+    first = _insert_message(conn, channel_id)
+    conn.commit()
+
+    assert claim_next(conn, CONSUMER, QUEUE).id == first
+    assert claim_next(conn, CONSUMER, QUEUE) is None
+    second = _insert_message(conn, channel_id)
+    conn.commit()
+    assert claim_next(conn, CONSUMER, QUEUE).id == second
+
+    assert claims._FRONTIER == {}
+    conn.close()
+
+
+class _PeerWinsFirstRound:
+    """Connection proxy: during claim_next's FIRST round a peer claims
+    each candidate just before this connection's attempt, so every race
+    in that round is lost; later rounds run untouched."""
+
+    def __init__(self, conn: sqlite3.Connection, peer: sqlite3.Connection) -> None:
+        self._conn = conn
+        self._peer = peer
+        self._scans = 0
+
+    def execute(self, sql: str, params=()):
+        if sql == claims._FRESH_CANDIDATES_SQL:
+            self._scans += 1
+        elif self._scans == 1 and "INSERT INTO claims" in sql:
+            self._peer.execute(
+                "INSERT INTO claims(message_id, consumer, state, deliveries, lease_until) "
+                "VALUES (?, 'peer@test', 'leased', 1, '2999-01-01T00:00:00.000Z')",
+                (params[0],),
+            )
+            self._peer.commit()
+        elif self._scans == 1 and "state = 'lapsed'" in sql and sql.lstrip().startswith(
+            "UPDATE"
+        ):
+            self._peer.execute(
+                "UPDATE claims SET state = 'leased', consumer = 'peer@test', "
+                "lease_until = '2999-01-01T00:00:00.000Z' WHERE message_id = ?",
+                (params[2],),
+            )
+            self._peer.commit()
+        return self._conn.execute(sql, params)
+
+
+def test_lost_round_does_not_skip_fresh_rows_below_a_lapsed_candidate(
+    raw_db: Path,
+) -> None:
+    """Found while fixing QA store #10: both scans resumed from ONE
+    ``after_id`` — the last candidate of the merged batch. A full fresh
+    batch (ids up to X) plus a lapsed candidate at Y > X, all lost to
+    racers, restarted the fresh scan at Y: fresh rows in (X, Y) were
+    never examined, and the next short scan advanced the frontier past
+    them — hidden from this process for good."""
+    setup = _connect(raw_db)
+    channel_id = _insert_channel(setup, max_deliveries=9)
+    fresh = [_insert_message(setup, channel_id) for _ in range(claims._CANDIDATE_BATCH + 1)]
+    lapsed = _insert_message(setup, channel_id)
+    _insert_claim_row(setup, lapsed, state="lapsed")
+    setup.commit()
+
+    auto = sqlite3.connect(raw_db, timeout=5.0, isolation_level=None)
+    auto.row_factory = sqlite3.Row
+    auto.execute("PRAGMA foreign_keys = ON")
+    peer = _connect(raw_db)
+    proxy = _PeerWinsFirstRound(auto, peer)
+
+    won = claim_next(proxy, CONSUMER, QUEUE)
+
+    assert won is not None and won.id == fresh[-1]
+    peer.close()
+    auto.close()
+    setup.close()
+
+
+def _insert_claim_row(conn: sqlite3.Connection, message_id: int, *, state: str) -> None:
+    conn.execute(
+        "INSERT INTO claims(message_id, consumer, state, deliveries, lease_until) "
+        "VALUES (?, 'old@test', ?, 1, '2000-01-01T00:00:00.000Z')",
+        (message_id, state),
+    )

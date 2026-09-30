@@ -366,6 +366,28 @@ def test_sweep_cheap_when_nothing_stale(db: Path) -> None:
     assert elapsed < 0.5
 
 
+# --- instance_id -----------------------------------------------------------
+
+
+def test_instance_id_backfills_a_stable_uuid(db: Path) -> None:
+    with bus_db.connection(db) as conn:
+        first = bus_db.instance_id(conn)
+    with bus_db.connection(db) as conn:
+        again = bus_db.instance_id(conn)
+    assert first is not None and len(first) == 32
+    assert again == first
+
+
+def test_instance_id_is_none_when_it_cannot_be_backfilled(db: Path) -> None:
+    """A connection that can't write (read-only) and finds no id yields
+    None — callers must then skip anything keyed on it."""
+    conn = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+    try:
+        assert bus_db.instance_id(conn) is None
+    finally:
+        conn.close()
+
+
 # --- teardown_run ----------------------------------------------------------
 
 
