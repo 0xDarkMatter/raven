@@ -231,6 +231,36 @@ def read_after(
     return [_row_to_message(row, channel_name=chan.name) for row in rows]
 
 
+def read_all_after(
+    conn: sqlite3.Connection,
+    after_id: int,
+    *,
+    limit: int = 100,
+    include_expired: bool = False,
+) -> list[Message]:
+    """Messages on EVERY channel with id > after_id, globally id-ordered.
+
+    The cross-channel tail primitive (``raven tail`` with no channel, and
+    ravend's all-channel SSE ``/tail``). WHY one query rather than a
+    per-channel merge in the caller: ids are global, so a single
+    ``ORDER BY id`` window is gap-free — resuming from the last id seen
+    can never skip a lower id on another channel. Per-channel windows
+    stitched together broke that (QA: `tail` printed channel-name order;
+    SSE ids went backwards across polls when one channel hit its cap)."""
+    clauses = ["m.id > ?"]
+    params: list[Any] = [after_id]
+    if not include_expired:
+        clauses.append(f"(m.expires_at IS NULL OR m.expires_at > {_NOW_SQL})")
+    params.append(limit)
+    rows = conn.execute(
+        "SELECT m.*, c.name AS channel_name FROM messages m "
+        "JOIN channels c ON c.id = m.channel_id "
+        f"WHERE {' AND '.join(clauses)} ORDER BY m.id ASC LIMIT ?",
+        params,
+    ).fetchall()
+    return [_row_to_message(row, channel_name=row["channel_name"]) for row in rows]
+
+
 def read_by_id(conn: sqlite3.Connection, message_id: int) -> Message:
     """Fetch one message (no liveness filter — forensic read).
     Raises :class:`UnknownMessageError`."""
@@ -256,4 +286,11 @@ def read_thread(conn: sqlite3.Connection, thread_id: int) -> list[Message]:
     return messages
 
 
-__all__ = ["MAX_BODY_DEPTH", "append", "read_after", "read_by_id", "read_thread"]
+__all__ = [
+    "MAX_BODY_DEPTH",
+    "append",
+    "read_after",
+    "read_all_after",
+    "read_by_id",
+    "read_thread",
+]

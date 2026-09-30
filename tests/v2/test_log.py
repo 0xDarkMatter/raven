@@ -544,3 +544,44 @@ def test_append_depth_check_is_iterative(conn: sqlite3.Connection) -> None:
 
     with pytest.raises(InvalidBodyError):
         log.append(conn, channel="c", sender=SENDER, type="t", body=_nested_dicts(5000))
+
+
+# --------------------------------------------------------------------------- #
+# read_all_after — the cross-channel tail primitive
+# --------------------------------------------------------------------------- #
+def test_read_all_after_is_globally_id_ordered_across_channels(
+    conn: sqlite3.Connection,
+) -> None:
+    """Interleaved sends on channels named in reverse order must come back
+    in id order, each carrying its own channel name (a per-channel merge
+    printed channel-name order)."""
+    sent = [
+        log.append(conn, channel=ch, sender=SENDER, type="t", body={"i": i})
+        for i, ch in enumerate(["z/b", "a/a", "z/b", "a/a"])
+    ]
+    got = log.read_all_after(conn, 0)
+    assert [(m.id, m.channel) for m in got] == [(m.id, m.channel) for m in sent]
+
+
+def test_read_all_after_resumes_and_limits_without_gaps(
+    conn: sqlite3.Connection,
+) -> None:
+    ids = [
+        log.append(conn, channel=f"c/{i % 3}", sender=SENDER, type="t", body={}).id
+        for i in range(7)
+    ]
+    first = log.read_all_after(conn, 0, limit=3)
+    rest = log.read_all_after(conn, first[-1].id, limit=100)
+    assert [m.id for m in first + rest] == ids
+
+
+def test_read_all_after_filters_expired_unless_asked(conn: sqlite3.Connection) -> None:
+    live = log.append(conn, channel="c", sender=SENDER, type="t", body={})
+    dead = log.append(
+        conn, channel="c", sender=SENDER, type="t", body={}, expires_in_s=-10
+    )
+    assert [m.id for m in log.read_all_after(conn, 0)] == [live.id]
+    assert [m.id for m in log.read_all_after(conn, 0, include_expired=True)] == [
+        live.id,
+        dead.id,
+    ]
