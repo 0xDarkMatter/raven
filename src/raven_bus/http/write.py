@@ -7,29 +7,48 @@ STRICTLY (every handler rejects unknown body keys — a typo like
 run the store calls in a worker thread via ``app.run_db`` (blocking
 sqlite3 on the event loop head-of-line-blocked the whole process), and
 render every failure through ``map_exception``.
+
+Two rules every handler here follows:
+
+- **Encode inside the transaction.** The success response is built with
+  ``app.render`` INSIDE the ``db.connection`` block, so an encode
+  failure rolls the write back instead of committing state the caller
+  never saw (QA http H2: a committed-but-unreturned /claim lease).
+- **Never create the store.** Connections are ``create=False``: the
+  ``raven serve`` preflight made the DB; if it vanishes, writes answer
+  503 ``unavailable`` rather than writing into a fresh empty file.
 """
 
 from __future__ import annotations
 
-import json
-from typing import Any
-
-from starlette.responses import JSONResponse
+import math
+from typing import Any, get_args
 
 from raven_bus import channels, claims, consumers, cursors, db, log
 from raven_bus.http.app import (
+    MAX_SQLITE_INT,
+    JSONResponse,
     Request,
     Response,
     map_exception,
     read_json_body,
+    render,
     run_db,
 )
+from raven_bus.models import ChannelKind, parse_consumer_id, validate_channel_name
 
 # Bounds for caller-supplied integers. MAX_LEASE_S caps at 30 days —
 # far beyond any sane lease, small enough that datetime arithmetic can
 # never overflow (10**30 seconds did, as a 500 — verify finding).
 MAX_LEASE_S = 30 * 24 * 3600
-MAX_SQLITE_INT = 2**63 - 1
+
+# expires_in_s shares the 30-day ceiling and must be POSITIVE: zero or a
+# negative value wrote a message born expired — invisible to every
+# liveness read, i.e. a silent drop (QA http H13; `raven send
+# --expires-in` applies the same 1..30d range).
+MAX_EXPIRES_S = MAX_LEASE_S
+
+_KINDS = get_args(ChannelKind)
 
 
 def _strict(
@@ -73,11 +92,34 @@ def _str_fields(payload: dict, *keys: str) -> None:
 def _finite_body(body: dict) -> None:
     """Reject NaN/Infinity anywhere in the body BEFORE the store commit —
     python json accepts them on ingest but the response encoder refuses,
-    which used to commit the row and then 500 (re-verify finding)."""
-    try:
-        json.dumps(body, allow_nan=False)
-    except ValueError as exc:
-        raise ValueError(f"'body' must contain only finite numbers: {exc}") from exc
+    which used to commit the row and then 500 (re-verify finding).
+
+    Iterative on purpose: the ``json.dumps(allow_nan=False)`` check this
+    replaced recursed, so a body deep enough to parse could still blow
+    the stack here — a RecursionError, i.e. a 500 instead of a 400 (QA
+    http H2). Depth itself is the store's rule (``log.MAX_BODY_DEPTH`` →
+    InvalidBodyError → 400), not re-implemented here."""
+    stack: list[Any] = [body]
+    while stack:
+        value = stack.pop()
+        if isinstance(value, dict):
+            stack.extend(value.values())
+        elif isinstance(value, list):
+            stack.extend(value)
+        elif isinstance(value, float) and not math.isfinite(value):
+            raise ValueError(f"'body' must contain only finite numbers, got {value!r}")
+
+
+def _channel_field(payload: dict) -> str:
+    """``channel`` grammar-checked up front (→ 400), like every route —
+    the store's lookups made a malformed name a 404 on some (QA http H10)."""
+    return validate_channel_name(payload["channel"])
+
+
+def _consumer_field(payload: dict, key: str = "consumer") -> str:
+    """``consumer`` (or ``sender``) grammar-checked up front (→ 400)."""
+    parse_consumer_id(payload[key])
+    return payload[key]
 
 
 def _path_message_id(request: Request) -> int:
@@ -102,8 +144,17 @@ def _tags_field(payload: dict) -> list[str] | None:
 
 
 async def send(request: Request) -> Response:
-    """POST /send → 201 Message. Body mirrors log.append kwargs + `kind`
-    (default 'broadcast'). Unknown body keys → 400."""
+    """POST /send → 201 Message. Body mirrors log.append kwargs + an
+    optional ``kind``. Unknown body keys → 400.
+
+    ``kind`` ABSENT → ``log.append(ensure=True)``: append to the existing
+    channel whatever its kind, creating an absent one as broadcast. It
+    used to default to 'broadcast' and ENFORCE it, so a producer feeding
+    an existing queue/stream without restating ``kind`` got 409 (QA http
+    H9). ``kind`` PRESENT → validated (broadcast|queue|stream, else 400)
+    and enforced: ``ensure_channel(kind)`` + ``append(ensure=False)`` —
+    the one sanctioned two-call pairing (mirrors ``raven send --kind``);
+    a mismatch with the stored kind → 409."""
     try:
         payload = await read_json_body(request)
         _strict(
@@ -112,29 +163,27 @@ async def send(request: Request) -> Response:
             {"urgency", "tags", "reply_to", "thread_id", "expires_in_s", "kind"},
         )
         _str_fields(payload, "channel", "sender", "type", "urgency", "kind")
+        channel = _channel_field(payload)
+        sender = _consumer_field(payload, "sender")
+        kind = payload.get("kind")
+        if kind is not None and kind not in _KINDS:
+            raise ValueError(f"'kind' must be one of {list(_KINDS)}, got {kind!r}")
         if not isinstance(payload["body"], dict):
             raise ValueError("'body' must be a JSON object")
         _finite_body(payload["body"])
         tags = _tags_field(payload)
         reply_to = _int_field(payload, "reply_to", minimum=1, maximum=MAX_SQLITE_INT)
         thread_id = _int_field(payload, "thread_id", minimum=1, maximum=MAX_SQLITE_INT)
-        expires_in_s = _int_field(
-            payload, "expires_in_s", minimum=-MAX_LEASE_S, maximum=MAX_LEASE_S
-        )
+        expires_in_s = _int_field(payload, "expires_in_s", minimum=1, maximum=MAX_EXPIRES_S)
 
-        def work() -> dict[str, Any]:
-            with db.connection(request.app.state.db_path) as conn:
-                # Sanctioned pairing (mirrors `raven send`, cli/send.py):
-                # ensure_channel establishes/validates the channel kind,
-                # then append(ensure=False) writes the message — two
-                # store contract calls, zero logic between them.
-                channels.ensure_channel(
-                    conn, payload["channel"], payload.get("kind", "broadcast")
-                )
-                return log.append(
+        def work() -> JSONResponse:
+            with db.connection(request.app.state.db_path, create=False) as conn:
+                if kind is not None:
+                    channels.ensure_channel(conn, channel, kind)
+                msg = log.append(
                     conn,
-                    channel=payload["channel"],
-                    sender=payload["sender"],
+                    channel=channel,
+                    sender=sender,
                     type=payload["type"],
                     body=payload["body"],
                     urgency=payload.get("urgency", "prompt"),
@@ -142,50 +191,56 @@ async def send(request: Request) -> Response:
                     reply_to=reply_to,
                     thread_id=thread_id,
                     expires_in_s=expires_in_s,
-                    ensure=False,
-                ).model_dump(mode="json")
+                    ensure=kind is None,
+                )
+                return render(lambda: msg.model_dump(mode="json"), status_code=201)
 
-        dumped = await run_db(work)
-    except Exception as exc:  # noqa: BLE001 -- map_exception re-raises anything it does not recognize
+        return await run_db(work)
+    except Exception as exc:  # noqa: BLE001 -- ADR-005: every failure → map_exception
         return map_exception(exc)
-    return JSONResponse(dumped, status_code=201)
 
 
 async def claim(request: Request) -> Response:
     """POST /claim {channel, consumer, lease_s?} → 200 Message, or
-    **204 empty body** when the queue has no claimable message."""
+    **204 empty body** when the queue has no claimable message.
+
+    The message is encoded INSIDE the claim transaction: if encoding
+    fails the lease rolls back with it (500 ``internal_error``) instead
+    of committing a delivery the caller never received (QA http H2)."""
     try:
         payload = await read_json_body(request)
         _strict(payload, {"channel", "consumer"}, {"lease_s"})
         _str_fields(payload, "channel", "consumer")
+        channel = _channel_field(payload)
+        consumer = _consumer_field(payload)
         lease_s = _int_field(
             payload, "lease_s", minimum=1, maximum=MAX_LEASE_S,
             default=claims.DEFAULT_LEASE_S,
         )
 
-        def work() -> dict[str, Any] | None:
-            with db.connection(request.app.state.db_path) as conn:
-                msg = claims.claim_next(
-                    conn, payload["consumer"], payload["channel"], lease_s=lease_s
-                )
-            return None if msg is None else msg.model_dump(mode="json")
+        def work() -> Response:
+            with db.connection(request.app.state.db_path, create=False) as conn:
+                msg = claims.claim_next(conn, consumer, channel, lease_s=lease_s)
+                if msg is None:
+                    return Response(status_code=204)
+                return render(lambda: msg.model_dump(mode="json"))
 
-        dumped = await run_db(work)
-    except Exception as exc:  # noqa: BLE001 -- map_exception re-raises anything it does not recognize
+        return await run_db(work)
+    except Exception as exc:  # noqa: BLE001 -- ADR-005: every failure → map_exception
         return map_exception(exc)
-    if dumped is None:
-        return Response(status_code=204)
-    return JSONResponse(dumped, status_code=200)
 
 
 def _claim_action(request: Request, payload: dict, fn):
-    """Build the store closure for renew/done/release (run via run_db)."""
+    """Build the store closure for renew/done/release (run via run_db).
+    Returns the encoded Claim (rendered inside the transaction), or None
+    for release's empty result."""
     message_id = _path_message_id(request)
+    consumer = _consumer_field(payload)
 
-    def work() -> dict[str, Any] | None:
-        with db.connection(request.app.state.db_path) as conn:
-            result = fn(conn, message_id, payload["consumer"])
-        return None if result is None else result.model_dump(mode="json")
+    def work() -> JSONResponse | None:
+        with db.connection(request.app.state.db_path, create=False) as conn:
+            result = fn(conn, message_id, consumer)
+            return None if result is None else render(lambda: result.model_dump(mode="json"))
 
     return work
 
@@ -204,10 +259,9 @@ async def claim_renew(request: Request) -> Response:
         def renew_fn(conn, message_id, consumer):
             return claims.renew(conn, message_id, consumer, lease_s=lease_s)
 
-        dumped = await run_db(_claim_action(request, payload, renew_fn))
-    except Exception as exc:  # noqa: BLE001 -- map_exception re-raises anything it does not recognize
+        return await run_db(_claim_action(request, payload, renew_fn))
+    except Exception as exc:  # noqa: BLE001 -- ADR-005: every failure → map_exception
         return map_exception(exc)
-    return JSONResponse(dumped, status_code=200)
 
 
 async def claim_done(request: Request) -> Response:
@@ -216,10 +270,9 @@ async def claim_done(request: Request) -> Response:
         payload = await read_json_body(request)
         _strict(payload, {"consumer"})
         _str_fields(payload, "consumer")
-        dumped = await run_db(_claim_action(request, payload, claims.complete))
-    except Exception as exc:  # noqa: BLE001 -- map_exception re-raises anything it does not recognize
+        return await run_db(_claim_action(request, payload, claims.complete))
+    except Exception as exc:  # noqa: BLE001 -- ADR-005: every failure → map_exception
         return map_exception(exc)
-    return JSONResponse(dumped, status_code=200)
 
 
 async def claim_release(request: Request) -> Response:
@@ -229,30 +282,31 @@ async def claim_release(request: Request) -> Response:
         _strict(payload, {"consumer"})
         _str_fields(payload, "consumer")
         await run_db(_claim_action(request, payload, claims.release))
-    except Exception as exc:  # noqa: BLE001 -- map_exception re-raises anything it does not recognize
+    except Exception as exc:  # noqa: BLE001 -- ADR-005: every failure → map_exception
         return map_exception(exc)
     return Response(status_code=204)
 
 
 async def ack(request: Request) -> Response:
     """POST /ack {channel, consumer, up_to_id} → 200 Cursor (monotonic;
-    backwards ack returns the unchanged cursor, still 200)."""
+    backwards ack returns the unchanged cursor, still 200). Malformed
+    channel/consumer → 400 (checked up front — QA http H10)."""
     try:
         payload = await read_json_body(request)
         _strict(payload, {"channel", "consumer", "up_to_id"})
         _str_fields(payload, "channel", "consumer")
+        channel = _channel_field(payload)
+        consumer = _consumer_field(payload)
         up_to_id = _int_field(payload, "up_to_id", minimum=0, maximum=MAX_SQLITE_INT)
 
-        def work() -> dict[str, Any]:
-            with db.connection(request.app.state.db_path) as conn:
-                return cursors.ack(
-                    conn, payload["consumer"], payload["channel"], up_to_id
-                ).model_dump(mode="json")
+        def work() -> JSONResponse:
+            with db.connection(request.app.state.db_path, create=False) as conn:
+                cur = cursors.ack(conn, consumer, channel, up_to_id)
+                return render(lambda: cur.model_dump(mode="json"))
 
-        dumped = await run_db(work)
-    except Exception as exc:  # noqa: BLE001 -- map_exception re-raises anything it does not recognize
+        return await run_db(work)
+    except Exception as exc:  # noqa: BLE001 -- ADR-005: every failure → map_exception
         return map_exception(exc)
-    return JSONResponse(dumped, status_code=200)
 
 
 async def heartbeat(request: Request) -> Response:
@@ -262,18 +316,20 @@ async def heartbeat(request: Request) -> Response:
         payload = await read_json_body(request)
         _strict(payload, {"consumer"})
         _str_fields(payload, "consumer")
+        consumer = _consumer_field(payload)
 
         def work() -> None:
-            with db.connection(request.app.state.db_path) as conn:
-                consumers.touch(conn, payload["consumer"])
+            with db.connection(request.app.state.db_path, create=False) as conn:
+                consumers.touch(conn, consumer)
 
         await run_db(work)
-    except Exception as exc:  # noqa: BLE001 -- map_exception re-raises anything it does not recognize
+    except Exception as exc:  # noqa: BLE001 -- ADR-005: every failure → map_exception
         return map_exception(exc)
     return Response(status_code=204)
 
 
 __all__ = [
+    "MAX_EXPIRES_S",
     "MAX_LEASE_S",
     "MAX_SQLITE_INT",
     "ack",

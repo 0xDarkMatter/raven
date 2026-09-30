@@ -10,6 +10,7 @@ channel names (ADR-002), and the GET write-free guarantee.
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 from urllib.parse import quote
 
@@ -87,17 +88,82 @@ def test_health_ok(client: TestClient, db: Path):
     assert body["db"] == str(db)
 
 
-def test_health_inits_missing_db(tmp_path: Path):
-    """The one sanctioned read-time write: init_db creates a missing DB
-    (mirrors `raven doctor`)."""
+def _delete_store(path: Path) -> None:
+    for suffix in ("", "-wal", "-shm"):
+        Path(f"{path}{suffix}").unlink(missing_ok=True)
+
+
+def test_health_on_missing_db_is_503_and_creates_nothing(tmp_path: Path):
+    """QA http H4: /health used init_db, which CREATED a missing DB — a
+    GET write, and a false "ok". It now probes read-only."""
     db._reset_init_cache()
     missing = tmp_path / "fresh.db"
-    assert not missing.exists()
     with TestClient(create_app(missing)) as c:
         resp = c.get("/health")
 
-    assert resp.status_code == 200
-    assert missing.exists()  # init_db created it
+    assert resp.status_code == 503
+    assert resp.json()["error"] == "unavailable"
+    assert not missing.exists()
+
+
+def test_health_notices_db_deleted_after_startup(client: TestClient, db: Path):
+    """QA http H4: after the process-cached init, /health kept answering
+    200 for a deleted file while every other route failed."""
+    assert client.get("/health").status_code == 200
+    _delete_store(db)
+
+    resp = client.get("/health")
+
+    assert resp.status_code == 503
+    assert resp.json()["error"] == "unavailable"
+    assert not db.exists()
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/channels",
+        "/channels/run/a/messages",
+        "/channels/run/a/pending?consumer=w@r",
+        "/channels/run/a/cursor?consumer=w@r",
+    ],
+)
+def test_reads_on_a_vanished_db_are_503_and_create_nothing(
+    client: TestClient, db: Path, path: str
+):
+    """GET handlers never write — not even the empty file sqlite3.connect
+    used to create when the store vanished under ravend (QA http H4)."""
+    _delete_store(db)
+
+    resp = client.get(path)
+
+    assert resp.status_code == 503
+    assert resp.json()["error"] == "unavailable"
+    assert not db.exists()
+
+
+def test_reads_on_a_foreign_file_are_503_schema_mismatch(tmp_path: Path):
+    """A replaced/foreign file used to 500 with a plain-text body."""
+    foreign = tmp_path / "foreign.db"
+    raw = sqlite3.connect(foreign)
+    raw.execute("CREATE TABLE unrelated (x)")
+    raw.close()
+    with TestClient(create_app(foreign)) as c:
+        health = c.get("/health")
+        listing = c.get("/channels")
+
+    assert (health.status_code, health.json()["error"]) == (503, "schema_mismatch")
+    assert (listing.status_code, listing.json()["error"]) == (503, "schema_mismatch")
+
+
+def test_reads_on_a_non_sqlite_file_are_503_schema_mismatch(tmp_path: Path):
+    garbage = tmp_path / "garbage.db"
+    garbage.write_bytes(b"not sqlite at all " * 100)
+    with TestClient(create_app(garbage)) as c:
+        resp = c.get("/channels/run/a/messages")
+
+    assert resp.status_code == 503
+    assert resp.json()["error"] == "schema_mismatch"
 
 
 # --------------------------------------------------------------------------- #
@@ -429,3 +495,76 @@ def test_cursor_slashy_channel(client: TestClient, db: Path):
 
     assert resp.status_code == 200
     assert resp.json() is None
+
+
+# --------------------------------------------------------------------------- #
+# QA http H10: one malformed input, one status — 400 on every route.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/channels/BAD%20NAME/messages",
+        "/channels//messages",
+        "/channels/run//a/messages",
+        "/channels/BAD%20NAME/pending?consumer=w@r",
+        "/channels/BAD%20NAME/cursor?consumer=w@r",
+    ],
+)
+def test_malformed_channel_name_is_400_not_404(client: TestClient, path: str):
+    """The store's name lookups made a malformed name 404 here while
+    /send and /claim said 400."""
+    resp = client.get(path)
+
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "bad_request"
+
+
+@pytest.mark.parametrize("route", ["pending", "cursor"])
+def test_malformed_consumer_is_400_on_every_consumer_route(
+    client: TestClient, db: Path, route: str
+):
+    """/cursor answered ``200 null`` for a consumer /pending rejected."""
+    _ensure(db, "run/b")
+
+    resp = client.get(f"/channels/run/b/{route}", params={"consumer": "NOT VALID"})
+
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "bad_request"
+
+
+def test_cursor_on_unknown_but_wellformed_channel_is_still_null(client: TestClient):
+    resp = client.get("/channels/run/nope/cursor", params={"consumer": "w@r"})
+
+    assert (resp.status_code, resp.json()) == (200, None)
+
+
+# --------------------------------------------------------------------------- #
+# QA http H13: strict query ints.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("raw", ["+1", "1_0", " 1", "1 ", "１", "²", "--5", "0x1"])
+def test_query_ints_accept_only_ascii_digits(client: TestClient, db: Path, raw: str):
+    """int() alone accepted '1_0' (as 10), '+1', padded and non-ASCII
+    digits — silently reading from the wrong id."""
+    _append(db, "run/a")
+
+    resp = client.get("/channels/run/a/messages", params={"after": raw})
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "'after' must be an integer"
+
+
+@pytest.mark.parametrize("raw", [str(2**63), "9" * 25, "9" * 5000, "-1"])
+def test_query_ints_out_of_range_name_the_range(client: TestClient, raw: str):
+    resp = client.get("/channels/run/a/messages", params={"after": raw})
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"].startswith("'after' must be between 0 and")
+
+
+def test_query_int_leading_zeros_are_still_in_range(client: TestClient, db: Path):
+    first = _append(db, "run/a")
+    second = _append(db, "run/a")
+
+    resp = client.get("/channels/run/a/messages", params={"after": "0" * 30 + str(first)})
+
+    assert [m["id"] for m in resp.json()["messages"]] == [second]

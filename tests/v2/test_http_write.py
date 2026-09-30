@@ -6,6 +6,7 @@ endpoint's test isn't done until the row is proven).
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from starlette.testclient import TestClient
 
 from raven_bus import channels, cursors
 from raven_bus import db as db_module
+from raven_bus.http import write as write_mod
 from raven_bus.http.app import create_app
 
 
@@ -562,3 +564,259 @@ def test_unused_import_guard() -> None:
     # cursors module is used indirectly via /ack; import kept for the
     # _raw()-style direct-store assertions pattern other tests follow.
     assert cursors.get_cursor is not None
+
+
+# --------------------------------------------------------------------------
+# QA http H9: /send's `kind` is optional and NOT defaulted.
+# --------------------------------------------------------------------------
+
+
+def _send(client: TestClient, channel: str, **extra) -> object:
+    return client.post(
+        "/send",
+        json={"channel": channel, "sender": "p@v0", "type": "job", "body": {}, **extra},
+    )
+
+
+@pytest.mark.parametrize("kind", ["queue", "stream"])
+def test_send_without_kind_appends_to_an_existing_non_broadcast_channel(
+    client: TestClient, db: Path, kind: str
+) -> None:
+    """A producer feeding an existing queue/stream without restating
+    `kind` got 409: the handler defaulted kind to 'broadcast' AND
+    enforced it."""
+    with db_module.connection(db) as c:
+        channels.ensure_channel(c, "run/v0/work", kind)
+
+    resp = _send(client, "run/v0/work")
+
+    assert resp.status_code == 201
+    with db_module.connection(db) as c:
+        assert channels.get_channel(c, "run/v0/work").kind == kind
+        count = c.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    assert count == 1
+
+
+def test_send_without_kind_creates_an_absent_channel_as_broadcast(
+    client: TestClient, db: Path
+) -> None:
+    assert _send(client, "run/v0/fresh").status_code == 201
+    with db_module.connection(db) as c:
+        assert channels.get_channel(c, "run/v0/fresh").kind == "broadcast"
+
+
+def test_send_with_matching_kind_appends(client: TestClient, db: Path) -> None:
+    with db_module.connection(db) as c:
+        channels.ensure_channel(c, "run/v0/q", "queue")
+
+    assert _send(client, "run/v0/q", kind="queue").status_code == 201
+
+
+def test_send_with_mismatched_kind_is_409_and_writes_nothing(
+    client: TestClient, db: Path
+) -> None:
+    with db_module.connection(db) as c:
+        channels.ensure_channel(c, "run/v0/q", "queue")
+
+    resp = _send(client, "run/v0/q", kind="broadcast")
+
+    assert resp.status_code == 409
+    conn = _raw(db)
+    assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 0
+    conn.close()
+
+
+def test_send_with_unknown_kind_is_400_and_creates_nothing(
+    client: TestClient, db: Path
+) -> None:
+    resp = _send(client, "run/v0/k", kind="bogus")
+
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "bad_request"
+    conn = _raw(db)
+    assert conn.execute("SELECT COUNT(*) FROM channels").fetchone()[0] == 0
+    conn.close()
+
+
+# --------------------------------------------------------------------------
+# QA http H2: encode inside the transaction — no phantom lease.
+# --------------------------------------------------------------------------
+
+
+def _nest(depth: int) -> list:
+    value: list = []
+    for _ in range(depth):
+        value = [value]
+    return value
+
+
+def test_claim_that_cannot_be_encoded_rolls_the_lease_back(
+    client: TestClient, db: Path
+) -> None:
+    """A legacy row nested past pydantic's serialiser depth (written
+    before log.MAX_BODY_DEPTH existed — so raw SQL here) used to be
+    LEASED and committed, then fail to encode: the worker got a 400 and
+    the lease it never saw dead-lettered the message unseen."""
+    with db_module.connection(db) as c:
+        chan = channels.ensure_channel(c, "run/v0/legacy", "queue")
+        c.execute(
+            "INSERT INTO messages (channel_id, sender, type, body) VALUES (?, ?, ?, ?)",
+            (chan.id, "p@v0", "job", json.dumps({"tree": _nest(150)})),
+        )
+
+    resp = client.post("/claim", json={"channel": "run/v0/legacy", "consumer": "w@v0"})
+
+    assert resp.status_code == 500
+    assert resp.json()["error"] == "internal_error"
+    conn = _raw(db)
+    assert conn.execute("SELECT COUNT(*) FROM claims").fetchone()[0] == 0
+    conn.close()
+
+
+def test_finite_body_check_does_not_recurse() -> None:
+    """The json.dumps-based check raised RecursionError (→ 500) on a
+    body deep enough to parse; the iterative walk can't blow the stack."""
+    write_mod._finite_body({"x": _nest(100_000)})
+    with pytest.raises(ValueError, match="finite"):
+        write_mod._finite_body({"x": [*_nest(5), {"y": float("inf")}]})
+
+
+def test_send_of_a_very_deep_body_is_a_400_envelope(client: TestClient) -> None:
+    raw = '{"channel":"run/v0/d","sender":"p@v0","type":"t","body":{"x":%s}}' % (
+        "[" * 900 + "]" * 900
+    )
+    resp = client.post(
+        "/send", content=raw.encode(), headers={"content-type": "application/json"}
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "bad_request"
+
+
+# --------------------------------------------------------------------------
+# QA http H3: every failure wears the envelope.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("field", ["reply_to", "thread_id"])
+def test_send_referencing_a_missing_message_is_404(
+    client: TestClient, field: str
+) -> None:
+    resp = _send(client, "run/v0/r", **{field: 999})
+
+    assert resp.status_code == 404
+    assert resp.json()["error"] == "not_found"
+
+
+def test_held_write_lock_is_503_busy(
+    client: TestClient, db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lock outlasting the busy timeout was a plain-text 500."""
+    monkeypatch.setattr(db_module, "DEFAULT_BUSY_TIMEOUT_S", 0.05)
+    holder = sqlite3.connect(str(db), timeout=0)
+    holder.execute("BEGIN IMMEDIATE")
+    holder.execute("INSERT INTO bus_meta (key, value) VALUES ('qa-lock', '1')")
+    try:
+        send = _send(client, "run/v0/b")
+        beat = client.post("/heartbeat", json={"consumer": "w@v0"})
+    finally:
+        holder.rollback()
+        holder.close()
+
+    for resp in (send, beat):
+        assert resp.status_code == 503
+        assert resp.json()["error"] == "busy"
+
+
+def test_write_to_a_foreign_file_is_503_schema_mismatch(tmp_path: Path) -> None:
+    foreign = tmp_path / "foreign.db"
+    raw = sqlite3.connect(foreign)
+    raw.execute("CREATE TABLE unrelated (x)")
+    raw.close()
+
+    resp = _send(TestClient(create_app(foreign)), "run/v0/x")
+
+    assert resp.status_code == 503
+    assert resp.json()["error"] == "schema_mismatch"
+
+
+def test_write_to_a_vanished_db_is_503_and_recreates_nothing(
+    client: TestClient, db: Path
+) -> None:
+    for suffix in ("", "-wal", "-shm"):
+        Path(f"{db}{suffix}").unlink(missing_ok=True)
+
+    resp = _send(client, "run/v0/x")
+
+    assert resp.status_code == 503
+    assert resp.json()["error"] == "unavailable"
+    assert not db.exists()
+
+
+def test_unexpected_store_failure_is_500_internal_error_without_leaking(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, caplog
+) -> None:
+    def _boom(*_args, **_kwargs):
+        raise KeyError("secret-internal-state")
+
+    monkeypatch.setattr(write_mod.log, "append", _boom)
+    with caplog.at_level("ERROR", logger="raven_bus.http"):
+        resp = _send(client, "run/v0/x")
+
+    assert resp.status_code == 500
+    assert resp.json()["error"] == "internal_error"
+    assert "secret-internal-state" not in resp.text
+    assert "secret-internal-state" in caplog.text
+
+
+# --------------------------------------------------------------------------
+# QA http H10 / H13: up-front address checks; expires_in_s range.
+# --------------------------------------------------------------------------
+
+
+def test_ack_with_malformed_channel_is_400_not_404(client: TestClient) -> None:
+    resp = client.post(
+        "/ack", json={"channel": "BAD NAME", "consumer": "a@v0", "up_to_id": 1}
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "bad_request"
+
+
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        ("/claim", {"channel": "run/v0/q", "consumer": "NOPE"}),
+        ("/claims/1/done", {"consumer": "NOPE"}),
+        ("/send", {"channel": "run/v0/q", "sender": "NOPE", "type": "t", "body": {}}),
+    ],
+)
+def test_malformed_consumer_is_400(client: TestClient, path: str, body: dict) -> None:
+    resp = client.post(path, json=body)
+
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "bad_request"
+
+
+@pytest.mark.parametrize("seconds", [0, -5, write_mod.MAX_EXPIRES_S + 1])
+def test_send_expires_in_s_outside_1_to_30_days_is_400(
+    client: TestClient, db: Path, seconds: int
+) -> None:
+    """Zero/negative wrote a message born expired — invisible to every
+    liveness read, i.e. a silent drop."""
+    resp = _send(client, "run/v0/e", expires_in_s=seconds)
+
+    assert resp.status_code == 400
+    conn = _raw(db)
+    assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 0
+    conn.close()
+
+
+@pytest.mark.parametrize("seconds", [1, write_mod.MAX_EXPIRES_S])
+def test_send_expires_in_s_range_bounds_are_inclusive(
+    client: TestClient, seconds: int
+) -> None:
+    resp = _send(client, "run/v0/e", expires_in_s=seconds)
+
+    assert resp.status_code == 201
+    assert resp.json()["expires_at"] is not None
