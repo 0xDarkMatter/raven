@@ -236,6 +236,23 @@ replaces v1's per-message delivery state with an append-only log + per-channel
   - *`raven doctor`* warns when it had to create the DB (a typo'd `--db`
     used to report "all checks passed"); *`raven serve`* reports a busy port
     as one line, exit 10; the top-level help no longer describes v1.
+- **ravend hardening (QA pass, 2026-09-30).** Route table unchanged; each fix
+  ships a regression test (full wire notes: ADR-005's 2026-09-30 amendment):
+  - *Concurrent first sends* to a new channel no longer 500 and drop messages
+    (the store's race-safe `ensure_channel`); `POST /send`'s `kind` is
+    optional, so sends to an existing queue/stream work without restating it.
+  - *No plain-text 500s.* Lock timeouts are `503 busy`, a missing store
+    `503 unavailable`, a foreign file `503 schema_mismatch`, anything else
+    `500 internal_error` — all in the `{"error","detail"}` envelope.
+  - *`POST /claim` can't lease what it can't return*: responses are encoded
+    inside the transaction and roll back on failure.
+  - *`/health` really probes* the store on every call, and ravend never
+    creates an empty DB file behind a vanished one.
+  - *`/tail`*: all-channel ids never go backwards across polls (a client
+    resuming from the last id seen lost messages); tearing down the tailed
+    channel closes the stream cleanly; `Last-Event-ID` is honoured.
+  - *Uniform validation*: malformed channel/consumer is 400 everywhere,
+    query ints are strict digits, `expires_in_s` is 1 s..30 days.
 - **Per-batch lease deadline.** `claim_next` now computes `lease_until` per
   batch rather than once up front, so a slow scan can't stamp an
   already-expired lease onto the rows it eventually writes.

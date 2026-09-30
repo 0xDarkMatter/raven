@@ -43,12 +43,15 @@ src/raven_bus/
 ├── exceptions.py RavenBusError → {InvalidAddressError (also ValueError),
 │                 UnknownChannelError, UnknownMessageError, ClaimDeniedError,
 │                 WrongChannelKindError, InvalidBodyError (also ValueError),
-│                 SchemaMismatchError (also RuntimeError), TeardownBlockedError}
+│                 SchemaMismatchError (also RuntimeError), TeardownBlockedError,
+│                 StoreUnavailableError}
 │                 — every subclass is exported from `raven_bus` (a test pins it)
 ├── paths.py      resolve_db_path(): arg > RAVEN_DB > ~/.raven/bus.db
 ├── db.py         init_db() (idempotent, process-cached; SchemaMismatchError on a
-│                 foreign file), connection() ctx mgr (WAL + foreign_keys + Row,
-│                 commit/rollback), data_version(), sweep(count_expired=False)
+│                 foreign file), connection(create=True) ctx mgr (WAL + foreign_keys
+│                 + Row, commit/rollback; create=False never makes a file — ravend),
+│                 probe() (read-only health check), is_busy_error(), data_version(),
+│                 sweep(count_expired=False)
 │                 (the ADR-001 enforcement point), teardown_run(), instance_id()
 ├── channels.py   ensure_channel (race-safe get-or-create; kind checked) /
 │                 get_channel / list_channels — kind is immutable
@@ -137,7 +140,8 @@ frozen in `http/app.py`'s route table (= ADR-005's endpoint table).
   validates/decodes, opens one `db.connection`, calls one contract function,
   encodes the result. **Adding logic to a handler is a defect** — it belongs in
   the module contract (where it's already at 100% coverage), not in HTTP. The
-  one sanctioned pairing is `send`'s `ensure_channel` + `append(ensure=False)`,
+  one sanctioned pairing is `send`'s `ensure_channel` + `append(ensure=False)`
+  when the request names a `kind` (without one it is a single `append(ensure=True)`),
   mirroring `raven send`; everything else is a single call.
 - **GET handlers never write.** v1's `GET /inbox` registered alias rows as a
   side effect — that bug class is the reason this line exists. (The one nuance:

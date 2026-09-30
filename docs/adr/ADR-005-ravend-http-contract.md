@@ -94,6 +94,35 @@ Two behaviours the BLUF under-specified, recorded as deliberate:
   a module-contract write, not handler logic — GET handlers themselves still
   never write.
 
+Wire changes from the same pass (the route table is unchanged):
+
+- **Status map extended.** Besides 400/404/409: `503 busy` (a SQLite lock
+  outlasted the busy timeout — retryable), `503 unavailable` (the store file
+  is missing or unopenable), `503 schema_mismatch` (not a raven v2 store —
+  on every route, not just `/health`), and `500 internal_error` for anything
+  unexpected (fixed `detail`; the traceback goes to the `raven_bus.http`
+  logger). Starlette's plain-text 500 no longer escapes.
+- **ravend never creates the DB.** Every connection opens with
+  `create=False`; a vanished file is 503 `unavailable`, never a fresh empty
+  file. `raven serve`'s `init_db` preflight is the one creator. `GET
+  /health` is a real read-only probe (`db.probe`) on every call.
+- **`POST /send`'s `kind` is optional.** Absent: one `log.append(ensure=True)`
+  (existing channel of any kind; broadcast if new). Present: must be a valid
+  kind (else 400), then `ensure_channel(kind)` + `append(ensure=False)` — a
+  mismatch is 409. `expires_in_s` must be 1..2,592,000 (1 s..30 days).
+- **Responses are encoded inside the transaction.** A result that can't be
+  encoded is 500 and rolls back — a `POST /claim` can no longer commit a
+  lease for a message it failed to return. (Trade-off: such a row, only
+  writable before the store's 64-level body-depth cap, now 500s every HTTP
+  claim at the head of its queue instead of dead-lettering unseen.)
+- **Input validation is uniform.** A malformed channel name or consumer id is
+  400 on every route (it was 404 on some, `200 null` on `/cursor`); query
+  ints are strict ASCII digits; an empty `?after=` means the default.
+- **`/tail`** honours `Last-Event-ID` (it wins over `?after=`); all-channel
+  ids are strictly increasing across polls (one id-ordered store read,
+  `log.read_all_after`); a tailed channel torn down mid-stream flushes what
+  was read and closes cleanly.
+
 ## Consequences
 
 - Port 7713 (unclaimed in the machine port registry as of 2026-08-12).

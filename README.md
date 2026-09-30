@@ -168,7 +168,12 @@ ravend is a sandbox escape hatch, not a daemon you need to run (design doc §4).
 It is a **thin bridge**: every endpoint maps 1:1 onto one module-contract call
 with no business logic in the HTTP layer, binds **loopback only, port 7713, no
 auth** (TLS/auth terminate at a reverse proxy for anything beyond one host), and
-errors use the envelope `{"error": <code>, "detail": <human>}` (ADR-005).
+errors use the envelope `{"error": <code>, "detail": <human>}` (ADR-005):
+400 bad input · 404 unknown channel/message · 409 conflict (claim not held,
+kind mismatch, teardown blocked) · 503 `busy` (lock timeout — retry) /
+`unavailable` (store file missing) / `schema_mismatch` (not a raven v2 store)
+· 500 `internal_error`. ravend never creates the DB file — `raven serve`'s
+startup does — so a vanished store is a 503, not a silently fresh empty one.
 
 Install the extra and run it:
 
@@ -217,17 +222,17 @@ curl -N '127.0.0.1:7713/tail?channel=run/v0-2/control'
 
 The wire surface is the endpoint table below (reproduced from
 [ADR-005](docs/adr/ADR-005-ravend-http-contract.md), which owns it as the wire
-format of record):
+format of record, updated with its 2026-09-30 amendment):
 
 | Method + path | Maps to | Notes |
 |---|---|---|
-| `GET /health` | db probe | `{status, db, version, schema}` |
+| `GET /health` | `db.probe` (read-only, every call) | `{status, db, version, schema}`; 503 when the store is missing or foreign |
 | `GET /channels?prefix=` | `channels.list_channels` | `{channels: [...]}` |
 | `GET /channels/{name}/messages?after=0&limit=100&include_expired=false` | `log.read_after` | forensic flag mirrors the Python arg |
 | `GET /channels/{name}/pending?consumer=&limit=` | `cursors.pending` | broadcast read; does not move the cursor |
 | `GET /channels/{name}/cursor?consumer=` | `cursors.get_cursor` | `null` body when absent |
-| `GET /tail?channel=&after=0` | `log.read_after` polling | SSE: `event: message`, message JSON per event; `: ping` comments while idle |
-| `POST /send` | `log.append` | body mirrors append kwargs (+`kind` for ensure); 201 |
+| `GET /tail?channel=&after=0` | `log.read_after` / `log.read_all_after` polling | SSE: `event: message`, message JSON per event; `: ping` comments while idle; honours `Last-Event-ID` |
+| `POST /send` | `log.append` | body mirrors append kwargs; optional `kind` creates/asserts the channel kind (absent: any existing kind, broadcast if new); `expires_in_s` 1..30 d; 201 |
 | `POST /claim` | `claims.claim_next` | 200 message, **204 when queue empty** |
 | `POST /claims/{id}/renew` | `claims.renew` | `{consumer, lease_s?}` |
 | `POST /claims/{id}/done` | `claims.complete` | `{consumer}` |
