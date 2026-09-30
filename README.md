@@ -460,17 +460,26 @@ for msg in conductor.inbox():
 
 The shim maps v1 onto v2: a v1 address `"<role>:<session>"` becomes a 2-consumer
 broadcast channel `compat/<session>/<role>`, and v1's `(role, session)` becomes
-the v2 consumer `<role>@<session>`. Three narrowings are unavoidable because v2
-has no per-message status column, no hash alias, and no session fence — they
-are documented loudly in `compat.py` and the CHANGELOG:
+the v2 consumer `<role>@<session>`. Constructing a `BusClient` emits a
+`DeprecationWarning`. These narrowings are unavoidable because v2 has no
+per-message status column, no hash alias, and no session fence — they are
+documented loudly in `compat.py` and the CHANGELOG:
 
 1. **Case-folding.** v2's grammar is lowercase-only (ADR-002); the shim
-   `.lower()`s role and session before mapping. (All v1 examples are
-   lowercase, so they keep running unchanged.)
-2. **Cursor-jump ack.** v1 acked a single message; `compat.ack(id)` jumps the
-   cursor to `id`, acking everything up to it. Fine for in-order ackers.
+   `.lower()`s role and session — in the constructor and in `inbox(role=)` /
+   `subscribe(role=)` — before mapping. (All v1 examples are lowercase, so
+   they keep running unchanged.)
+2. **Cursor-jump ack, scoped to your own inbox.** v1 acked a single message;
+   `compat.ack(id)` jumps this client's cursor to `id`, acking everything up
+   to it — fine for in-order ackers. An id on *another* channel (e.g. one you
+   sent) is a no-op; an unknown id raises `UnknownMessageError` as in v1.
 3. **`task_id` in body.** v2 has no `task_id` column; the shim smuggles it
-   under `body["__task_id__"]` on send and strips it on read.
+   under `body["__task_id__"]` on send and strips it on read, so that body key
+   is reserved.
+4. **No schema enforcement, no competing consumers.** `SchemaRegistry` is a
+   no-op (strict mode doesn't reject anything), and two clients with the same
+   role share one broadcast cursor — both see every message; there is no
+   v1-style claim. Use a v2 `queue` channel for exactly-one delivery.
 
 ### What was removed
 

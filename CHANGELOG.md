@@ -183,6 +183,10 @@ replaces v1's per-message delivery state with an append-only log + per-channel
   once ADR-003's digest rule releases it (the same `_fyi_due` rule `plan`
   uses). The ACP harness still pushes full `render` blocks — it owns the
   loop and acks after delivery.
+- **Packaging.** The version is single-sourced from `raven_bus.__version__`
+  (package metadata said `0.1.1` while `raven version` said `0.2.0.dev0`);
+  the description is v2's; the unused v1 dependencies `structlog` and
+  `pyyaml` are dropped. The dist name stays a placeholder (ADR-004).
 - **Import root renamed `claude_bus` → `raven_bus`** (ADR-004). The CLI stays
   `raven`. The **pip distribution name is undecided** — do not `pip install
   raven` (Sentry's legacy client); install from source (`pip install -e .`)
@@ -204,17 +208,25 @@ replaces v1's per-message delivery state with an append-only log + per-channel
 
 ### v1-compat narrowings
 
-The shim preserves the v1 surface but three behaviours narrow, because v2 has
+The shim preserves the v1 surface but some behaviours narrow, because v2 has
 no per-message status, no hash alias, and no session fence (documented loudly
-in `raven_bus/compat.py`):
+in `raven_bus/compat.py`). Constructing a `BusClient` emits a
+`DeprecationWarning`.
 
 - **Case-folding.** v2's grammar is lowercase-only (ADR-002); the shim
-  `.lower()`s role and session before mapping. (All v1 examples are lowercase,
-  so they keep running unchanged.)
-- **Cursor-jump ack.** v1 acked a single message; `compat.ack(id)` jumps the
-  cursor to `id`, acking everything up to it.
+  `.lower()`s role and session (constructor, `inbox(role=)`,
+  `subscribe(role=)`) before mapping.
+- **Cursor-jump ack, own inbox only.** v1 acked a single message;
+  `compat.ack(id)` jumps this client's cursor to `id`, acking everything up to
+  it. An id on another channel is a no-op (it used to jump the cursor and
+  silently skip this inbox's unread messages); an unknown id raises.
+  `compat.read(id)` of another inbox's message reports the recipient's
+  read-state.
 - **`task_id` in body.** v2 has no `task_id` column; the shim carries it under
-  `body["__task_id__"]` on send and strips it on read.
+  the reserved body key `__task_id__` on send and strips it on read.
+- **No schema enforcement, no competing consumers.** `SchemaRegistry` is a
+  no-op; same-role clients share one broadcast cursor (use a `queue` channel
+  for exactly-one delivery).
 
 ## Roadmap
 
