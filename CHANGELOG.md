@@ -186,6 +186,39 @@ replaces v1's per-message delivery state with an append-only log + per-channel
   - *Unknown `reply_to`/`thread_id`* raises `UnknownMessageError`; address and
     tag grammars reject a trailing newline; `sweep`'s expired count is opt-in
     (it ran on every read); every exception class is exported from `raven_bus`.
+- **Adapter hardening (QA pass, 2026-09-30).** Each fix ships a regression
+  test that failed first:
+  - *`raven acp` no longer stalls a channel.* Acks were capped by the global
+    `plan.ack_up_to` and covered only the current boundary, so delivered-but-
+    unacked ids piled up; once 100 filled the pending window the channel
+    stalled for the session (later blocking messages too) and every restart
+    re-injected them. It now acks each channel up to its longest delivered
+    prefix, and gathering pages past already-delivered ids.
+  - *Framing escapes closed.* Sender/type collapse every `str.splitlines()`
+    boundary (U+2028/2029/0085/VT/FF/FS/GS/RS were let through and forged
+    header lines); body JSON escapes them; marker neutralising loops to a
+    fixpoint (self-overlapping markers survived one pass); sender/type are
+    capped at 200 chars (a blocking message could inject 200k chars of type).
+  - *Pulled content stays framed.* The hook's notice sent agents to plain
+    `raven read`, which printed `type` raw — a newline forged whole message
+    lines. The notice now says `raven read --framed`, and plain output is
+    sanitised too.
+  - *Starvation.* A single oversized fyi digest line was shed forever and
+    pinned acks (digest escape valve added); an fyi backlog starved the
+    prompt tier to one message per boundary (prompts are fitted first).
+  - *Hook* is read-only (no sweep / presence writes / DB creation — it
+    stalled ~6 s behind a writer's lock), skips a missing or non-broadcast
+    channel instead of going silent, keeps its footer when over budget, and
+    stays quiet on channels its own `raven acp` harness delivers.
+  - *Wrapper* tries `$RAVEN_PYTHON`, else `python3` then `python`, and ends
+    every command line in ` #` so a CRLF copy can't exit 2 (PreToolUse's
+    blocking code) under Linux bash.
+  - *`raven acp`*: the ACP timeout is an inactivity limit, off by default
+    (it was a 600 s total deadline that aborted long turns, while a silent
+    hung agent waited forever); a non-zero agent exit returns 10, not 0;
+    bad `--poll-interval`/`--budget`/`--timeout`, a non-UTF-8
+    `--initial-prompt-file` or a non-broadcast watched channel are usage
+    errors; an existing stream reply channel is left alone.
 - **Per-batch lease deadline.** `claim_next` now computes `lease_until` per
   batch rather than once up front, so a slow scan can't stamp an
   already-expired lease onto the rows it eventually writes.

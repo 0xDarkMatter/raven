@@ -176,33 +176,57 @@ decision text owns the *why*; treat each as a build-breaker.
   chars, no bodies/types) — never `render`'s full blocks, which repeated the
   whole backlog each call. The fyi due-rule is `policy._fyi_due`, shared by
   `plan` and `render_hint`; don't fork it.
+- **Pulled content must stay data-framed.** The notice points agents at
+  `raven read --framed`, which prints `policy.render`'s frame. Plain
+  `raven read` output runs every sender/type through `policy.single_line`
+  (all `str.splitlines()` boundaries, incl. U+2028) — a raw `type` with a
+  newline forged whole message lines. Never print message fields unsanitised.
 - **`policy` stays pure: no clock reads, no I/O, no randomness.** `now` and the
   token budget are *inputs* to `plan` (`datetime` is passed in; the harness
   passes `datetime.now(UTC)`, the hook the same). A `datetime.now()` or file
   read inside `policy.py` is a build-breaker — the functions must stay
   deterministic for identical inputs (it's how they're tested).
-- **The hook must NEVER ack.** It only peeks (`cursors.pending`, which advances
-  nothing) and renders. `cursors.ack` appears nowhere in `adapters/hooks/`. This
-  is what lets a hook run *beside* a harness on the same consumer without
-  double-delivery — only the harness moves the cursor (ADR-006).
-- **The harness acks ONLY after a successful `session/prompt`.** `_deliver`
-  submits first, then `cursors.ack`. If the child dies (ACP EOF) before the
-  submit completes, the loop returns and the message stays pending for the next
-  process/boundary — an undelivered message must never be acked. Every ack is
-  also capped at `plan.ack_up_to`, which stops before the first deferred id
-  (cursor-jump can't skip an older still-deferred message — ADR-001).
+- **The hook must NEVER write — not even presence.** It opens the DB
+  read-only (`mode=ro`, 250 ms busy timeout) and issues SELECTs only
+  (`cursors.get_cursor` + `log.read_after`): no `init_db`, no `sweep`, no
+  `consumers.touch`, and a missing DB file stays missing. Under a held write
+  lock the old read path stalled every tool call ~6 s. Unknown or
+  non-broadcast watched channels are skipped (one stderr line), not fatal.
+  `cursors.ack` appears nowhere in `adapters/hooks/`; only the harness moves
+  a cursor.
+- **A hook inside a harness-driven agent stays quiet on the harness's
+  channels.** `raven acp` sets `RAVEN_ACP_CONSUMER` / `RAVEN_ACP_CHANNELS` in
+  the agent's env; the hook skips exactly those. Otherwise it re-announces
+  ids the harness injected but hasn't acked yet (acks follow the turn).
+  Code calling `run_harness` with its own child doesn't get the markers.
+- **The harness acks ONLY after the whole boundary's prompts succeed** (none
+  on `AcpError`), and **per channel, up to the longest prefix of that
+  channel's pending ids delivered this session** — walking from the cursor,
+  stopping at the first undelivered id. That never passes a deferred id, and
+  one channel's deferral can't pin another's (the old global
+  `plan.ack_up_to` cap stalled whole channels once 100 delivered-but-unacked
+  ids filled the pending window, and re-injected them on every restart).
+  `plan.ack_up_to` stays meaningful for single-channel callers only.
 - **The harness's same-session redelivery guard is a SET of delivered ids,
   never a per-channel max.** A max hides lower-id *deferred* messages from
   `policy.plan`, which then computes `ack_up_to` without them — the cursor
-  jumps over messages injected zero times (issue #3). `plan` must always
-  see every undelivered pending id.
+  jumps over messages injected zero times (issue #3). Gathering pages past
+  already-delivered ids (bounded) so `plan` always sees undelivered ones.
 - **The hook's output is `hookSpecificOutput.additionalContext` JSON, never
   bare text.** Claude Code logs plain PreToolUse stdout and never shows it
   to the model (issue #2); `peek._emit` owns the envelope. The wrapper must
-  not `exec` python — `exec` makes its exit-0 guarantee unreachable.
+  not `exec` python — `exec` makes its exit-0 guarantee unreachable — and
+  every command line in it ends in ` #`, so a CRLF copy's stray `\r` lands
+  in a comment instead of making bash exit 2 (PreToolUse's *blocking* code).
+  Interpreter order: `$RAVEN_PYTHON` alone if set, else `python3`, then
+  `python`.
 - **The harness is a dumb pipe: no respawn.** `run_harness` exits when the child
-  exits or ACP errors; lifecycle (spawn/reap/restart) belongs to the spawner
-  (design §9 Q4 — ff-spawn's journal). Two owners of respawn = orphan factories.
+  exits or ACP errors (0 only if the child exited 0; 10 otherwise, with one
+  `raven-acp: <phase> failed: …` stderr line); lifecycle (spawn/reap/restart)
+  belongs to the spawner (design §9 Q4 — ff-spawn's journal). Two owners of
+  respawn = orphan factories. The ACP timeout is an **inactivity** limit, off
+  by default (`raven acp --timeout S`): ACP is silent during long tool calls,
+  and a dead agent is detected without one.
 - **Subprocess-driven hook tests are invisible to coverage.** The hook's real
   path runs in a child process (`python -m …peek`), so `--cov` never sees it.
   Exercise the logic through its **in-process twins**: import `peek`/`policy`
@@ -260,7 +284,9 @@ test exercises real v2 semantics against a live schema.
 raven send      --channel C --from R@RUN -t TYPE --body JSON
                 [--urgency U] [--tag T]... [--reply-to ID] [--expires-in S]
                 [--kind broadcast|queue|stream]
-raven read      --channel C --as R@RUN [-m MAX] [-j]      (broadcast pending)
+raven read      --channel C --as R@RUN [-m MAX≥1] [-j | --framed]
+                                                            (broadcast pending; --framed = the
+                                                             policy.render data frame)
 raven ack       --channel C --as R@RUN --up-to ID          (cursor jump)
 raven claim     --channel C --as R@RUN [--lease S] [-j]    (queue: claim next)
 raven done      --id ID --as R@RUN                         (complete claim)
@@ -275,7 +301,7 @@ raven serve    [--host 127.0.0.1] [--port 7713] [--db P] [--yes-expose]
                                                              non-loopback --host needs --yes-expose)
 raven acp      --as R@RUN --channel C [--channel C]... [--reply-to C]
                [--db P] [--poll-interval S] [--budget N] [--cwd .]
-               [--mode M] [--initial-prompt-file F] -- <agent cmd...>
+               [--mode M] [--initial-prompt-file F] [--timeout S] -- <agent cmd...>
                                                             (dumb-pipe ACP harness; ADR-006.
                                                              --mode = session/set_mode after
                                                              session/new; headless lanes need a

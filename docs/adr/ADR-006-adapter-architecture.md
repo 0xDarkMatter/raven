@@ -77,6 +77,40 @@ and never acks; the harness acks after delivery):
   per-channel max hid deferred lower ids from `plan`, breaking the
   "ack never passes a deferred id" rule above — delivered-zero-times loss.
 
+## Amendment (2026-09-30, QA pass)
+
+A hostile QA pass of the adapter layer changed four things the Decision and
+Consequences above state differently. The decision itself — pure policy,
+thin adapters, dumb-pipe harness, a hook that never acks — stands.
+
+- **Ack rule.** The harness no longer caps acks at the global
+  `plan.ack_up_to`. It acks each channel, after the whole boundary succeeds,
+  up to the longest prefix of that channel's pending ids delivered this
+  session (stopping at the first undelivered id). The global cap let one
+  channel's deferral pin another, and once 100 delivered-but-unacked ids
+  filled a channel's pending window that channel stalled for the session —
+  later blocking messages included. `ack_up_to` remains the rule for a
+  single-channel caller.
+- **The hook beside a harness *does* double-announce — now mitigated.** The
+  Consequences' "can serve the same consumer concurrently without
+  double-delivery" was wrong: the harness acks after the turn, so a hook in
+  that turn re-announces what was just injected. `raven acp` now sets
+  `RAVEN_ACP_CONSUMER` / `RAVEN_ACP_CHANNELS` in its agent's environment and
+  the hook stays quiet on exactly those channels. (A caller driving
+  `run_harness` with its own child doesn't get the markers.)
+- **The hook is read-only, strictly.** It opens the DB read-only and runs
+  SELECTs only — no `sweep`, no presence upsert, no DB creation — and skips
+  unknown or non-broadcast channels. The old read path wrote on every tool
+  call and stalled ~6 s behind another writer's lock. Pulled content stays
+  data-framed: the notice points at `raven read --framed` (`policy.render`'s
+  frame), and plain `raven read` sanitises sender/type to one line.
+- **Harness lifecycle.** `run_harness` returns 0 only when the agent exits
+  0 (a non-zero exit is 10, as a mid-prompt crash already was), with one
+  stderr breadcrumb per failure. The ACP timeout is an *inactivity* limit,
+  off by default (`raven acp --timeout`), not a 600 s total deadline that
+  killed long turns while a silent hung agent waited forever. The wrapper's
+  interpreter order is `$RAVEN_PYTHON`, else `python3`, then `python`.
+
 ## Alternatives rejected
 
 - **Harness respawns crashed agents** — buzz-acp does; here lifecycle
