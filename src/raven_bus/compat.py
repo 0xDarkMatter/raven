@@ -2,8 +2,10 @@
 
 Keeps the v1 public surface importable for one release so the four
 worked examples and their integration tests survive as the rewrite's
-regression net. Deprecated from day one; removed after one minor
-release.
+regression net. Deprecated from day one: every ``BusClient(...)``
+construction emits a :class:`DeprecationWarning` (hidden by Python's
+default filters unless raised from ``__main__``); removed after one
+minor release.
 
 Mapping (ADR-002/004):
 
@@ -18,10 +20,11 @@ Mapping (ADR-002/004):
   compat channel.
 - v1 ``inbox``                         → ``cursors.pending`` (status
   'unread').
-- v1 ``ack``                           → ``cursors.ack(up_to_id=id)`` —
-  NOTE the semantic narrowing: v1 acked single messages; cursor-jump
-  acks everything up to id. Acceptable for the examples (they ack in
-  order); documented loudly here.
+- v1 ``read``                          → ``log.read_by_id``; status is the
+  message RECIPIENT's read-state (their cursor on the message's own
+  channel), as v1's per-row status was.
+- v1 ``ack``                           → ``cursors.ack(up_to_id=id)`` on
+  this client's OWN channel only (see narrowings).
 - v1 ``subscribe``                     → poll ``claims``-free loop over
   ``pending`` + per-message ``cursors.ack`` — at-most-once is
   approximated by ack-before-yield, matching v1's documented crash
@@ -30,19 +33,48 @@ Mapping (ADR-002/004):
   (register/unregister/strict_mode accepted; validate returns body
   unchanged). v2 core has no schema registry (kept out of P1 scope).
 
-Tightening vs v1 (all four examples are lowercase, so they keep running):
-- role AND session_id are normalised with ``.lower()`` before mapping to
-  the v2 grammar, which is lowercase-only (ADR-002). v1 was
-  case-sensitive; this shim folds case so the v1 address forms survive.
-- ``task_id`` has no v2 column: it is carried INSIDE ``body`` under
-  ``"__task_id__"`` on send and stripped back out on read.
-- ``ack`` is cursor-jump (see above), not single-message.
+Narrowings vs v1 — each one is deliberate; read before "fixing":
+
+- **Case-folding.** role AND session_id are normalised with ``.lower()``
+  everywhere a v1 identity is accepted — the constructor, ``send(to=)``,
+  and the ``role=`` argument of ``inbox()``/``subscribe()`` — because
+  the v2 grammar is lowercase-only (ADR-002). v1 was case-sensitive;
+  folding keeps the v1 address forms working. (All four examples are
+  lowercase.)
+- **Cursor-jump ack.** v1 acked a single message; the v2 cursor is
+  monotonic, so ``ack(id)`` acks everything on this client's channel up
+  to ``id``. Fine for in-order ackers (the examples, ``subscribe``).
+- **Ack is scoped to this client's own channel.** Message ids are
+  global, but a cursor is per ``(consumer, channel)``. ``ack(id)`` of an
+  existing message that is NOT on this client's compat channel (e.g. one
+  it *sent*, which lives on the recipient's channel) is a silent no-op:
+  jumping the own cursor to a foreign id would skip every lower unread
+  message in this inbox. v1 accepted such an ack without error (it
+  flipped that one row's global status); the shim keeps the no-error
+  contract but never moves any cursor for it — in particular never the
+  recipient's. An unknown id still raises ``UnknownMessageError``.
+- **``__task_id__`` is a reserved body key.** v2 has no ``task_id``
+  column, so ``send(task_id=...)`` smuggles it INSIDE ``body`` under
+  ``"__task_id__"`` (overwriting any caller key of that name) and every
+  read strips it back out into ``Message.task_id``. Consequently a
+  caller body key named ``__task_id__`` is never delivered as data — it
+  surfaces as ``task_id``. Don't use that key.
+- **Schemas are not enforced.** ``SchemaRegistry`` is a no-op:
+  ``strict_mode(True)`` changes nothing and ``validate`` returns the body
+  unchanged.
+- **No competing consumers.** v1's ``subscribe`` claimed each message
+  atomically. Here two clients with the same ``(session, role)`` share
+  one consumer cursor with no claim, so concurrent copies of a role may
+  both handle a message (or split them arbitrarily). For
+  exactly-one-winner delivery use a v2 ``queue`` channel
+  (``raven_bus.claims``; see ``examples/02-two-processes``).
 """
 
 from __future__ import annotations
 
 import asyncio
 import sqlite3  # noqa: F401  (siblings take a sqlite3.Connection)
+import warnings
 from collections.abc import AsyncIterator
 from datetime import datetime
 from pathlib import Path
@@ -64,6 +96,8 @@ from raven_bus.models import (
 
 # Body key used to smuggle v1 ``task_id`` through the v2 store, which has
 # no dedicated column. Stripped on read so the caller sees a clean body.
+# RESERVED: a caller's own body key of this name is consumed as the task
+# id on read (never delivered as data) — see the module narrowings.
 _TASK_ID_KEY = "__task_id__"
 
 # v1 read-state is reduced to two states; v2 has none on the message row
@@ -73,6 +107,14 @@ _READ = "read"
 
 # Broadcast channel prefix; one channel per v1 recipient identity.
 _CHANNEL_PREFIX = "compat"
+
+# Emitted once per BusClient construction (ADR-004: deprecated from day
+# one). Tests filter on this exact prefix — keep it stable.
+_DEPRECATION_MESSAGE = (
+    "raven_bus.compat.BusClient is deprecated (ADR-004): it is the v1 API "
+    "shim and will be removed after one minor release. Use the v2 modules "
+    "(raven_bus.log / cursors / claims) directly."
+)
 
 
 def _compat_channel(session_id: str, role: str) -> str:
@@ -88,6 +130,20 @@ def _compat_channel(session_id: str, role: str) -> str:
 def _consumer_id(role: str, session_id: str) -> str:
     """v2 consumer id ``<role>@<run>`` for a v1 (role, session) pair."""
     return format_consumer_id(role, session_id)
+
+
+def _recipient_consumer(channel: str, fallback: str) -> str:
+    """The consumer whose cursor holds a message's read-state.
+
+    A ``compat/<session>/<role>`` channel belongs to exactly one v1
+    recipient, ``<role>@<session>``. Any other channel (a native v2
+    channel reached by a global id) has no v1 recipient, so the
+    ``fallback`` consumer (the reading client) is used instead.
+    """
+    segments = channel.split("/")
+    if len(segments) == 3 and segments[0] == _CHANNEL_PREFIX:
+        return _consumer_id(segments[2], segments[1])
+    return fallback
 
 
 def _parse_v1_address(addr: str) -> tuple[str, str]:
@@ -246,6 +302,11 @@ class BusClient:
         role: str,
         db_path: str | Path | None = None,
     ) -> None:
+        # stacklevel=2 attributes the warning to the caller's line, so
+        # Python's default filters show it only when the caller is
+        # __main__ (the examples construct clients in agents.py → silent).
+        warnings.warn(_DEPRECATION_MESSAGE, DeprecationWarning, stacklevel=2)
+
         # v1 parity: type + emptiness checks first, so callers get the
         # familiar ValueError before any v2 grammar validation runs.
         if not isinstance(session_id, str) or not session_id.strip():
@@ -319,7 +380,8 @@ class BusClient:
         urgency passes through verbatim (v1 used blocking/prompt/fyi,
         same literals as v2 — a bad value is rejected by ``log.append``'s
         Urgency validation). correlation_id→thread_id, reply_to→reply_to.
-        task_id is smuggled in body (no v2 column).
+        task_id is smuggled in body under the reserved ``__task_id__`` key
+        (no v2 column; overwrites a caller key of that name).
         """
         recipient_role, recipient_session = _parse_v1_address(to)
         # Same case-folding tightening as the constructor.
@@ -355,6 +417,22 @@ class BusClient:
 
     # ----- read / inbox / ack -----------------------------------------
 
+    def _check_own_role(self, role: str | None, method: str) -> None:
+        """Reject a v1 ``role=`` argument that isn't this client's identity.
+
+        Accepts the bare role or the full ``"<role>:<session>"`` address,
+        case-folded exactly like the constructor (a client built as
+        ``BusClient("demo", "Carol")`` accepts ``role="Carol"``).
+        """
+        if role is None:
+            return
+        folded = role.lower() if isinstance(role, str) else role
+        if folded != self.address and folded != self.role:
+            raise ValueError(
+                f"BusClient.{method}(role=...) currently only supports this client's "
+                f"own role; got {role!r}, expected {self.address!r} or {self.role!r}"
+            )
+
     def inbox(
         self,
         role: str | None = None,
@@ -363,13 +441,10 @@ class BusClient:
         """Unseen messages on this client's compat channel (``pending``).
 
         ``role`` is accepted for v1 signature parity; only this client's
-        own role is supported (matching v1's behaviour).
+        own role is supported (matching v1's behaviour); it is case-folded
+        like every other v1 identity the shim accepts.
         """
-        if role is not None and role != self.address and role != self.role:
-            raise ValueError(
-                f"BusClient.inbox(role=...) currently only supports this client's "
-                f"own role; got {role!r}, expected {self.address!r} or {self.role!r}"
-            )
+        self._check_own_role(role, "inbox")
         with db.connection(self.db_path) as conn:
             pending = cursors.pending(
                 conn, self._consumer, self._channel, limit=max
@@ -388,14 +463,19 @@ class BusClient:
         ]
 
     def read(self, message_id: int) -> Message:
-        """One message by id; status derived from this client's cursor.
+        """One message by id; status derived from its recipient's cursor.
 
-        id <= own cursor's last_ack_id → 'read', else 'unread' (ADR-001:
-        read-state is cursor-derived, never stored on the row).
+        id <= recipient cursor's last_ack_id → 'read', else 'unread'
+        (ADR-001: read-state is cursor-derived, never stored on the row).
+        Ids are global, so the cursor consulted is the one on the
+        message's OWN channel, held by that channel's v1 recipient — the
+        same read-state v1's per-row status reported. For a message in
+        this client's inbox that is this client's own cursor.
         """
         with db.connection(self.db_path) as conn:
             v2 = log.read_by_id(conn, message_id)
-            cursor = cursors.get_cursor(conn, self._consumer, self._channel)
+            owner = _recipient_consumer(v2.channel, fallback=self._consumer)
+            cursor = cursors.get_cursor(conn, owner, v2.channel)
         last_ack = cursor.last_ack_id if cursor is not None else 0
         status = _READ if message_id <= last_ack else _UNREAD
         return _to_public(
@@ -411,14 +491,24 @@ class BusClient:
         """Ack by advancing this client's cursor to ``message_id``.
 
         NARROWING vs v1: v1 acked a single message; the v2 cursor is
-        monotonic, so this acks everything up to ``message_id``. Fine for
-        the examples, which ack in ascending id order.
+        monotonic, so this acks everything on this client's channel up to
+        ``message_id``. Fine for the examples, which ack in ascending id
+        order. An existing id on ANOTHER channel is a silent no-op (see
+        the module docstring's narrowings); an unknown id raises
+        :class:`UnknownMessageError` as v1 did.
         """
         with db.connection(self.db_path) as conn:
             # v1 raised UnknownMessageError on a missing id; preserve that
             # by probing the log before advancing the cursor. read_by_id
             # raises on absence — no need to re-wrap.
-            log.read_by_id(conn, message_id)
+            msg = log.read_by_id(conn, message_id)
+            # Ids are global but the cursor is per-channel: jumping it to
+            # a foreign id (e.g. a message this client SENT, which lives
+            # on the recipient's channel) would silently swallow every
+            # lower unread id in this inbox. v1 took such an ack without
+            # error, so no-op rather than raise.
+            if msg.channel != self._channel:
+                return
             cursors.ack(
                 conn, self._consumer, self._channel, up_to_id=message_id
             )
@@ -437,12 +527,9 @@ class BusClient:
         consumer crashes mid-handle the message is gone, matching v1's
         documented crash semantics. Polls every ``poll_interval_s``;
         cancellation propagates as :class:`asyncio.CancelledError`.
+        ``role`` is checked (case-folded) like :meth:`inbox`'s.
         """
-        if role is not None and role != self.address and role != self.role:
-            raise ValueError(
-                f"BusClient.subscribe(role=...) currently only supports this "
-                f"client's own role; got {role!r}"
-            )
+        self._check_own_role(role, "subscribe")
         # No try/except around the loop: asyncio.CancelledError raised at
         # the await point propagates straight out — clean cancellation,
         # matching v1's contract. Wrapping it just to re-raise adds nothing.
