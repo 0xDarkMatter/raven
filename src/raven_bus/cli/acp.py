@@ -16,6 +16,7 @@ conventions as the rest of the app (one-line error:, exit 2 usage /
 from __future__ import annotations
 
 import math
+import os
 import subprocess
 from pathlib import Path
 
@@ -24,6 +25,7 @@ import typer
 from raven_bus import channels as channels_mod
 from raven_bus import db, models
 from raven_bus.adapters.acp.harness import HarnessConfig, parse_channels, run_harness
+from raven_bus.adapters.hooks.peek import ENV_ACP_CHANNELS, ENV_ACP_CONSUMER
 from raven_bus.cli._common import EXIT_ERROR, EXIT_USAGE, die, handle_errors
 
 # Registration note (mirrors cli/main.py's pattern for other commands):
@@ -157,10 +159,20 @@ def acp(
     )
 
     try:
+        # Tell a raven hook inside the agent which consumer/channels this
+        # harness already delivers, so it doesn't re-announce them during
+        # the very turn that injects them (QA finding A11; peek skips
+        # exactly these channels for exactly this consumer).
+        child_env = {
+            **os.environ,
+            ENV_ACP_CONSUMER: as_,
+            ENV_ACP_CHANNELS: ",".join(channels),
+        }
         child = subprocess.Popen(
             agent_argv,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
+            env=child_env,
         )
     except OSError as exc:
         # A missing/unlaunchable agent must render as the CLI's one-line

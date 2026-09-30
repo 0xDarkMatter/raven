@@ -1228,3 +1228,38 @@ def test_cli_non_utf8_initial_prompt_file_is_one_line_usage_error(
     assert result.exit_code == 2
     assert "--initial-prompt-file is not valid UTF-8" in result.output
     assert result.exception is None or isinstance(result.exception, SystemExit)
+
+
+def test_cli_marks_the_agent_env_with_what_the_harness_serves(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """QA finding A11 mitigation: the spawned agent's env names this
+    harness's consumer + channels, so a raven hook inside it skips them
+    instead of re-announcing messages during the turn that injects them."""
+    captured: dict = {}
+
+    class _FakeProc:
+        def __init__(self, argv, **kwargs) -> None:
+            captured["env"] = kwargs["env"]
+
+        def poll(self):
+            return 0
+
+        def terminate(self) -> None:
+            pass  # pragma: no cover -- child already exited
+
+    monkeypatch.setattr("raven_bus.cli.acp.subprocess.Popen", _FakeProc)
+    monkeypatch.setattr("raven_bus.cli.acp.run_harness", lambda *a, **k: 0)
+    monkeypatch.setenv("SOME_PARENT_VAR", "kept")
+
+    result = runner.invoke(
+        app,
+        ["acp", "--as", CONSUMER, "--channel", CHANNEL, "--channel", "run/run1/ctl",
+         "--db", str(db), "--", "agent"],
+    )
+
+    assert result.exit_code == 0
+    env = captured["env"]
+    assert env["RAVEN_ACP_CONSUMER"] == CONSUMER
+    assert env["RAVEN_ACP_CHANNELS"] == f"{CHANNEL},run/run1/ctl"
+    assert env["SOME_PARENT_VAR"] == "kept"  # the rest of the env passes through
