@@ -162,6 +162,30 @@ replaces v1's per-message delivery state with an append-only log + per-channel
   `exec`s python (its `|| true` never ran, so a missing interpreter exited
   127 and raised a hook-error notice on every tool call), ships executable,
   and `*.sh` is pinned to LF via `.gitattributes`.
+- **Store hardening (QA pass, 2026-09-30).** Each fix ships a regression
+  test that failed first:
+  - *Concurrent first use of a channel* no longer loses sends: `ensure_channel`
+    is an `INSERT … ON CONFLICT DO NOTHING` get-or-create (8 concurrent first
+    sends lost up to 57/96; 6 concurrent `raven acp` starts crashed 10/48).
+  - *`append(ensure=True)` works on existing queue/stream channels* (it
+    demanded `broadcast`); it now creates only absent channels, as broadcast.
+  - *`ack` clamps to the channel head* — acking a foreign/future id (ids are
+    global) used to hide every later message on the channel forever.
+  - *`release` undoes only its own claim's count* (`deliveries - 1`, was
+    `= 0`), so a poison message can't dodge dead-lettering via a release.
+  - *Teardown blocked by an outside `reply_to`/`thread_id`* raises
+    `TeardownBlockedError` naming the blockers (was a raw FK traceback).
+  - *Foreign DB files* (another schema version, or an unrelated SQLite file)
+    raise `SchemaMismatchError` and are left untouched (was a bare
+    `RuntimeError`, or silent adoption); init retries only on busy/locked.
+  - *Claim frontier soundness*: keyed on a `bus_meta` instance id (ext4
+    reuses a replaced file's inode), the ceiling is read before the scan, and
+    the fresh/lapsed scans keep separate resume points.
+  - *Bodies nested deeper than 64 levels* are rejected (`InvalidBodyError`) —
+    they were storable but unreadable over HTTP, and an HTTP claim leased them.
+  - *Unknown `reply_to`/`thread_id`* raises `UnknownMessageError`; address and
+    tag grammars reject a trailing newline; `sweep`'s expired count is opt-in
+    (it ran on every read); every exception class is exported from `raven_bus`.
 - **Per-batch lease deadline.** `claim_next` now computes `lease_until` per
   batch rather than once up front, so a slow scan can't stamp an
   already-expired lease onto the rows it eventually writes.

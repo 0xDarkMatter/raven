@@ -42,13 +42,19 @@ src/raven_bus/
 │                 (validate_atom / parse_consumer_id / validate_channel_name)
 ├── exceptions.py RavenBusError → {InvalidAddressError (also ValueError),
 │                 UnknownChannelError, UnknownMessageError, ClaimDeniedError,
-│                 WrongChannelKindError}
+│                 WrongChannelKindError, InvalidBodyError (also ValueError),
+│                 SchemaMismatchError (also RuntimeError), TeardownBlockedError}
+│                 — every subclass is exported from `raven_bus` (a test pins it)
 ├── paths.py      resolve_db_path(): arg > RAVEN_DB > ~/.raven/bus.db
-├── db.py         init_db() (idempotent, process-cached), connection() ctx mgr
-│                 (WAL + foreign_keys + Row, commit/rollback), data_version(),
-│                 sweep() (the ADR-001 enforcement point), teardown_run()
-├── channels.py   ensure_channel / get_channel / list_channels — kind is immutable
-├── log.py        append() (the ONLY messages writer) + read_after/read_by_id/read_thread
+├── db.py         init_db() (idempotent, process-cached; SchemaMismatchError on a
+│                 foreign file), connection() ctx mgr (WAL + foreign_keys + Row,
+│                 commit/rollback), data_version(), sweep(count_expired=False)
+│                 (the ADR-001 enforcement point), teardown_run(), instance_id()
+├── channels.py   ensure_channel (race-safe get-or-create; kind checked) /
+│                 get_channel / list_channels — kind is immutable
+├── log.py        append() (the ONLY messages writer; ensure=True = get-or-create,
+│                 any kind; bodies capped at MAX_BODY_DEPTH=64) + read_after /
+│                 read_all_after (cross-channel, id-ordered) / read_by_id / read_thread
 ├── cursors.py    broadcast: pending() + ack() (cursor-jump only) + get_cursor()
 ├── claims.py     queue: claim_next / renew / complete / release / get_claim
 ├── consumers.py  touch() — the ONLY writer of `consumers` (heartbeat + upsert)
@@ -74,7 +80,8 @@ src/raven_bus/
                   channels doctor teardown version serve acp  (_common.py = exit codes + error map)
 ```
 
-Six tables: `channels`, `messages`, `cursors`, `claims`, `consumers`, `bus_meta`.
+Six tables: `channels`, `messages`, `cursors`, `claims`, `consumers`, `bus_meta`
+(`schema_version`, plus a lazily written `instance_id`).
 `messages` has **no status column** — read-state lives in `cursors`/`claims`.
 
 ## Landmines (ADR-001 — these are hard invariants)
@@ -90,7 +97,9 @@ Treat each as a build-breaker if violated. The decision text owns the *why*.
   it — v2 read paths call `db.sweep` first.
 - **Ack is a cursor jump, not per-message.** `cursors.ack(up_to_id)` advances
   monotonically (`MAX(current, up_to_id)`); backwards ack is a silent no-op.
-  No gap tracking — `tail` covers forensics.
+  It **clamps** `up_to_id` to the channel's current head first — ids are
+  global, so acking a foreign or future id would otherwise hide every later
+  message on this channel forever. No gap tracking — `tail` covers forensics.
 - **Claims use `INSERT … ON CONFLICT DO NOTHING`.** Rowcount 1 wins; a lost
   race retries the next candidate rather than returning `None`. Never a
   read-modify-write claim.
@@ -104,9 +113,15 @@ Treat each as a build-breaker if violated. The decision text owns the *why*.
   state='lapsed'` that increments `deliveries` atomically — there is no
   caller-side snapshot, so any sweep call site is harmless to dead-letter
   accounting. A voluntary `release` flips the row to `lapsed` with
-  `deliveries=0` (immediately re-claimable, doesn't count) — **never
-  delete** a claim row: a deleted row falls below every process's claim
-  frontier and the message becomes unclaimable.
+  `deliveries - 1` (immediately re-claimable; it undoes only its own
+  claim's count — resetting to 0 let a poison message dodge dead-lettering
+  forever) — **never delete** a claim row: a deleted row falls below every
+  process's claim frontier and the message becomes unclaimable.
+- **`teardown_run` refuses rather than orphan.** If a message outside the
+  run replies to / threads under one inside it, the schema's foreign keys
+  forbid the delete; `teardown_run` raises `TeardownBlockedError` naming the
+  blockers and deletes nothing. Don't "fix" this by nulling `reply_to` —
+  that's an `UPDATE` on `messages` (append-only).
 - **There is no migration chain — `~/.raven/bus.db` is live (fleetflow).**
   `init_db` skips the SQL when the stored `schema_version` matches, so
   editing `0002_v2_schema.sql` in place never reaches existing DBs; and it
@@ -132,10 +147,13 @@ frozen in `http/app.py`'s route table (= ADR-005's endpoint table).
   `/heartbeat` (ADR-005 Amendment). That is the *module's* write,
   not the handler's — the handler still makes exactly one contract call.)
 - **The claim frontier is a pure per-process optimisation.** `claims._FRONTIER`
-  is an in-memory `{(db_path, channel_id): id}` watermark that lets a warm
-  `claim_next` skip a cold backlog scan. It is never persisted and never read
-  for correctness — a fresh process re-derives it from the same query that
-  serves the request. Correctness must never depend on it being populated.
+  is an in-memory watermark keyed by `path|instance_id|dev:ino` + channel that
+  lets a warm `claim_next` skip a cold backlog scan. `instance_id` is a uuid
+  in `bus_meta`, backfilled once inside `claim_next`'s transaction — the key
+  includes it because ext4 reuses a replaced file's inode, and a stale
+  frontier silently hides every message below it; with no instance id the
+  cache is skipped. Never persisted, never read for correctness — a fresh
+  process re-derives it. Correctness must never depend on it being populated.
 - **SSE tests need the real-uvicorn harness.** Sync `TestClient.stream` over an
   infinite SSE generator hangs on context exit — the portal can't reliably
   deliver `http.disconnect`, so the generator's poll loop never sees the client
