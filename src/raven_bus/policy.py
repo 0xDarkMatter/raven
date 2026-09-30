@@ -21,6 +21,10 @@ Tier semantics (ADR-003, restated as the enforcement site):
 ``ack_up_to`` is the highest message id an adapter may cursor-ack AFTER
 successful delivery — it must never include a deferred message
 (a deferred fyi must survive to a later boundary or another process).
+It is one number across ALL channels in ``pending``; the ACP harness
+therefore acks by the stricter per-channel rule in
+``harness._ack_delivered_prefixes`` (a global cap let one channel's
+deferral pin every other channel — QA finding A1).
 
 Two output shapes, one owner:
 
