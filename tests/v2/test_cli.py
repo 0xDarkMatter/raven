@@ -539,7 +539,9 @@ def test_tail_no_follow_single_channel_drains_and_exits() -> None:
     assert result.exit_code == 0
     assert "#1" in result.stdout
     assert "#2" in result.stdout
-    read_after.assert_called_once_with(conn, "run/r1/team", 0, include_expired=True)
+    read_after.assert_called_once_with(
+        conn, "run/r1/team", 0, limit=100, include_expired=True
+    )
     list_channels.assert_not_called()
 
 
@@ -548,8 +550,7 @@ def test_tail_no_follow_all_channels_json() -> None:
     with (
         patch("raven_bus.db.init_db"),
         patch("raven_bus.db.connection", return_value=_mock_connection(conn)),
-        patch("raven_bus.channels.list_channels", return_value=[_channel()]),
-        patch("raven_bus.log.read_after", return_value=[_message()]),
+        patch("raven_bus.log.read_all_after", return_value=[_message()]),
     ):
         result = runner.invoke(app, ["tail", "--no-follow", "--json"])
     assert result.exit_code == 0
@@ -578,8 +579,7 @@ def test_tail_follow_sleeps_then_stops_on_ctrl_c() -> None:
     with (
         patch("raven_bus.db.init_db"),
         patch("raven_bus.db.connection", return_value=_mock_connection(conn)),
-        patch("raven_bus.log.read_after", return_value=[]),
-        patch("raven_bus.channels.list_channels", return_value=[]),
+        patch("raven_bus.log.read_all_after", return_value=[]),
         patch("time.sleep", side_effect=KeyboardInterrupt),
     ):
         result = runner.invoke(app, ["tail"])
