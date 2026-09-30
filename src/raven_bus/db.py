@@ -244,7 +244,7 @@ def data_version(conn: sqlite3.Connection) -> int:
     return int(row[0])
 
 
-def sweep(conn: sqlite3.Connection) -> SweepResult:
+def sweep(conn: sqlite3.Connection, *, count_expired: bool = False) -> SweepResult:
     """Enforce time-based state, in one pass (ADR-001):
 
     1. **Lease reaping** — two single set-based UPDATEs whose WHERE
@@ -259,10 +259,17 @@ def sweep(conn: sqlite3.Connection) -> SweepResult:
        snapshot is needed and dead-lettering cannot be evaded by other
        sweep call sites (finding verify-001).
     2. **Expiry**: messages past ``expires_at`` are *not* deleted
-       (append-only log) — read paths must filter them. ``expired`` is
-       a RUNNING TOTAL of live-expired messages lacking a terminal
-       claim (observability only; it is not "newly expired this
-       sweep").
+       (append-only log) — read paths must filter them. With
+       ``count_expired=True``, ``expired`` is a RUNNING TOTAL of
+       live-expired messages lacking a terminal claim (observability
+       only; it is not "newly expired this sweep"). By default it is
+       NOT computed and reads 0.
+
+    WHY the count is opt-in (QA store #9): this runs on every
+    pending/claim — every hook peek — inside the write transaction,
+    and the COUNT walks every expired message in the DB (18ms -> 119ms
+    as they pile up). Only ``raven doctor`` reports it, so only doctor
+    pays for it.
 
     Cheap when nothing is stale; safe to call on every read."""
     now = _now_iso()
@@ -285,6 +292,9 @@ def sweep(conn: sqlite3.Connection) -> SweepResult:
         (now, now),
     )
     requeued = requeue_cur.rowcount if requeue_cur.rowcount != -1 else 0
+
+    if not count_expired:
+        return SweepResult(requeued=requeued, dead_lettered=dead_lettered)
 
     expired_row = conn.execute(
         """

@@ -305,7 +305,7 @@ def test_sweep_never_touches_messages_table(db: Path) -> None:
         mid = _insert_message(conn, cid, expires_at=past)
 
     with bus_db.connection(db) as conn:
-        result = bus_db.sweep(conn)
+        result = bus_db.sweep(conn, count_expired=True)
         row = conn.execute("SELECT * FROM messages WHERE id = ?", (mid,)).fetchone()
 
     assert row is not None  # message never deleted by sweep
@@ -318,11 +318,31 @@ def test_sweep_expired_excludes_terminal_claims(db: Path) -> None:
         cid = _insert_channel(conn, "run/t/q", max_deliveries=3)
         mid = _insert_message(conn, cid, expires_at=past)
         _insert_claim(conn, mid, state="done", deliveries=1, lease_until=past)
+        _insert_message(conn, cid, expires_at=past)  # counted: no claim
 
     with bus_db.connection(db) as conn:
+        result = bus_db.sweep(conn, count_expired=True)
+
+    assert result.expired == 1
+
+
+def test_sweep_skips_the_expired_count_unless_asked(db: Path) -> None:
+    """QA store #9: sweep runs on every pending/claim — every hook peek —
+    inside the write transaction, and its expired COUNT scanned every
+    expired message in the DB (18ms -> 119ms as they piled up). The
+    count is observability only, so it is opt-in (raven doctor)."""
+    past = _iso(datetime.now(UTC) - timedelta(seconds=10))
+    with bus_db.connection(db) as conn:
+        cid = _insert_channel(conn, "run/t/q")
+        _insert_message(conn, cid, expires_at=past)
+
+    statements: list[str] = []
+    with bus_db.connection(db) as conn:
+        conn.set_trace_callback(statements.append)
         result = bus_db.sweep(conn)
 
     assert result.expired == 0
+    assert not [sql for sql in statements if "COUNT(" in sql.upper()]
 
 
 def test_sweep_cheap_when_nothing_stale(db: Path) -> None:

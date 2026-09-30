@@ -32,7 +32,7 @@ def cmd_doctor(
             mode_row = conn.execute("PRAGMA journal_mode").fetchone()
             mode = mode_row[0] if mode_row is not None else "unknown"
             checks.append(("wal", str(mode).lower() == "wal", f"journal_mode={mode}"))
-            result = db.sweep(conn)
+            result = db.sweep(conn, count_expired=True)
             sweep_detail = (
                 f"expired={result.expired} requeued={result.requeued} "
                 f"dead_lettered={result.dead_lettered}"

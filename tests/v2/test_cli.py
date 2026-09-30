@@ -652,6 +652,25 @@ def test_doctor_all_ok() -> None:
     assert "all checks passed" in result.stdout
 
 
+def test_doctor_requests_the_expired_count() -> None:
+    """sweep's expired COUNT is opt-in (QA store #9); doctor is the one
+    caller that reports it, so it must ask."""
+    conn = MagicMock()
+    conn.execute.side_effect = [
+        MagicMock(fetchone=MagicMock(return_value=("2",))),
+        MagicMock(fetchone=MagicMock(return_value=("wal",))),
+    ]
+    with (
+        patch("raven_bus.db.init_db"),
+        patch("raven_bus.db.connection", return_value=_mock_connection(conn)),
+        patch("raven_bus.db.sweep", return_value=SweepResult(expired=4)) as sweep,
+    ):
+        result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 0
+    sweep.assert_called_once_with(conn, count_expired=True)
+    assert "expired=4" in result.stdout
+
+
 def test_doctor_reports_schema_mismatch_as_a_failed_check() -> None:
     """init_db now REFUSES foreign/unstamped files (QA store #8); doctor
     must report that as a failed check, not crash with a traceback."""

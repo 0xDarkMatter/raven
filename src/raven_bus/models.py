@@ -153,7 +153,9 @@ class Consumer(BaseModel):
 
 
 class SweepResult(BaseModel):
-    """Counts returned by db.sweep() — expiry + lease reaping (ADR-001)."""
+    """Counts returned by db.sweep() — expiry + lease reaping (ADR-001).
+    ``expired`` is only computed on ``sweep(conn, count_expired=True)``;
+    otherwise it is 0."""
 
     model_config = ConfigDict(frozen=True)
 
