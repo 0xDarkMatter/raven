@@ -20,7 +20,9 @@ transport are faked.
 
 from __future__ import annotations
 
+import re
 import sqlite3
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -735,6 +737,140 @@ def test_delivered_watermark_prevents_redelivery_storm(
     with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
         still = cursors.pending(conn, CONSUMER, CHANNEL)
     assert [m.id for m in still] == [msg_fyi.id, msg_block.id]
+
+
+# --------------------------------------------------------------------------- #
+# Deferred-below-delivered: never ack past an undelivered id (issue #3).
+#
+# The redelivery-storm guard above used to be a per-channel MAX delivered
+# id. That hid every pending id below the max — including ones policy had
+# DEFERRED, not delivered — from plan(), which then computed ack_up_to
+# without them and the cursor jumped over messages injected zero times.
+# These run the REAL policy against the real store; a sender publishes
+# mid-turn via _PublishingClient.
+# --------------------------------------------------------------------------- #
+class _PublishingClient(FakeAcpClient):
+    """FakeAcpClient that calls ``on_prompt(n)`` after its n-th prompt —
+    a sender publishing onto the bus while the agent is mid-turn."""
+
+    def __init__(self, on_prompt: Callable[[int], None]) -> None:
+        super().__init__()
+        self._on_prompt = on_prompt
+
+    def prompt(self, session_id: str, text: str) -> PromptResult:
+        result = super().prompt(session_id, text)
+        self._on_prompt(len(self.prompts))
+        return result
+
+
+def _injected_ids(text: str) -> list[int]:
+    """Ids ``policy.render`` put in front of the agent: full message
+    blocks (``id: N`` lines) plus digest lines (``[N] sender ...``)."""
+    full = re.findall(r"^id: (\d+)$", text, re.M)
+    digest = re.findall(r"^\[(\d+)\] ", text, re.M)
+    return [int(i) for i in full + digest]
+
+
+def test_deferred_fyi_below_delivered_prompt_is_not_acked_past(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #3 scenario A: fyi #1 (below digest thresholds) + prompt #2;
+    a second prompt arrives mid-turn. Boundary 2 must still see #1 as
+    deferred — the old max-watermark hid it and acked straight past."""
+    with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+        msg_fyi = _append(conn, urgency="fyi")
+        msg_a = _append(conn, urgency="prompt")
+
+    late: list[Message] = []
+
+    def _publish(n: int) -> None:
+        if n == 1:
+            with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+                late.append(_append(conn, urgency="prompt"))
+
+    client = _PublishingClient(_publish)
+    code = run_harness(_config(db_path=db), _dies_after(6), client=client, max_boundaries=2)
+
+    assert code == 0
+    assert [_injected_ids(t) for _, t in client.prompts] == [[msg_a.id], [late[0].id]]
+    with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+        cur = cursors.get_cursor(conn, CONSUMER, CHANNEL)
+        still = [m.id for m in cursors.pending(conn, CONSUMER, CHANNEL)]
+    assert cur is None  # the never-injected fyi still pins the cursor
+    assert msg_fyi.id in still
+
+
+def test_budget_shed_prompts_below_delivered_blocking_are_not_lost(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #3 scenario B: six ~3 KB prompts + a blocking #7. Boundary 1
+    delivers #7 and the two prompts the budget fits; #3-#6 are shed. A
+    late steer must not let the cursor jump over the shed four — every
+    message is injected exactly once, and the cursor lands on the last."""
+    pad = "x" * 3000
+    with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+        shed = [
+            log.append(conn, channel=CHANNEL, sender="peer@run1", type="steer",
+                       body={"n": i, "pad": pad})
+            for i in range(6)
+        ]
+        stop = _append(conn, urgency="blocking")
+
+    late: list[Message] = []
+
+    def _publish(n: int) -> None:
+        if n == 1:
+            with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+                late.append(_append(conn, urgency="prompt"))
+
+    client = _PublishingClient(_publish)
+    code = run_harness(_config(db_path=db), _dies_after(8), client=client, max_boundaries=3)
+
+    assert code == 0
+    injected = [i for _, t in client.prompts for i in _injected_ids(t)]
+    expected = [m.id for m in shed] + [stop.id, late[0].id]
+    assert sorted(injected) == sorted(expected)  # each exactly once, none lost
+    with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+        cur = cursors.get_cursor(conn, CONSUMER, CHANNEL)
+        still = cursors.pending(conn, CONSUMER, CHANNEL)
+    assert cur is not None and cur.last_ack_id == late[0].id
+    assert still == []
+
+
+def test_deferred_fyi_still_reaches_digest_after_later_delivery(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #3 scenario C: a deferred fyi must stay visible to plan() so
+    its digest trigger can fire. digest_min_count=2 here; the second fyi
+    arrives mid-turn, so boundary 2 digests BOTH and the cursor clears."""
+    real_plan = harness.policy.plan
+    monkeypatch.setattr(
+        harness.policy, "plan",
+        lambda pending, **kw: real_plan(pending, digest_min_count=2, **kw),
+    )
+    with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+        fyi_1 = _append(conn, urgency="fyi")
+        msg_a = _append(conn, urgency="prompt")
+
+    late: list[Message] = []
+
+    def _publish(n: int) -> None:
+        if n == 1:
+            with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+                late.append(_append(conn, urgency="fyi"))
+
+    client = _PublishingClient(_publish)
+    code = run_harness(_config(db_path=db), _dies_after(6), client=client, max_boundaries=2)
+
+    assert code == 0
+    assert [_injected_ids(t) for _, t in client.prompts] == [
+        [msg_a.id], [fyi_1.id, late[0].id],
+    ]
+    with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+        cur = cursors.get_cursor(conn, CONSUMER, CHANNEL)
+        still = cursors.pending(conn, CONSUMER, CHANNEL)
+    assert cur is not None and cur.last_ack_id == late[0].id
+    assert still == []
 
 
 def test_store_error_exits_ten_not_traceback(

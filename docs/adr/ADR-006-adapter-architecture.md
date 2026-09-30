@@ -48,6 +48,15 @@ P3 implements them. buzz-acp proved the harness shape (batch → one
 - Testing uses a **fake ACP agent** subprocess (ships in tests/) — the
   protocol client is tested against it, never against a live model.
 
+## Amendment (2026-09-30, issue #3)
+
+An implementation defect, fixed without changing the decision:
+
+- **Harness redelivery guard.** The in-memory guard that stops a session
+  re-injecting what it already delivered is a set of exact ids. A
+  per-channel max hid deferred lower ids from `plan`, breaking the
+  "ack never passes a deferred id" rule above — delivered-zero-times loss.
+
 ## Alternatives rejected
 
 - **Harness respawns crashed agents** — buzz-acp does; here lifecycle

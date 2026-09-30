@@ -13,8 +13,8 @@ Per boundary (the loop, roughly):
    batch+digest render as one prompt;
 4. AFTER the WHOLE boundary succeeds, one ``cursors.ack`` capped at the
    plan's ack_up_to (per-prompt acking LOST messages — see _deliver);
-   an in-memory delivered watermark stops same-session redelivery
-   where a deferred fyi pins the cursor;
+   an in-memory set of delivered ids stops same-session redelivery
+   where a deferred message pins the cursor;
 5. post the agent's reply text and stop_reason to the bus as telemetry
    (``log.append`` type='acp-reply' on the reply_channel), and each
    session/update batch count as type='acp-activity' heartbeats.
@@ -126,13 +126,18 @@ def run_harness(
     except AcpError:
         return 10
 
-    # In-memory delivered watermark per channel: a message delivered this
-    # SESSION but not (yet) coverable by the cursor (a lower-id deferred
-    # fyi pins ack_up_to) must not be re-planned every tick — that was a
-    # full-CPU byte-identical redelivery storm (verify finding). Crash
-    # semantics unchanged: the dict dies with the process, the cursor is
-    # the durable truth, redelivery after a crash is at-least-once.
-    delivered_watermark: dict[str, int] = {}
+    # Ids delivered this SESSION but not (yet) coverable by the cursor (a
+    # lower-id deferred message pins ack_up_to) must not be re-planned
+    # every tick — that was a full-CPU byte-identical redelivery storm
+    # (verify finding). It MUST be a set of exact ids, never a per-channel
+    # max: a max hides lower-id DEFERRED messages from plan(), which then
+    # computes ack_up_to without them and the cursor jumps over messages
+    # injected zero times (issue #3 — message loss). Pruned to still-
+    # pending ids each tick (ack is monotonic, so an id that leaves
+    # pending never returns). Crash semantics unchanged: the set dies with
+    # the process, the cursor is the durable truth, redelivery after a
+    # crash is at-least-once.
+    delivered: set[int] = set()
 
     boundary = 0
     while True:
@@ -140,11 +145,9 @@ def run_harness(
             return 0
 
         try:
-            pending = [
-                m
-                for m in _gather_pending(config)
-                if m.id > delivered_watermark.get(m.channel, 0)
-            ]
+            gathered = _gather_pending(config)
+            delivered.intersection_update(m.id for m in gathered)
+            pending = [m for m in gathered if m.id not in delivered]
             plan_ = policy.plan(
                 pending, now=datetime.now(UTC), token_budget=config.token_budget
             )
@@ -154,7 +157,7 @@ def run_harness(
                 continue
 
             boundary += 1
-            _deliver(config, acp, session_id, plan_, boundary, delivered_watermark)
+            _deliver(config, acp, session_id, plan_, boundary, delivered)
         except (AcpError, RavenBusError, sqlite3.Error) as exc:
             # Store errors (a 5s busy timeout under writer load is an
             # sqlite3.OperationalError) must exit like protocol errors —
@@ -184,7 +187,7 @@ def _deliver(
     session_id: str,
     plan_: policy.InjectionPlan,
     boundary: int,
-    delivered_watermark: dict[str, int],
+    delivered_ids: set[int],
 ) -> None:
     """Interrupts alone, first (one prompt each); then one prompt for
     batch+digest if either is non-empty.
@@ -195,9 +198,10 @@ def _deliver(
     ack at ack_up_to could cover lower-id batch messages the failed
     batch prompt never delivered. A crash mid-boundary now redelivers
     already-prompted interrupts — at-least-once, the survivable
-    failure mode. The delivered watermark advances even where the
-    cursor cannot (deferred fyi pinning ack_up_to), so this session
-    never re-delivers what it already injected."""
+    failure mode. ``delivered_ids`` records every injected id even where
+    the cursor cannot advance (a deferred message pinning ack_up_to), so
+    this session never re-delivers what it already injected — while
+    deferred ids stay OUT of it, so plan() keeps seeing them."""
     for msg in plan_.interrupt:
         solo = policy.InjectionPlan(interrupt=[msg])
         result = acp.prompt(session_id, policy.render(solo))
@@ -213,10 +217,7 @@ def _deliver(
     )
     with db_connection(config.db_path) as conn:
         _ack_covered(conn, config.consumer, delivered, plan_.ack_up_to)
-    for msg in delivered:
-        delivered_watermark[msg.channel] = max(
-            delivered_watermark.get(msg.channel, 0), msg.id
-        )
+    delivered_ids.update(msg.id for msg in delivered)
 
 
 def _ack_covered(

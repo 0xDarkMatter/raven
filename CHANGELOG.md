@@ -142,6 +142,15 @@ replaces v1's per-message delivery state with an append-only log + per-channel
 
 ### Fixed
 
+- **`raven acp` no longer acks deferred messages it never injected**
+  ([#3](https://github.com/0xDarkMatter/raven/issues/3)). The same-session
+  redelivery guard was a per-channel *max* delivered id, which hid lower-id
+  messages policy had **deferred** (an fyi below digest thresholds,
+  budget-shed prompts under a delivered blocking message) from `plan()` —
+  the next delivery then acked straight past them: delivered zero times.
+  It is now a set of exact delivered ids (pruned to still-pending), so
+  `plan()` keeps seeing every undelivered id, `ack_up_to` stops before
+  them again, and a deferred fyi's digest trigger can still fire.
 - **Per-batch lease deadline.** `claim_next` now computes `lease_until` per
   batch rather than once up front, so a slow scan can't stamp an
   already-expired lease onto the rows it eventually writes.

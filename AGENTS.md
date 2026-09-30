@@ -156,6 +156,11 @@ decision text owns the *why*; treat each as a build-breaker.
   process/boundary — an undelivered message must never be acked. Every ack is
   also capped at `plan.ack_up_to`, which stops before the first deferred id
   (cursor-jump can't skip an older still-deferred message — ADR-001).
+- **The harness's same-session redelivery guard is a SET of delivered ids,
+  never a per-channel max.** A max hides lower-id *deferred* messages from
+  `policy.plan`, which then computes `ack_up_to` without them — the cursor
+  jumps over messages injected zero times (issue #3). `plan` must always
+  see every undelivered pending id.
 - **The harness is a dumb pipe: no respawn.** `run_harness` exits when the child
   exits or ACP errors; lifecycle (spawn/reap/restart) belongs to the spawner
   (design §9 Q4 — ff-spawn's journal). Two owners of respawn = orphan factories.
