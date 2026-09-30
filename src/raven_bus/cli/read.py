@@ -33,7 +33,11 @@ def cmd_read(
     as_: str = typer.Option(
         ..., "--as", help="Reader consumer id '<role>@<run>'."
     ),
-    max_: int = typer.Option(100, "-m", "--max", help="Maximum messages to return."),
+    # min=1: SQLite reads LIMIT -1 as "no limit" and 0 as "nothing", so
+    # both silently did something other than what --max says.
+    max_: int = typer.Option(
+        100, "-m", "--max", min=1, help="Maximum messages to return (at least 1)."
+    ),
     json_out: bool = typer.Option(
         False, "-j", "--json", help="Emit JSON instead of text."
     ),

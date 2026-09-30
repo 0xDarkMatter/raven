@@ -150,3 +150,13 @@ def test_framed_output_survives_a_cp1252_pipe(monkeypatch: pytest.MonkeyPatch) -
     _echo_framed([msg])  # must not raise UnicodeEncodeError
     sys.stdout.flush()
     assert b'{"w": "\\u96e8"}' in raw.getvalue()
+
+
+@pytest.mark.parametrize("bad", ["0", "-1"])
+def test_read_max_below_one_is_a_usage_error(db: Path, bad: str) -> None:
+    """-m -1 read the whole backlog (SQLite LIMIT -1 = unlimited) and
+    -m 0 returned nothing; both are usage errors now."""
+    _seed(db, ("t", "prompt", {}))
+    result = _read(db, "-m", bad)
+    assert result.exit_code == 2
+    assert "Traceback" not in result.output
