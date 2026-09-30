@@ -472,6 +472,8 @@ def test_cli_double_dash_parsing_and_exit_code(
             "/tmp/agent",
             "--mode",
             "bypassPermissions",
+            "--timeout",
+            "90",
             "--",
             "some-agent",
             "--flag",
@@ -489,6 +491,7 @@ def test_cli_double_dash_parsing_and_exit_code(
     assert config.token_budget == 111
     assert config.cwd == "/tmp/agent"
     assert config.mode == "bypassPermissions"
+    assert config.timeout_s == 90.0
 
 
 def test_cli_initial_prompt_file_read_and_passed_verbatim(
@@ -1099,3 +1102,32 @@ def test_prune_forgets_only_ids_that_can_never_be_pending_again() -> None:
     # 3 is below the lowest pending id (acked/expired); 500 is past the
     # gathered window and may still be pending — kept.
     assert delivered == {CHANNEL: {10, 500}, A_CH: set()}
+
+
+# --------------------------------------------------------------------------- #
+# QA finding A7 — the ACP inactivity timeout is configurable end to end.
+# --------------------------------------------------------------------------- #
+def test_harness_builds_its_client_with_the_configured_timeout(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict = {}
+
+    class _Recorder(FakeAcpClient):
+        def __init__(self, child, *, timeout_s=None) -> None:
+            super().__init__(init_error=AcpError("stop after construction"))
+            seen["timeout_s"] = timeout_s
+
+    monkeypatch.setattr(harness, "AcpClient", _Recorder)
+    assert run_harness(_config(db_path=db, timeout_s=90.0), _never_dies()) == 10
+    assert seen == {"timeout_s": 90.0}
+
+
+@pytest.mark.parametrize("bad", ["0", "-5"])
+def test_cli_non_positive_timeout_is_usage_error(db: Path, bad: str) -> None:
+    result = runner.invoke(
+        app,
+        ["acp", "--as", CONSUMER, "--channel", CHANNEL, "--db", str(db),
+         "--timeout", bad, "--", "agent"],
+    )
+    assert result.exit_code == 2
+    assert "--timeout must be a positive" in result.output

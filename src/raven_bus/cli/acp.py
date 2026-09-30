@@ -3,6 +3,7 @@
     raven acp --as lane-3@v0-2 --channel run/v0-2/lane/3 \
               [--channel run/v0-2/control]... [--reply-to run/v0-2/telemetry] \
               [--db PATH] [--poll-interval 1.0] [--budget 2000] [--cwd .] \
+              [--mode MODE] [--initial-prompt-file FILE] [--timeout S] \
               -- <agent command...>
 
 Spawns the agent command (everything after ``--``) with piped stdio,
@@ -78,6 +79,16 @@ def acp(
             "agent refuses it."
         ),
     ),
+    timeout: float | None = typer.Option(
+        None,
+        "--timeout",
+        help=(
+            "Inactivity limit in seconds: exit 10 when the agent sends "
+            "nothing for this long (every streamed update resets it). "
+            "Default: none — a healthy agent is silent while a long tool "
+            "call runs, and a dead agent is detected without it."
+        ),
+    ),
 ) -> None:
     """Spawn an agent (everything after ``--``) under the bus<->ACP
     harness: a dumb pipe (ADR-006) — no respawn, exit when the child
@@ -98,6 +109,8 @@ def acp(
             models.validate_channel_name(reply_to)
         if mode is not None and not mode.strip():
             die("--mode must be a non-empty mode id", EXIT_USAGE)
+        if timeout is not None and not timeout > 0:
+            die("--timeout must be a positive number of seconds", EXIT_USAGE)
         initial_prompt: str | None = None
         if initial_prompt_file is not None:
             try:
@@ -129,6 +142,7 @@ def acp(
         cwd=cwd,
         mode=mode,
         initial_prompt=initial_prompt,
+        timeout_s=timeout,
     )
 
     try:

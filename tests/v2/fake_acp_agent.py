@@ -14,6 +14,15 @@ Run as ``python fake_acp_agent.py [--scenario NAME]``. The scenarios are:
     Emit the first text chunk and exit with status 1.
 ``garbage``
     Emit one non-JSON line at startup, then otherwise behave like echo.
+``stream``
+    Answer each prompt with 10 chunks spaced 0.15 s apart (1.5 s in all):
+    a long, ACTIVE turn that an inactivity timeout must not cut off.
+``hang``
+    Complete the handshake, then go silent on every prompt (sleep 60 s).
+``orphan-stdout``
+    On a prompt, spawn a grandchild that inherits stdout and sleeps 4 s,
+    then exit 1 without answering: the pipe stays open after the agent
+    is dead, so only a liveness check (not EOF) can notice.
 
 All messages use JSON-RPC 2.0, one UTF-8 JSON object per LF-terminated line.
 The module is import-safe because the harness lane imports its helpers too.
@@ -23,11 +32,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 import time
 from typing import Any, TextIO
 
-SCENARIOS = ("echo", "slow", "request-perms", "die-mid-prompt", "garbage")
+SCENARIOS = (
+    "echo", "slow", "request-perms", "die-mid-prompt", "garbage",
+    "stream", "hang", "orphan-stdout",
+)
 SESSION_ID = "fake-session"
 PERMISSION_REQUEST_ID = 9001
 
@@ -149,6 +162,21 @@ def serve(scenario: str, stdin: TextIO, stdout: TextIO) -> int:
                     },
                 },
             )
+
+        if scenario == "hang":
+            time.sleep(60)
+            return 0
+        if scenario == "orphan-stdout":
+            subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(4)"], stdout=stdout
+            )
+            return 1
+        if scenario == "stream":
+            for ordinal in range(10):
+                send(stdout, update(f"c{ordinal} ", ordinal=ordinal))
+                time.sleep(0.15)
+            send(stdout, response(request, {"stopReason": "end_turn"}))
+            continue
 
         prefix = f"[mode={mode}] " if mode is not None else ""
         rendered = f"{prefix}echo: {prompt_text(request)}"

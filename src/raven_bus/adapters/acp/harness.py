@@ -69,6 +69,11 @@ class HarnessConfig(BaseModel):
     cwd: str = "."
     """cwd passed to session/new (the agent's working directory)."""
 
+    timeout_s: float | None = None
+    """ACP inactivity limit (``raven acp --timeout``): a request fails —
+    exit 10 — when the agent sends no frame for this long. None = no
+    limit; why that is the default is on ``AcpClient.__init__``."""
+
     mode: str | None = None
     """Session mode selected via ``session/set_mode`` right after
     ``session/new`` (None = never sent). Needed for headless lanes:
@@ -114,7 +119,7 @@ def run_harness(
     0 = child exited cleanly / boundary cap reached, 10 = protocol
     error. ``client`` injection exists for tests; default constructs
     an AcpClient over ``child``."""
-    acp = client if client is not None else AcpClient(child)
+    acp = client if client is not None else AcpClient(child, timeout_s=config.timeout_s)
 
     try:
         acp.initialize()

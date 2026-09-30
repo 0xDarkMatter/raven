@@ -17,15 +17,22 @@ per line — the ACP stdio transport). Supported calls:
 - agent → client REQUESTS (permission/fs/terminal) are answered with a
   JSON-RPC error (method not supported) — we granted no capabilities.
 
-Blocking, synchronous, single-threaded by design: the harness drives
-one call at a time (dumb pipe). No respawn logic here (ADR-006).
+Synchronous API — the harness drives one call at a time (dumb pipe) —
+over ONE daemon reader thread that drains the child's stdout into a
+queue. The thread is what makes the waits enforceable (QA finding A7): a
+blocking ``readline`` could neither time out a silent agent nor notice
+that the agent had exited while a grandchild (a tool subprocess) still
+held its stdout open. It also keeps the child from blocking on a full
+stdout pipe between turns. No respawn logic here (ADR-006).
 """
 
 from __future__ import annotations
 
 import io
 import json
+import queue
 import subprocess
+import threading
 import time
 from collections.abc import Callable, Sequence
 from typing import Any, TextIO
@@ -35,7 +42,22 @@ from pydantic import BaseModel, ConfigDict, Field
 
 class AcpError(Exception):
     """Protocol-level failure: malformed frame, JSON-RPC error response,
-    unexpected EOF (child died), or timeout."""
+    the agent exiting (EOF, or the child process gone while a grandchild
+    keeps its stdout open), or — only when ``timeout_s`` is set — no
+    frame at all from the agent for ``timeout_s`` seconds."""
+
+
+_EOF = object()
+"""Queue sentinel: the agent's stdout reached end-of-file."""
+
+_WAIT_SLICE_S = 0.1
+"""How often a wait re-checks the inactivity deadline and child liveness."""
+
+_EXIT_GRACE_S = 0.5
+"""After the child process has exited, how long to keep draining frames it
+wrote before dying. The reader thread moves already-buffered lines into the
+queue within milliseconds; a pipe that stays silent this long after exit is
+held open only by a grandchild, so the agent is treated as exited."""
 
 
 class PromptResult(BaseModel):
@@ -62,11 +84,28 @@ class AcpClient:
         self,
         child: subprocess.Popen,
         *,
-        timeout_s: float = 600.0,
+        timeout_s: float | None = None,
         on_update: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
-        """``child`` must have stdin/stdout as pipes (text mode handled
-        internally either way — implementer's choice, document it).
+        """``child`` must have stdin/stdout as pipes. Binary pipes are
+        wrapped as UTF-8 with LF framing (the ACP stdio transport);
+        text-mode pipes are used as their owner configured them.
+
+        ``timeout_s`` is an INACTIVITY limit: a request fails when the
+        agent sends no frame at all (response, notification or request)
+        for that many seconds; every received frame restarts the clock,
+        so a long, actively streaming turn is never cut off. It used to
+        be a TOTAL per-request deadline that aborted any turn streaming
+        past 10 minutes — and never fired for a silent agent, because
+        ``readline`` blocked past it (QA finding A7).
+
+        Default None = no inactivity limit, deliberately: ACP streams
+        nothing while a tool call runs, so a healthy agent can be silent
+        for as long as its longest build or test run, and wall-clock
+        lifecycle belongs to the spawner (ADR-006 — ff-spawn's journal).
+        A DEAD agent needs no timeout: waits notice child exit even
+        while a grandchild holds the pipe open.
+
         ``on_update`` fires for every session/update as it arrives
         (live telemetry hook for the harness)."""
         if child.stdin is None or child.stdout is None:
@@ -78,6 +117,11 @@ class AcpClient:
         self._timeout_s = timeout_s
         self._on_update = on_update
         self._next_id = 1
+        # Lines (str), _EOF, or the exception that stopped the reader.
+        self._frames: queue.Queue[object] = queue.Queue()
+        threading.Thread(
+            target=self._pump_stdout, name="raven-acp-reader", daemon=True
+        ).start()
 
     def initialize(self) -> dict[str, Any]:
         """initialize handshake; returns the agent's capabilities dict.
@@ -114,7 +158,8 @@ class AcpClient:
         """session/prompt with one text content block; pumps
         notifications (and rejects agent-initiated requests) until the
         prompt's response arrives; returns the collected result.
-        Raises AcpError on child EOF / JSON-RPC error / timeout."""
+        Raises AcpError when the agent exits, on a JSON-RPC error, or on
+        ``timeout_s`` of agent silence (only if configured)."""
         updates: list[dict[str, Any]] = []
         text_chunks: list[str] = []
         result = self._request(
@@ -182,9 +227,8 @@ class AcpClient:
             }
         )
 
-        deadline = time.monotonic() + self._timeout_s
         while True:
-            message = self._read(deadline)
+            message = self._read()
             if "method" in message:
                 self._handle_agent_message(message, updates, text_chunks)
                 continue
@@ -206,22 +250,54 @@ class AcpClient:
                 raise AcpError("JSON-RPC response result must be an object")
             return result
 
-    def _read(self, deadline: float) -> dict[str, Any]:
-        while True:
-            if time.monotonic() >= deadline:
-                raise AcpError("agent response timed out")
-
-            # readline may remain blocked past the deadline. This synchronous
-            # client deliberately checks again when a frame/EOF arrives;
-            # lifecycle and termination remain the harness owner's concern.
-            try:
+    def _pump_stdout(self) -> None:
+        """Reader thread: move every stdout line into the queue, then the
+        EOF sentinel — or the exception that stopped reading (a decode
+        error, a pipe closed under us), re-raised by ``_next_line``."""
+        try:
+            while True:
                 line = self._stdout.readline()
-            except (OSError, UnicodeError) as exc:
-                raise AcpError(f"failed to read agent output: {exc}") from exc
-            if line == "":
-                raise AcpError("agent exited")
-            if time.monotonic() >= deadline:
+                if line == "":
+                    self._frames.put(_EOF)
+                    return
+                self._frames.put(line)
+        except Exception as exc:  # noqa: BLE001 -- surfaced to the caller
+            self._frames.put(exc)
+
+    def _child_exited(self) -> bool:
+        poll = getattr(self._child, "poll", None)
+        return poll is not None and poll() is not None
+
+    def _next_line(self) -> str:
+        """The next raw stdout line, waiting at most ``timeout_s`` (when
+        set) — the deadline is per call, i.e. per frame."""
+        deadline = None if self._timeout_s is None else time.monotonic() + self._timeout_s
+        exited_at: float | None = None
+        while True:
+            now = time.monotonic()
+            if deadline is not None and now >= deadline:
                 raise AcpError("agent response timed out")
+            wait = _WAIT_SLICE_S if deadline is None else min(_WAIT_SLICE_S, deadline - now)
+            try:
+                item = self._frames.get(timeout=wait)
+            except queue.Empty:
+                if self._child_exited():
+                    exited_at = exited_at if exited_at is not None else time.monotonic()
+                    if time.monotonic() - exited_at >= _EXIT_GRACE_S:
+                        raise AcpError("agent exited") from None
+                continue
+            if isinstance(item, str):
+                return item
+            # Terminal states stay terminal: re-queue so any later read
+            # fails the same way instead of blocking forever.
+            self._frames.put(item)
+            if isinstance(item, BaseException):
+                raise AcpError(f"failed to read agent output: {item}") from item
+            raise AcpError("agent exited")
+
+    def _read(self) -> dict[str, Any]:
+        while True:
+            line = self._next_line()
             if line.strip():
                 break
         try:
