@@ -5,14 +5,17 @@ Commands (frozen surface — flags may grow, commands may not):
     raven send      --channel C --from R@RUN -t TYPE --body JSON
                     [--urgency U] [--tag T]... [--reply-to ID]
                     [--expires-in S] [--kind broadcast|queue|stream]
-    raven read      --channel C --as R@RUN [-m MAX] [-j]     (broadcast pending)
+                    (--kind omitted = any existing kind; broadcast if new)
+    raven read      --channel C --as R@RUN [-m MAX] [-j | --framed]
+                    (broadcast pending; --framed = policy.render's frame)
     raven ack       --channel C --as R@RUN --up-to ID        (cursor jump)
     raven claim     --channel C --as R@RUN [--lease S] [-j]  (queue: claim next)
     raven done      --id ID --as R@RUN                       (complete claim)
     raven release   --id ID --as R@RUN
     raven tail      [--channel C] [--from ID] [--no-follow] [--json]
                     [--interval S]
-                    (identity-free, includes expired — forensic surface)
+                    (identity-free, includes expired, id-ordered across
+                    channels — forensic surface)
     raven channels  [--prefix P] [-j]
     raven doctor    [--db P]  (db reachable, schema version, WAL; runs one
                     real sweep and reports its tallies — not a dry run)
@@ -21,15 +24,17 @@ Commands (frozen surface — flags may grow, commands may not):
     raven serve     [--host H] [--port 7713] [--db P] [--yes-expose]
                     (ravend, the `[http]` extra — ADR-005)
     raven acp       --as R@RUN --channel C... [--reply-to C] [--mode M]
-                    [--initial-prompt-file F] ... -- <agent cmd...>
+                    [--initial-prompt-file F] [--timeout S] ... -- <agent cmd...>
                     (dumb-pipe ACP harness — ADR-006)
 
-AGENTS.md "CLI surface" carries the full flag list for serve/acp.
+docs/CLI.md carries the full flag list, every numeric bound, and each
+command's failure behaviour — change it together with this docstring.
 
 Conventions carried from v1: one-line ``error: ...`` on failure, exit
 codes 0 ok / 2 usage / 3 not-found / 10 error, ``-j/--json`` on read
-surfaces, tracebacks never shown to users. Every read command runs the
-opportunistic sweep first (ADR-001).
+surfaces, tracebacks never shown to users (cli_main renders any
+unexpected exception as ``error: <Type>: <msg>``, exit 10). Every read
+command runs the opportunistic sweep first (ADR-001).
 """
 
 from __future__ import annotations

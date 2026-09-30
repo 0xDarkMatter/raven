@@ -32,7 +32,7 @@ $ raven send --channel run/demo/control --from orchestrator@demo \
 sent #1 orchestrator@demo -> run/demo/control type=steer
 ```
 
-`--channel` is auto-created as `broadcast` (the default `--kind`) on first send.
+`--channel` is auto-created as `broadcast` on first send (pass `--kind queue` or `--kind stream` to create another kind). Later sends needn't repeat `--kind` — they go to the channel whatever its kind.
 
 ```bash
 # Read the lane's unseen messages. Reading does NOT ack.
@@ -58,7 +58,7 @@ returns `#1` regardless of `lane-1`'s cursor.
 ## 2. Queue: claim, done
 
 A `queue` channel hands out work packets — exactly one consumer wins each
-message, holds a lease, and finishes it. Create it with `--kind queue`.
+message, holds a lease, and finishes it. Create it with `--kind queue` on the first send; later sends can omit it.
 
 ```bash
 $ raven send --channel run/demo/queue --from orchestrator@demo \

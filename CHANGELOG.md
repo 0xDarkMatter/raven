@@ -219,6 +219,23 @@ replaces v1's per-message delivery state with an append-only log + per-channel
     bad `--poll-interval`/`--budget`/`--timeout`, a non-UTF-8
     `--initial-prompt-file` or a non-broadcast watched channel are usage
     errors; an existing stream reply channel is left alone.
+- **CLI robustness (QA pass, 2026-09-30).** Each fix ships a regression test:
+  - *`raven send` to an existing queue/stream* no longer needs `--kind`
+    repeated (it failed with `WrongChannelKindError`); `--kind` is optional
+    and only creates or asserts. A bogus kind is a usage error.
+  - *`raven tail --no-follow`* drains the whole backlog (it stopped silently
+    at 100 per channel) and prints in id order across channels (it printed
+    channel-name order); bad channel grammar is exit 2, unknown channel 3.
+  - *No tracebacks.* Any unexpected exception renders as `error: <Type>:
+    <msg>`, exit 10 (a garbage `--db` file, a directory as `--db`, …); every
+    numeric flag is bounded (`--expires-in`/`--lease` 1 s..30 d, ids within
+    int64, `-m` ≥ 1, `--interval` in (0, 3600], `--port` 1..65535 — see
+    docs/CLI.md); an empty `--type` and an over-deep `--body` are usage errors.
+  - *`raven teardown`* without `--yes` and without a terminal refuses with a
+    one-line error, exit 2 (it printed "Aborted." and exited 1).
+  - *`raven doctor`* warns when it had to create the DB (a typo'd `--db`
+    used to report "all checks passed"); *`raven serve`* reports a busy port
+    as one line, exit 10; the top-level help no longer describes v1.
 - **Per-batch lease deadline.** `claim_next` now computes `lease_until` per
   batch rather than once up front, so a slow scan can't stamp an
   already-expired lease onto the rows it eventually writes.
