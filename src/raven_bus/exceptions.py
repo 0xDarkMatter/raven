@@ -59,6 +59,13 @@ class TeardownBlockedError(RavenBusError):
         self.total = total
 
 
+class StoreUnavailableError(RavenBusError):
+    """The DB file a caller said must ALREADY exist is missing or cannot
+    be opened (``db.connection(create=False)`` / ``db.probe``). Those
+    callers — ravend, whose ``raven serve`` preflight created the store —
+    must never silently create an empty, schema-less file in its place."""
+
+
 class InvalidBodyError(RavenBusError, ValueError):
     """A message body the store refuses to write — today, one nested
     deeper than ``log.MAX_BODY_DEPTH`` (readers could not re-serialise

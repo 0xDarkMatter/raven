@@ -13,6 +13,7 @@ from raven_bus import db as bus_db
 from raven_bus.exceptions import (
     InvalidAddressError,
     SchemaMismatchError,
+    StoreUnavailableError,
     TeardownBlockedError,
 )
 
@@ -849,3 +850,106 @@ def test_is_busy_classifies_retryable_errors(
     exc: sqlite3.OperationalError, busy: bool
 ) -> None:
     assert bus_db._is_busy(exc) is busy
+
+
+# --- probe / connection(create=False) — ravend's never-create path (QA http H4)
+
+
+def test_is_busy_error_is_false_for_non_sqlite_and_non_busy_errors() -> None:
+    assert bus_db.is_busy_error(sqlite3.OperationalError("database is locked")) is True
+    assert bus_db.is_busy_error(sqlite3.OperationalError("no such table: x")) is False
+    assert bus_db.is_busy_error(sqlite3.IntegrityError("database is locked")) is False
+    assert bus_db.is_busy_error(ValueError("database is locked")) is False
+
+
+def test_probe_returns_the_schema_version_of_a_live_store(db: Path) -> None:
+    assert bus_db.probe(db) == bus_db.SCHEMA_VERSION
+
+
+def test_probe_bypasses_the_init_cache_and_never_creates(tmp_path: Path) -> None:
+    """init_db's process cache said "ok" for a file deleted after startup
+    (ravend's /health, QA http H4); probe re-reads every call and must
+    not re-create the file sqlite3.connect would."""
+    path = tmp_path / "gone.db"
+    bus_db.init_db(path, force=True)
+    for suffix in ("", "-wal", "-shm"):
+        Path(f"{path}{suffix}").unlink(missing_ok=True)
+
+    with pytest.raises(StoreUnavailableError, match="nothing was created"):
+        bus_db.probe(path)
+    assert not path.exists()
+
+
+@pytest.mark.parametrize(
+    ("setup", "match"),
+    [
+        ("CREATE TABLE other (x)", "not a raven store"),
+        ("CREATE TABLE bus_meta (key TEXT PRIMARY KEY, value TEXT)", "None"),
+        (
+            "CREATE TABLE bus_meta (key TEXT PRIMARY KEY, value TEXT);"
+            "INSERT INTO bus_meta VALUES ('schema_version', '1')",
+            "'1'",
+        ),
+    ],
+    ids=["no-bus-meta", "unstamped", "other-version"],
+)
+def test_probe_refuses_a_file_that_is_not_a_current_store(
+    tmp_path: Path, setup: str, match: str
+) -> None:
+    path = tmp_path / "foreign.db"
+    raw = sqlite3.connect(path)
+    raw.executescript(setup)
+    raw.close()
+
+    with pytest.raises(SchemaMismatchError, match=match):
+        bus_db.probe(path)
+
+
+def test_probe_refuses_a_non_sqlite_file(tmp_path: Path) -> None:
+    path = tmp_path / "garbage.db"
+    path.write_bytes(b"this is not a sqlite database, just bytes " * 50)
+
+    with pytest.raises(SchemaMismatchError, match="file is not a database"):
+        bus_db.probe(path)
+
+
+def test_probe_reraises_a_lock_that_outlasts_the_busy_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A busy store is transient, not foreign: the raw OperationalError
+    propagates (ravend maps it to 503 ``busy``), never SchemaMismatch.
+    Rollback-journal mode, because WAL readers never block."""
+    path = tmp_path / "locked.db"
+    raw = sqlite3.connect(path, isolation_level=None)
+    raw.executescript(
+        "PRAGMA journal_mode = DELETE;"
+        "CREATE TABLE bus_meta (key TEXT PRIMARY KEY, value TEXT);"
+        "INSERT INTO bus_meta VALUES ('schema_version', '2')"
+    )
+    raw.execute("BEGIN EXCLUSIVE")
+    monkeypatch.setattr(bus_db, "DEFAULT_BUSY_TIMEOUT_S", 0.05)
+    try:
+        with pytest.raises(sqlite3.OperationalError) as info:
+            bus_db.probe(path)
+    finally:
+        raw.rollback()
+        raw.close()
+    assert bus_db.is_busy_error(info.value)
+
+
+def test_connection_create_false_refuses_a_missing_file(tmp_path: Path) -> None:
+    path = tmp_path / "missing.db"
+
+    with pytest.raises(StoreUnavailableError), bus_db.connection(path, create=False):
+        pass  # unreachable: opening raises
+    assert not path.exists()
+
+
+def test_connection_create_false_opens_an_existing_store(db: Path) -> None:
+    with bus_db.connection(db, create=False) as conn:
+        conn.execute("INSERT INTO bus_meta (key, value) VALUES ('probe-test', 'x')")
+    with bus_db.connection(db, create=False) as conn:
+        row = conn.execute("SELECT value FROM bus_meta WHERE key = 'probe-test'").fetchone()
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    assert row["value"] == "x"
+    assert mode == "wal"
