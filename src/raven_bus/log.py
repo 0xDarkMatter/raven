@@ -18,7 +18,11 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from raven_bus import channels, consumers
-from raven_bus.exceptions import InvalidAddressError, UnknownMessageError
+from raven_bus.exceptions import (
+    InvalidAddressError,
+    UnknownChannelError,
+    UnknownMessageError,
+)
 from raven_bus.models import URGENCY_RANK, Message, Urgency, parse_consumer_id, validate_tags
 
 _SELECT = "SELECT * FROM messages"
@@ -74,8 +78,14 @@ def append(
 
     - ``sender`` is validated as a consumer id and upserted into
       ``consumers`` (last_seen_at bumped).
-    - ``channel`` must exist unless ``ensure`` (then created as
-      ``broadcast``).
+    - ``ensure=True`` is get-or-create WITHOUT a kind opinion: an
+      existing channel of ANY kind is appended to as-is; only an absent
+      one is created, as ``broadcast``. (It used to re-ensure with the
+      default kind, so appending to an existing queue/stream raised
+      WrongChannelKindError — QA store #2.) Callers that must enforce a
+      kind call ``channels.ensure_channel(conn, name, kind)`` themselves
+      and pass ``ensure=False``. ``ensure=False``: the channel must
+      exist (:class:`UnknownChannelError`).
     - ``thread_id`` inherits from the ``reply_to`` parent when unset
       (parent's thread_id, else the parent id itself) — v1's proven
       conversation rule.
@@ -90,10 +100,15 @@ def append(
 
     consumers.touch(conn, sender)
 
-    if ensure:
-        chan = channels.ensure_channel(conn, channel)
-    else:
+    try:
         chan = channels.get_channel(conn, channel)
+    except UnknownChannelError:
+        if not ensure:
+            raise
+        # consumers.touch above already took this transaction's write
+        # lock, so no peer can create the name between the miss and here;
+        # ensure_channel is race-safe on its own regardless.
+        chan = channels.ensure_channel(conn, channel)
 
     resolved_thread_id = thread_id
     if reply_to is not None and thread_id is None:

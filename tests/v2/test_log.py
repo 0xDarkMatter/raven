@@ -9,6 +9,7 @@ on db.py internals.
 from __future__ import annotations
 
 import sqlite3
+import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -313,3 +314,125 @@ def test_read_thread_includes_expired(conn: sqlite3.Connection) -> None:
     )
     thread = log.read_thread(conn, root.id)
     assert reply.id in {m.id for m in thread}
+
+
+# --- QA store-lane regressions: channel get-or-create ---------------------
+
+
+def _is_channel_insert(sql: str) -> bool:
+    return sql.lstrip().upper().startswith("INSERT INTO CHANNELS")
+
+
+def test_ensure_channel_survives_concurrent_first_use(db: Path) -> None:
+    """QA store #1: SELECT-then-INSERT raced. A peer committing the same
+    new channel between our SELECT miss and our INSERT surfaced a raw
+    ``IntegrityError: UNIQUE constraint failed: channels.name`` (8
+    concurrent `raven send` to a fresh channel: up to 57/96 failed).
+    Deterministic interleave: a holder owns the write lock with the row
+    uncommitted; the contender misses on SELECT and blocks in INSERT;
+    the holder commits; the contender must adopt the holder's row."""
+    from raven_bus import db as bus_db
+    from raven_bus.models import Channel
+
+    holder = sqlite3.connect(db, timeout=5.0)
+    holder.execute("BEGIN IMMEDIATE")
+    holder.execute(
+        "INSERT INTO channels (name, kind) VALUES ('run/r/fresh', 'broadcast')"
+    )
+
+    insert_started = threading.Event()
+    outcome: list[object] = []
+
+    def contender() -> None:
+        try:
+            with bus_db.connection(db) as cx:
+                cx.set_trace_callback(
+                    lambda sql: insert_started.set() if _is_channel_insert(sql) else None
+                )
+                outcome.append(channels.ensure_channel(cx, "run/r/fresh"))
+        except BaseException as exc:  # noqa: BLE001 -- surfaced by the assert
+            outcome.append(exc)
+
+    thread = threading.Thread(target=contender)
+    thread.start()
+    try:
+        assert insert_started.wait(5), "contender never reached its INSERT"
+        time.sleep(0.2)  # let the contender park in the busy-wait
+    finally:
+        holder.commit()
+        holder.close()
+    thread.join(10)
+
+    assert len(outcome) == 1
+    assert isinstance(outcome[0], Channel), outcome[0]
+    assert outcome[0].name == "run/r/fresh"
+
+
+def test_ensure_channel_concurrent_first_use_stress(db: Path) -> None:
+    """QA store #1, the reviewer's shape: many connections race the first
+    use of one channel; every one must get the same row, none may crash."""
+    from raven_bus import db as bus_db
+
+    workers = 8
+    barrier = threading.Barrier(workers)
+    ids: list[int] = []
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            with bus_db.connection(db) as cx:
+                barrier.wait(5)
+                ids.append(channels.ensure_channel(cx, "run/r/stress", "queue").id)
+        except BaseException as exc:  # noqa: BLE001 -- surfaced by the assert
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(workers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(20)
+
+    assert errors == []
+    assert len(ids) == workers
+    assert len(set(ids)) == 1
+
+
+def test_ensure_channel_existing_hit_does_not_burn_autoincrement_ids(
+    conn: sqlite3.Connection,
+) -> None:
+    """``INSERT ... ON CONFLICT DO NOTHING`` still advances AUTOINCREMENT
+    on a conflict, so the insert must only run on a SELECT miss —
+    otherwise every send to an existing channel would burn a channel id."""
+    first = channels.ensure_channel(conn, "chan-a")
+    for _ in range(5):
+        channels.ensure_channel(conn, "chan-a")
+    second = channels.ensure_channel(conn, "chan-b")
+    assert second.id == first.id + 1
+
+
+def test_ensure_channel_rejects_unknown_kind(conn: sqlite3.Connection) -> None:
+    """QA store #2: a bogus kind hit the schema's raw CHECK
+    IntegrityError; it is an input error (same class as a bad urgency)."""
+    with pytest.raises(InvalidAddressError, match="kind"):
+        channels.ensure_channel(conn, "chan-k", "bogus")  # type: ignore[arg-type]
+    assert conn.execute("SELECT COUNT(*) FROM channels").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("kind", ["queue", "stream"])
+def test_append_ensure_uses_existing_channel_of_any_kind(
+    conn: sqlite3.Connection, kind: str
+) -> None:
+    """QA store #2: ``append(ensure=True)`` re-ensured with the default
+    kind 'broadcast', so appending to an EXISTING queue/stream raised
+    WrongChannelKindError (broke the Python queue snippet, `raven send`
+    to a queue, and harness telemetry to a stream reply channel).
+    ensure=True is get-or-create: an existing channel is used as-is."""
+    channels.ensure_channel(conn, "run/r/typed", kind)  # type: ignore[arg-type]
+    msg = log.append(conn, channel="run/r/typed", sender=SENDER, type="t", body={})
+    assert msg.channel == "run/r/typed"
+    assert channels.get_channel(conn, "run/r/typed").kind == kind
+
+
+def test_append_ensure_validates_absent_channel_name(conn: sqlite3.Connection) -> None:
+    with pytest.raises(InvalidAddressError):
+        log.append(conn, channel="Bad Name", sender=SENDER, type="t", body={})
