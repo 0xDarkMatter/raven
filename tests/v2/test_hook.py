@@ -897,3 +897,117 @@ def test_hook_skips_channels_its_own_harness_delivers(monkeypatch, capsys, tmp_p
     monkeypatch.setenv("RAVEN_ACP_CONSUMER", "someone-else@run-a")
     assert peek_mod.peek() == 0
     assert f"--channel {CHANNEL} " in additional_context(capsys.readouterr().out)
+
+
+# --------------------------------------------------------------------------- #
+# QA finding A14 — the wrapper's interpreter choice and CRLF copies.
+# --------------------------------------------------------------------------- #
+def _shim(bin_dir: Path, name: str, body: str) -> None:
+    """A fake interpreter on PATH: a POSIX sh script (Git Bash runs a
+    shebang file without an extension)."""
+    shim = bin_dir / name
+    shim.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8", newline="\n")
+    shim.chmod(0o755)
+
+
+def _run_wrapper(tmp_path: Path, env: dict[str, str], wrapper: Path = WRAPPER):
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash not available — wrapper smoke is Git Bash/POSIX only")
+    return subprocess.run(
+        [bash, str(wrapper)], env=env, capture_output=True, text=True, timeout=60.0,
+        check=False,
+    )
+
+
+_REAL = Path(sys.executable).as_posix()
+
+
+def _wrapper_env(tmp_path: Path, bin_dir: Path) -> dict[str, str]:
+    db_path = tmp_path / "bus.db"
+    seed_channel(db_path, CHANNEL, [("steer", "prompt", {})])
+    env = _env(RAVEN_CONSUMER=CONSUMER, RAVEN_CHANNELS=CHANNEL, RAVEN_DB=str(db_path))
+    env.pop("RAVEN_PYTHON", None)
+    for key in ("RAVEN_ACP_CONSUMER", "RAVEN_ACP_CHANNELS"):
+        env.pop(key, None)
+    env["PATH"] = str(bin_dir)
+    return env
+
+
+def _one_notice(stdout: str) -> str:
+    assert stdout.count("\n") == 1, stdout  # exactly one JSON line — never two
+    return additional_context(stdout)
+
+
+@pytest.mark.parametrize(
+    "broken_python3",
+    [
+        "exit 49",  # the Windows Store stub: stderr-only, non-zero
+        f'exec "{_REAL}" -m raven_bus_no_such_module "$@"',  # no raven_bus there
+    ],
+    ids=["store-stub", "import-fails"],
+)
+def test_wrapper_falls_back_from_python3_to_python(tmp_path, broken_python3):
+    """No RAVEN_PYTHON: python3 first, then python. A python3 that can't
+    run peek writes nothing to stdout, so the fallback prints once."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _shim(bin_dir, "python3", broken_python3)
+    _shim(bin_dir, "python", f'exec "{_REAL}" "$@"')
+
+    result = _run_wrapper(tmp_path, _wrapper_env(tmp_path, bin_dir))
+
+    assert result.returncode == 0
+    assert f"--channel {CHANNEL} --as {CONSUMER}" in _one_notice(result.stdout)
+
+
+def test_wrapper_prefers_python3_and_never_runs_a_second_interpreter(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _shim(bin_dir, "python3", f'exec "{_REAL}" "$@"')
+    _shim(bin_dir, "python", 'echo "SECOND-INTERPRETER-RAN"')
+
+    result = _run_wrapper(tmp_path, _wrapper_env(tmp_path, bin_dir))
+
+    assert result.returncode == 0
+    assert "SECOND-INTERPRETER-RAN" not in result.stdout
+    _one_notice(result.stdout)
+
+
+def test_wrapper_does_not_second_guess_an_explicit_raven_python(tmp_path):
+    """RAVEN_PYTHON names THE interpreter: when it is wrong the hook stays
+    silent (exit 0) rather than quietly using some other python."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _shim(bin_dir, "python3", f'exec "{_REAL}" "$@"')
+    env = _wrapper_env(tmp_path, bin_dir)
+    env["RAVEN_PYTHON"] = (tmp_path / "no-such-python").as_posix()
+
+    result = _run_wrapper(tmp_path, env)
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+
+
+def test_wrapper_command_lines_are_crlf_safe():
+    """Every command line ends in ' #' and the command block has no blank
+    line, so a CRLF copy's stray \\r always lands in a comment. (Linux
+    bash exits 2 — PreToolUse's BLOCKING code — on `exit 0\\r`; Git
+    Bash hides this by stripping CRs, hence a structural check too.)"""
+    lines = WRAPPER.read_text(encoding="utf-8").splitlines()
+    first_cmd = next(i for i, line in enumerate(lines) if line and not line.startswith("#"))
+    block = lines[first_cmd:]
+    assert all(line.strip() for line in block), "blank line in the command block"
+    commands = [line for line in block if not line.lstrip().startswith("#")]
+    assert commands and all(line.endswith(" #") for line in commands), commands
+
+
+def test_wrapper_crlf_copy_still_exits_zero(tmp_path):
+    crlf = tmp_path / "raven-inbox-hook.sh"
+    crlf.write_bytes(WRAPPER.read_bytes().replace(b"\n", b"\r\n"))
+    env = _env()  # no RAVEN_CONSUMER: the silent path
+
+    result = _run_wrapper(tmp_path, env, crlf)
+
+    assert result.returncode == 0
+    assert result.stdout == ""
