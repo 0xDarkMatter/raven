@@ -15,6 +15,7 @@ conventions as the rest of the app (one-line error:, exit 2 usage /
 
 from __future__ import annotations
 
+import math
 import subprocess
 from pathlib import Path
 
@@ -111,12 +112,22 @@ def acp(
             die("--mode must be a non-empty mode id", EXIT_USAGE)
         if timeout is not None and not timeout > 0:
             die("--timeout must be a positive number of seconds", EXIT_USAGE)
+        # Usage errors, not runtime ones (QA finding A13): a zero poll
+        # interval busy-looped the idle path at full CPU, a negative one
+        # raised ValueError from time.sleep (a traceback), and a budget
+        # below 1 token defers everything but the escape-valve rescue.
+        if not (math.isfinite(poll_interval) and poll_interval > 0):
+            die("--poll-interval must be a positive number of seconds", EXIT_USAGE)
+        if budget < 1:
+            die("--budget must be at least 1 token", EXIT_USAGE)
         initial_prompt: str | None = None
         if initial_prompt_file is not None:
             try:
                 initial_prompt = initial_prompt_file.read_text(encoding="utf-8")
             except OSError as exc:
                 die(f"cannot read --initial-prompt-file: {exc}", EXIT_USAGE)
+            except UnicodeDecodeError as exc:
+                die(f"--initial-prompt-file is not valid UTF-8: {exc}", EXIT_USAGE)
             if initial_prompt is None or not initial_prompt.strip():
                 die("--initial-prompt-file is empty", EXIT_USAGE)
         db.init_db(db_path)

@@ -116,9 +116,12 @@ def run_harness(
 ) -> int:
     """Drive the loop until the child exits, AcpError, or
     ``max_boundaries`` deliveries (tests). Returns an exit code:
-    0 = child exited cleanly / boundary cap reached, 10 = protocol
-    error. ``client`` injection exists for tests; default constructs
-    an AcpClient over ``child``."""
+    0 = the child exited with status 0 / boundary cap reached;
+    10 = protocol or store error, or the child exited NON-zero (a crash
+    while idle used to return 0 — QA finding A13 — telling the spawner
+    "clean exit" about an OOM-killed agent). Every 10 leaves one
+    ``raven-acp:`` line on stderr. ``client`` injection exists for
+    tests; default constructs an AcpClient over ``child``."""
     acp = client if client is not None else AcpClient(child, timeout_s=config.timeout_s)
 
     try:
@@ -132,8 +135,11 @@ def run_harness(
             # boundary so the orchestrator sees the lane accept its task.
             result = acp.prompt(session_id, config.initial_prompt)
             _post_telemetry(config, result, 0)
-    except AcpError:
-        return 10
+    except (AcpError, RavenBusError, sqlite3.Error) as exc:
+        # Store errors too: boundary 0's telemetry write escaped as a
+        # traceback (QA finding A13), and a handshake/set_mode failure
+        # exited 10 silently.
+        return _fail("session setup failed", exc)
 
     # Ids delivered this SESSION but not (yet) coverable by the cursor (a
     # lower-id undelivered message pins that channel) must not be
@@ -148,7 +154,11 @@ def run_harness(
 
     boundary = 0
     while True:
-        if child.poll() is not None:
+        status = child.poll()
+        if status is not None:
+            if status != 0:
+                print(f"raven-acp: agent exited with status {status}", file=sys.stderr)
+                return 10
             return 0
 
         try:
@@ -181,11 +191,9 @@ def run_harness(
         except (AcpError, RavenBusError, sqlite3.Error) as exc:
             # Store errors (a 5s busy timeout under writer load is an
             # sqlite3.OperationalError) must exit like protocol errors —
-            # a traceback-crash was the GLM verify finding. One stderr
-            # breadcrumb; undelivered messages stay pending (cursor is
-            # the durable truth).
-            print(f"raven-acp: {type(exc).__name__}: {exc}", file=sys.stderr)
-            return 10
+            # a traceback-crash was the GLM verify finding. Undelivered
+            # messages stay pending (cursor is the durable truth).
+            return _fail("delivery failed", exc)
 
         if max_boundaries is not None and boundary >= max_boundaries:
             return 0
@@ -200,6 +208,12 @@ delivered-but-unackable ids below newer messages; past it, newer messages
 wait until the pin clears (a deferred fyi is due within
 DEFAULT_DIGEST_MAX_AGE_S, a budget-shed prompt goes next boundary), so the
 bound can delay, never stall."""
+
+
+def _fail(what: str, exc: BaseException) -> int:
+    """One stderr breadcrumb, then the harness's error exit code."""
+    print(f"raven-acp: {what}: {type(exc).__name__}: {exc}", file=sys.stderr)
+    return 10
 
 
 def _gather_pending(

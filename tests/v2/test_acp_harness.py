@@ -1122,8 +1122,20 @@ def test_harness_builds_its_client_with_the_configured_timeout(
     assert seen == {"timeout_s": 90.0}
 
 
+@pytest.fixture()
+def no_launch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Usage-error tests must fail BEFORE any spawn: a real binary named
+    like the dummy command (there is an ``agent`` on some PATHs) would
+    otherwise be launched and the harness would wait on it forever."""
+
+    def _refuse(*_a, **_k):
+        raise AssertionError("raven acp launched the agent despite a usage error")
+
+    monkeypatch.setattr("raven_bus.cli.acp.subprocess.Popen", _refuse)
+
+
 @pytest.mark.parametrize("bad", ["0", "-5"])
-def test_cli_non_positive_timeout_is_usage_error(db: Path, bad: str) -> None:
+def test_cli_non_positive_timeout_is_usage_error(db: Path, bad: str, no_launch: None) -> None:
     result = runner.invoke(
         app,
         ["acp", "--as", CONSUMER, "--channel", CHANNEL, "--db", str(db),
@@ -1131,3 +1143,88 @@ def test_cli_non_positive_timeout_is_usage_error(db: Path, bad: str) -> None:
     )
     assert result.exit_code == 2
     assert "--timeout must be a positive" in result.output
+
+
+# --------------------------------------------------------------------------- #
+# QA finding A13 — exit codes, CLI usage errors, breadcrumbs.
+# --------------------------------------------------------------------------- #
+def test_child_crash_while_idle_returns_ten_not_zero(
+    db: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """probe_exit: an agent OOM-killed while idle (status 137) made
+    run_harness return 0 — "child exited cleanly" to the spawner."""
+    _stub_plan(monkeypatch, InjectionPlan())
+    code = run_harness(_config(db_path=db), FakeChild([137]), client=FakeAcpClient())
+    assert code == 10
+    assert "raven-acp: agent exited with status 137" in capsys.readouterr().err
+
+
+def test_boundary_zero_telemetry_store_error_exits_ten_not_traceback(
+    db: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def _locked(*_a, **_k) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(harness, "_post_telemetry", _locked)
+    code = run_harness(
+        _config(db_path=db, reply_channel="run/run1/telemetry", initial_prompt="task"),
+        _never_dies(),
+        client=FakeAcpClient(),
+    )
+    assert code == 10
+    assert "raven-acp: session setup failed: OperationalError: database is locked" in (
+        capsys.readouterr().err
+    )
+
+
+@pytest.mark.parametrize(
+    ("client", "mode"),
+    [
+        (FakeAcpClient(init_error=AcpError("child EOF")), None),
+        (FakeAcpClient(set_mode_error=AcpError("mode refused")), "nope"),
+    ],
+    ids=["handshake", "set_mode"],
+)
+def test_setup_failures_leave_a_breadcrumb(
+    db: Path, capsys: pytest.CaptureFixture[str], client: FakeAcpClient, mode: str | None
+) -> None:
+    assert run_harness(_config(db_path=db, mode=mode), _never_dies(), client=client) == 10
+    assert capsys.readouterr().err.startswith("raven-acp: session setup failed: AcpError: ")
+
+
+@pytest.mark.parametrize(
+    ("flag", "value", "message"),
+    [
+        ("--poll-interval", "0", "--poll-interval must be a positive"),
+        ("--poll-interval", "-1", "--poll-interval must be a positive"),
+        ("--poll-interval", "inf", "--poll-interval must be a positive"),
+        ("--budget", "0", "--budget must be at least 1"),
+        ("--budget", "-3", "--budget must be at least 1"),
+    ],
+)
+def test_cli_nonsense_loop_settings_are_usage_errors(
+    db: Path, flag: str, value: str, message: str, no_launch: None
+) -> None:
+    result = runner.invoke(
+        app,
+        ["acp", "--as", CONSUMER, "--channel", CHANNEL, "--db", str(db),
+         flag, value, "--", "agent"],
+    )
+    assert result.exit_code == 2
+    assert message in result.output
+    assert "Traceback" not in result.output
+
+
+def test_cli_non_utf8_initial_prompt_file_is_one_line_usage_error(
+    db: Path, tmp_path: Path, no_launch: None
+) -> None:
+    packet = tmp_path / "packet.txt"
+    packet.write_bytes("café task\n".encode("cp1252"))
+    result = runner.invoke(
+        app,
+        ["acp", "--as", CONSUMER, "--channel", CHANNEL, "--db", str(db),
+         "--initial-prompt-file", str(packet), "--", "agent"],
+    )
+    assert result.exit_code == 2
+    assert "--initial-prompt-file is not valid UTF-8" in result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit)
