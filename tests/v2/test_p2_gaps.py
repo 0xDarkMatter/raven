@@ -33,11 +33,19 @@ def client(db: Path):
         yield test_client
 
 
-def test_map_exception_reraises_foreign_exceptions() -> None:
-    """Non-raven, non-ValueError exceptions are NOT swallowed into an
-    envelope — they re-raise so genuine bugs surface as 500s."""
-    with pytest.raises(KeyError):
-        http_app.map_exception(KeyError("not ours"))
+def test_map_exception_renders_foreign_exceptions_as_internal_error(caplog) -> None:
+    """QA http H3: a non-raven exception used to be RE-RAISED, which
+    Starlette rendered as a plain-text 500 with no envelope. It is now a
+    500 ``internal_error`` envelope; the traceback goes to the server
+    log and the exception text never reaches ``detail``."""
+    with caplog.at_level("ERROR", logger="raven_bus.http"):
+        response = http_app.map_exception(KeyError("secret-internal-state"))
+    assert response.status_code == 500
+    payload = json.loads(response.body)
+    assert payload["error"] == "internal_error"
+    assert "secret-internal-state" not in payload["detail"]
+    assert caplog.records and caplog.records[-1].exc_info is not None
+    assert "secret-internal-state" in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -67,11 +75,11 @@ def test_health_on_a_foreign_schema_is_503(client: TestClient, db: Path) -> None
     assert response.json()["error"] == "schema_mismatch"
 
 
-def test_health_maps_init_failure(client: TestClient, monkeypatch) -> None:
+def test_health_maps_probe_failure(client: TestClient, monkeypatch) -> None:
     def _boom(_path):
         raise UnknownChannelError("probe failed")
 
-    monkeypatch.setattr(read_mod.db, "init_db", _boom)
+    monkeypatch.setattr(read_mod.db, "probe", _boom)
     response = client.get("/health")
     assert response.status_code == 404
     assert response.json()["error"] == "not_found"

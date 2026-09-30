@@ -28,6 +28,7 @@ from typer.testing import CliRunner
 from raven_bus import db as bus_db
 from raven_bus import log
 from raven_bus.cli import serve as serve_cmd
+from raven_bus.exceptions import UnknownChannelError
 from raven_bus.cli.main import app as cli_app
 from raven_bus.http import app as http_app
 from raven_bus.http import sse
@@ -68,14 +69,16 @@ def sse_server(db: Path, monkeypatch: pytest.MonkeyPatch):
     thread.join(timeout=5.0)
 
 
-def _stream_events(base_url: str, path: str, count: int) -> list[list[str]]:
+def _stream_events(
+    base_url: str, path: str, count: int, headers: dict[str, str] | None = None
+) -> list[list[str]]:
     """Read ``count`` SSE message events, then close the socket (which
     is what actually signals disconnect to the generator)."""
     events: list[list[str]] = []
     current: list[str] = []
     with (
         httpx.Client(timeout=httpx.Timeout(5.0)) as http,
-        http.stream("GET", base_url + path) as response,
+        http.stream("GET", base_url + path, headers=headers) as response,
     ):
         assert response.status_code == 200
         assert response.headers["content-type"].startswith("text/event-stream")
@@ -122,7 +125,7 @@ def test_bad_after_is_400_before_stream(client: TestClient) -> None:
     assert response.status_code == 400
     assert response.json() == {
         "error": "bad_request",
-        "detail": "after must be an integer",
+        "detail": "'after' must be an integer",
     }
 
 
@@ -130,7 +133,7 @@ def test_negative_after_is_400_before_stream(client: TestClient) -> None:
     response = client.get("/tail?after=-1")
 
     assert response.status_code == 400
-    assert response.json()["detail"].startswith("after must be between 0 and")
+    assert response.json()["detail"].startswith("'after' must be between 0 and")
 
 
 def test_oversized_after_is_400_before_stream(client: TestClient) -> None:
@@ -231,6 +234,156 @@ async def test_idle_stream_pings_then_exits_cleanly_on_cancellation(
     assert await anext(events) == ": ping\n\n"
     with pytest.raises(StopAsyncIteration):
         await anext(events)
+
+
+# --------------------------------------------------------------------------- #
+# QA http H5 / H6 — driven in-process: _events is an async generator, and a
+# request stand-in whose is_disconnected() budget bounds every loop.
+# --------------------------------------------------------------------------- #
+class _Polls:
+    """``is_disconnected()`` is False for ``budget`` polls, then True."""
+
+    def __init__(self, budget: int) -> None:
+        self.left = budget
+
+    async def is_disconnected(self) -> bool:
+        self.left -= 1
+        return self.left < 0
+
+
+def _event_ids(chunks: list[str]) -> list[int]:
+    return [
+        int(chunk.split("\n")[1].removeprefix("id: "))
+        for chunk in chunks
+        if chunk.startswith("event: message")
+    ]
+
+
+async def test_all_channel_tail_ids_never_go_backwards_across_capped_polls(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """QA http H5: per-channel windows merged in the handler emitted a
+    later id on channel b BEFORE channel a's capped remainder, so a client
+    resuming from the max id it saw lost a's remainder."""
+    monkeypatch.setattr(sse, "POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(sse, "_READ_BATCH", 2)
+    monkeypatch.setattr(sse, "_MAX_BATCHES_PER_POLL", 2)
+    ids_a = [_append(db, "run/t/a", n).id for n in range(10)]
+    late_b = _append(db, "run/t/b", 99).id
+
+    chunks = [c async for c in sse._events(_Polls(20), db_path=db, channel=None, after=0)]
+
+    assert _event_ids(chunks) == [*ids_a, late_b]
+
+
+async def test_tail_ends_cleanly_when_the_channel_is_torn_down(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """QA http H6: an unhandled UnknownChannelError used to kill the
+    generator mid-stream (truncated chunked body + server traceback)."""
+    monkeypatch.setattr(sse, "POLL_INTERVAL_S", 0.0)
+    first = _append(db, "run/td/c", 1)
+    polls = _Polls(1000)
+    events = sse._events(polls, db_path=db, channel="run/td/c", after=0)
+
+    assert _event_ids([await anext(events)]) == [first.id]
+    with bus_db.connection(db) as conn:
+        bus_db.teardown_run(conn, "td")
+    rest = [c async for c in events]
+
+    assert rest == []
+    assert polls.left > 0  # it ended itself; the disconnect budget didn't
+
+
+async def test_teardown_mid_drain_still_flushes_what_was_read(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sse, "POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(sse, "_READ_BATCH", 1)
+    first = _append(db, "run/td/c", 1)
+    _append(db, "run/td/c", 2)
+    real_read_after = log.read_after
+    calls: list[int] = []
+
+    def read_then_vanish(conn, channel, after_id, **kwargs):
+        calls.append(after_id)
+        if len(calls) > 1:
+            raise UnknownChannelError(f"channel {channel!r} does not exist")
+        return real_read_after(conn, channel, after_id, **kwargs)
+
+    monkeypatch.setattr(sse.log, "read_after", read_then_vanish)
+    chunks = [
+        c async for c in sse._events(_Polls(50), db_path=db, channel="run/td/c", after=0)
+    ]
+
+    assert _event_ids(chunks) == [first.id]
+
+
+# --------------------------------------------------------------------------- #
+# QA http H10 / H11 / H13 — pre-stream validation and resume.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("raw", ["--5", "²", "+1", "1_0"])
+def test_non_integer_after_says_integer_not_range(client: TestClient, raw: str) -> None:
+    """lstrip('-').isdigit() called '--5' and '²' out-of-range integers."""
+    response = client.get("/tail", params={"after": raw})
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "'after' must be an integer"
+
+
+def test_malformed_channel_name_is_400_not_404(client: TestClient) -> None:
+    response = client.get("/tail", params={"channel": "BAD NAME"})
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "bad_request"
+
+
+@pytest.mark.parametrize("value", ["abc", "-1", "1_0", str(2**63)])
+def test_bad_last_event_id_is_400_before_stream(client: TestClient, value: str) -> None:
+    response = client.get("/tail", headers={"Last-Event-ID": value})
+
+    assert response.status_code == 400
+    assert response.json()["detail"].startswith("'Last-Event-ID' must be")
+
+
+@pytest.mark.parametrize("query", ["", "?channel=run/test-run/x"])
+def test_tail_on_a_vanished_db_is_503_and_creates_nothing(
+    client: TestClient, db: Path, query: str
+) -> None:
+    for suffix in ("", "-wal", "-shm"):
+        Path(f"{db}{suffix}").unlink(missing_ok=True)
+
+    response = client.get("/tail" + query)
+
+    assert response.status_code == 503
+    assert response.json()["error"] == "unavailable"
+    assert not db.exists()
+
+
+def test_last_event_id_header_wins_over_after(db: Path, sse_server: str) -> None:
+    """QA http H11: a standard EventSource reconnect sends Last-Event-ID
+    but re-requests the ORIGINAL URL; honouring only ?after= replayed
+    everything from the start."""
+    sent = [_append(db, "run/test-run/resume", n) for n in range(3)]
+
+    events = _stream_events(
+        sse_server,
+        "/tail?channel=run/test-run/resume&after=0",
+        1,
+        headers={"Last-Event-ID": str(sent[1].id)},
+    )
+
+    assert events[0][1] == f"id: {sent[2].id}"
+
+
+def test_empty_after_means_the_default(db: Path, sse_server: str) -> None:
+    """QA http H13: `/tail?after=` was a 400 while `/messages?after=`
+    fell back to the default."""
+    first = _append(db, "run/test-run/empty", 1)
+
+    events = _stream_events(sse_server, "/tail?channel=run/test-run/empty&after=", 1)
+
+    assert events[0][1] == f"id: {first.id}"
 
 
 def test_serve_command_is_registered() -> None:

@@ -10,14 +10,27 @@ GET /tail?channel=&after=0 → text/event-stream. An OBSERVER (like
 
 While idle, emit ``: ping`` comment lines (~15s) so proxies keep the
 stream open. Poll via db.data_version at ~250ms (design §9 Q2): run the
-full read only when the version changed. `channel` given → one
-log.read_after per poll (thin-bridge rule). `channel` absent → tail ALL
-channels by iterating channels.list_channels and read_after per channel
-each changed-poll, merging by message id — O(channels) per changed
-poll; note the cost in a comment, add nothing to the log module.
+full read only when the version changed. One store read per poll batch:
+``channel`` given → ``log.read_after``; absent → ``log.read_all_after``.
 
-Disconnect: starlette raises on write to a gone client — let the
-generator exit cleanly (no error envelope mid-stream).
+WHY one global read for all-channel mode (QA http H5): it used to merge
+per-channel ``read_after`` windows here. When one channel hit its
+per-poll cap, a higher id on another channel was emitted first, so ids
+went BACKWARDS across polls — and a client resuming from the max id it
+had seen skipped the capped channel's remainder forever. Message ids
+are global, so one ``ORDER BY id`` window is gap-free; resume state is a
+single ``last_id`` in both modes.
+
+Resume: ``Last-Event-ID`` (what a standard EventSource sends on
+auto-reconnect) wins over ``?after=`` — otherwise a reconnect replayed
+from the ORIGINAL ``after`` (QA http H11). Both are validated before the
+stream starts (400 envelope).
+
+Stream end: a client disconnect ends the generator quietly. So does the
+tailed channel disappearing mid-stream (``raven teardown``): the events
+already read are flushed, then the body closes cleanly — it used to die
+with an unhandled UnknownChannelError, a truncated chunked body and a
+server traceback (QA http H6). A reconnect then gets 404.
 """
 
 from __future__ import annotations
@@ -30,7 +43,9 @@ import anyio
 from anyio import to_thread
 
 from raven_bus import channels, db, log
-from raven_bus.http.app import Request, Response, map_exception
+from raven_bus.exceptions import UnknownChannelError
+from raven_bus.http.app import Request, Response, map_exception, parse_int, query_int
+from raven_bus.models import validate_channel_name
 
 try:
     from starlette.responses import StreamingResponse
@@ -42,11 +57,9 @@ except ImportError as exc:  # pragma: no cover -- app.py provides the same guard
 POLL_INTERVAL_S = 0.25
 PING_INTERVAL_S = 15.0
 
-# Bounds (opus verify round): an `after` beyond int64 aborted MID-STREAM
-# (headers already sent — no envelope possible), and a burst larger than
-# one read_after batch stranded the remainder because delivery was gated
-# on data_version CHANGING — hence the drain loop in _collect_batch.
-_MAX_SQLITE_INT = 2**63 - 1
+# One read batch. A burst larger than a batch must still drain without
+# waiting for data_version to CHANGE again (verify finding) — hence the
+# drain loop in _collect.
 _READ_BATCH = 100
 
 # Drain bound per poll: without it, a producer keeping >= 1 full batch
@@ -56,40 +69,43 @@ _READ_BATCH = 100
 _MAX_BATCHES_PER_POLL = 10
 
 
+def _resume_after(request: Request) -> int:
+    """Where to start: ``Last-Event-ID`` if the client sent one (an
+    EventSource reconnect), else ``?after=`` (default 0; empty = default,
+    as on /messages). Either must be a strict int in 0..int64 → else
+    ValueError (→ 400 before streaming)."""
+    last_event_id = request.headers.get("last-event-id")
+    if last_event_id:
+        return parse_int(last_event_id, "Last-Event-ID")
+    return query_int(request, "after", 0)
+
+
 async def tail(request: Request) -> Response:
     """GET /tail?channel=&after=0 → StreamingResponse(text/event-stream).
 
-    Bad `after` → 400 envelope (before the stream starts); unknown
-    channel → 404 before streaming."""
-    channel = request.query_params.get("channel") or None
-    raw_after = request.query_params.get("after", "0")
+    Everything that can fail is checked BEFORE the stream starts, where
+    an envelope is still possible: bad ``after``/``Last-Event-ID`` or a
+    malformed channel name → 400; unknown channel → 404; missing store
+    → 503 ``unavailable``; foreign store → 503 ``schema_mismatch``."""
     try:
-        after = int(raw_after)
-        if not 0 <= after <= _MAX_SQLITE_INT:
-            raise ValueError(
-                f"after must be between 0 and {_MAX_SQLITE_INT}"
-            )
-    except ValueError:
-        detail = (
-            f"after must be between 0 and {_MAX_SQLITE_INT}"
-            if raw_after.lstrip("-").isdigit()
-            else "after must be an integer"
-        )
-        return map_exception(ValueError(detail))
+        channel = request.query_params.get("channel") or None
+        if channel is not None:
+            validate_channel_name(channel)
+        after = _resume_after(request)
+        db_path = request.app.state.db_path
 
-    db_path = request.app.state.db_path
-    if channel is not None:
         def _preflight() -> None:
-            with db.connection(db_path) as conn:
+            if channel is None:
+                db.probe(db_path)
+                return
+            with db.connection(db_path, create=False) as conn:
                 channels.get_channel(conn, channel)
 
-        try:
-            # Off-loop like every other store call (re-verify finding:
-            # this preflight could freeze the process behind a busy
-            # timeout).
-            await to_thread.run_sync(_preflight)
-        except Exception as exc:  # noqa: BLE001 -- ADR-005: every failure routes through map_exception
-            return map_exception(exc)
+        # Off-loop like every other store call (re-verify finding: this
+        # preflight could freeze the process behind a busy timeout).
+        await to_thread.run_sync(_preflight)
+    except Exception as exc:  # noqa: BLE001 -- ADR-005: every failure routes through map_exception
+        return map_exception(exc)
 
     return StreamingResponse(
         _events(request, db_path=db_path, channel=channel, after=after),
@@ -98,48 +114,49 @@ async def tail(request: Request) -> Response:
     )
 
 
+def _render(message) -> str:
+    payload = json.dumps(
+        message.model_dump(mode="json"), ensure_ascii=False, separators=(",", ":")
+    )
+    return f"event: message\nid: {message.id}\ndata: {payload}\n\n"
+
+
 async def _events(
     request: Request, *, db_path, channel: str | None, after: int
 ) -> AsyncIterator[str]:
-    last_ids: dict[str, int] = {} if channel is None else {channel: after}
+    last_id = after
     last_version: int | None = None
     idle_s = 0.0
 
-    def _collect_batch(conn) -> tuple[list, bool]:
-        """Blocking read pass (runs in a worker thread): drains each
-        channel up to ``_MAX_BATCHES_PER_POLL`` batches — unbounded
-        draining livelocked against a producer that kept ≥1 full batch
-        unread (re-verify finding), while a single batch stranded
-        single-txn bursts (verify finding). Returns (messages, drained)
-        — ``drained=False`` means more rows are already known to exist,
-        so the caller must re-read WITHOUT waiting for data_version to
-        change again."""
-        if channel is None:
-            # Deliberately O(channels) per changed poll: the HTTP bridge
-            # composes public store contracts instead of adding log APIs.
-            names = [item.name for item in channels.list_channels(conn)]
-        else:
-            names = [channel]
+    def _collect(conn, start: int) -> tuple[list, bool, bool]:
+        """Blocking read pass (runs in a worker thread) from ``start``:
+        up to ``_MAX_BATCHES_PER_POLL`` batches, globally id-ordered.
+        Returns ``(messages, drained, gone)``. ``drained=False`` means
+        more rows are already known to exist, so the caller re-reads
+        WITHOUT waiting for data_version; ``gone=True`` means the tailed
+        channel no longer exists (the messages read before that are
+        still returned, to be flushed)."""
+        collected: list = []
+        cursor = start
+        for _round in range(_MAX_BATCHES_PER_POLL):
+            try:
+                if channel is None:
+                    batch = log.read_all_after(
+                        conn, cursor, limit=_READ_BATCH, include_expired=True
+                    )
+                else:
+                    batch = log.read_after(
+                        conn, channel, cursor, limit=_READ_BATCH, include_expired=True
+                    )
+            except UnknownChannelError:
+                return collected, True, True
+            collected.extend(batch)
+            if len(batch) < _READ_BATCH:
+                return collected, True, False
+            cursor = batch[-1].id
+        return collected, False, False
 
-        collected = []
-        drained = True
-        for name in names:
-            for _round in range(_MAX_BATCHES_PER_POLL):
-                channel_after = last_ids.setdefault(name, after)
-                batch = log.read_after(
-                    conn, name, channel_after,
-                    limit=_READ_BATCH, include_expired=True,
-                )
-                collected.extend(batch)
-                if batch:
-                    last_ids[name] = batch[-1].id
-                if len(batch) < _READ_BATCH:
-                    break
-            else:
-                drained = False
-        return sorted(collected, key=lambda item: item.id), drained
-
-    conn_cm = db.connection(db_path, cross_thread=True)
+    conn_cm = db.connection(db_path, cross_thread=True, create=False)
     try:
         # cross_thread: the connection lives on this task but every
         # blocking call (INCLUDING open/close — re-verify finding) runs
@@ -151,27 +168,20 @@ async def _events(
                 version = await to_thread.run_sync(db.data_version, conn)
                 if last_version is None or version != last_version:
                     last_version = version
-                    messages, drained = await to_thread.run_sync(
-                        _collect_batch, conn
+                    messages, drained, gone = await to_thread.run_sync(
+                        _collect, conn, last_id
                     )
                     if not drained:
                         # Force an immediate re-read next tick — rows we
                         # already know about must not wait for another
                         # commit to move data_version.
                         last_version = None
-
                     for message in messages:
-                        payload = json.dumps(
-                            message.model_dump(mode="json"),
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                        )
-                        yield (
-                            f"event: message\n"
-                            f"id: {message.id}\n"
-                            f"data: {payload}\n\n"
-                        )
+                        yield _render(message)
+                        last_id = message.id
                         idle_s = 0.0
+                    if gone:
+                        return
 
                 await asyncio.sleep(POLL_INTERVAL_S)
                 idle_s += POLL_INTERVAL_S
@@ -182,9 +192,7 @@ async def _events(
             # Close off-loop too; shielded so a disconnect-cancellation
             # arriving mid-close cannot leak the connection.
             with anyio.CancelScope(shield=True):
-                await to_thread.run_sync(
-                    conn_cm.__exit__, None, None, None
-                )
+                await to_thread.run_sync(conn_cm.__exit__, None, None, None)
     except asyncio.CancelledError:
         return
 

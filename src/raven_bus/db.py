@@ -23,7 +23,11 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-from raven_bus.exceptions import SchemaMismatchError, TeardownBlockedError
+from raven_bus.exceptions import (
+    SchemaMismatchError,
+    StoreUnavailableError,
+    TeardownBlockedError,
+)
 from raven_bus.models import SweepResult
 from raven_bus.paths import resolve_db_path
 
@@ -200,14 +204,85 @@ def _is_busy(exc: sqlite3.OperationalError) -> bool:
     return "locked" in message or "busy" in message
 
 
+def is_busy_error(exc: BaseException) -> bool:
+    """True when ``exc`` is sqlite's transient lock contention
+    ('database is locked' / busy — SQLITE_BUSY/SQLITE_LOCKED) that
+    outlasted the busy timeout. Callers that map errors onto a protocol
+    (ravend's 503 ``busy``) use this instead of sniffing messages."""
+    return isinstance(exc, sqlite3.OperationalError) and _is_busy(exc)
+
+
 def _schema_current(resolved: Path) -> bool:
     """True if ``resolved`` already carries the current schema version."""
     return _stored_schema_version(resolved) == SCHEMA_VERSION
 
 
+def _open_existing(resolved: Path, *, cross_thread: bool = False) -> sqlite3.Connection:
+    """Open ``resolved`` WITHOUT creating it: a ``mode=rw`` URI makes
+    sqlite fail with SQLITE_CANTOPEN instead of creating an empty file.
+    A plain path would silently create a schema-less file whenever the
+    store vanished under a long-lived process (QA http H4) — and an
+    exists()-then-connect check would race the same way."""
+    try:
+        return sqlite3.connect(
+            f"{resolved.as_uri()}?mode=rw",
+            uri=True,
+            timeout=DEFAULT_BUSY_TIMEOUT_S,
+            isolation_level="DEFERRED",
+            check_same_thread=not cross_thread,
+        )
+    except sqlite3.OperationalError as exc:
+        raise StoreUnavailableError(
+            f"{resolved} is missing or cannot be opened ({exc}); nothing was "
+            "created — re-initialise it (e.g. restart `raven serve`)"
+        ) from exc
+
+
+def probe(db_path: str | Path | None = None) -> str:
+    """Read-only health check of an EXISTING store: returns its
+    ``schema_version`` stamp (always :data:`SCHEMA_VERSION` on success).
+
+    Unlike :func:`init_db` this never creates, migrates, or writes, and
+    it bypasses the process init cache — so it notices a file deleted or
+    replaced after startup (ravend's GET /health, QA http H4).
+
+    Raises :class:`StoreUnavailableError` when the file is missing or
+    cannot be opened, :class:`SchemaMismatchError` when it opens but is
+    not a current raven v2 store (not a database, no ``bus_meta``, no
+    stamp, or another version). A lock that outlasts the busy timeout
+    re-raises sqlite's OperationalError (see :func:`is_busy_error`)."""
+    resolved = resolve_db_path(db_path)
+    conn = _open_existing(resolved)
+    try:
+        row = conn.execute(
+            "SELECT value FROM bus_meta WHERE key = 'schema_version'"
+        ).fetchone()
+    except sqlite3.DatabaseError as exc:
+        if is_busy_error(exc):
+            raise
+        # 'no such table: bus_meta' / 'file is not a database': the file
+        # opened but is not raven's.
+        raise SchemaMismatchError(
+            f"{resolved} is not a raven store ({exc}) — point RAVEN_DB/db_path "
+            "at a raven v2 store"
+        ) from exc
+    finally:
+        conn.close()
+    stored = None if row is None else str(row[0])
+    if stored != SCHEMA_VERSION:
+        raise SchemaMismatchError(
+            f"{resolved} carries schema version {stored!r}; this raven_bus "
+            f"expects {SCHEMA_VERSION!r}"
+        )
+    return stored
+
+
 @contextmanager
 def connection(
-    db_path: str | Path | None = None, *, cross_thread: bool = False
+    db_path: str | Path | None = None,
+    *,
+    cross_thread: bool = False,
+    create: bool = True,
 ) -> Iterator[sqlite3.Connection]:
     """Short-lived connection: WAL + foreign_keys pragmas, Row factory,
     commit on clean exit, rollback + re-raise on exception, always
@@ -217,14 +292,22 @@ def connection(
     callers that hold the connection on one task but run each blocking
     call in a worker thread (ravend's SSE tail). The CALLER must
     guarantee no two threads use it concurrently — awaiting each call
-    before the next satisfies that."""
+    before the next satisfies that.
+
+    ``create=False`` refuses to create a missing file
+    (:class:`StoreUnavailableError`) — for callers whose store was
+    initialised up front and must never be replaced by an empty file
+    (ravend: every handler, incl. the write-free GETs)."""
     resolved = resolve_db_path(db_path)
-    conn = sqlite3.connect(
-        str(resolved),
-        timeout=DEFAULT_BUSY_TIMEOUT_S,
-        isolation_level="DEFERRED",
-        check_same_thread=not cross_thread,
-    )
+    if create:
+        conn = sqlite3.connect(
+            str(resolved),
+            timeout=DEFAULT_BUSY_TIMEOUT_S,
+            isolation_level="DEFERRED",
+            check_same_thread=not cross_thread,
+        )
+    else:
+        conn = _open_existing(resolved, cross_thread=cross_thread)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA foreign_keys = ON")
@@ -476,6 +559,8 @@ __all__ = [
     "data_version",
     "init_db",
     "instance_id",
+    "is_busy_error",
+    "probe",
     "sweep",
     "teardown_run",
 ]
