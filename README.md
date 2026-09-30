@@ -27,6 +27,10 @@ lanes (fleetflow ADR-022/ADR-023 record that integration's contract).
 
 ## Recent Updates
 
+**v0.2.1** (October 2026)
+
+*   🐛 **Clean output through Windows pipes** - raven's own text (errors, `--help`, the `raven read --framed` header, truncation markers) is now pure ASCII. Piped output on Windows is cp1252, so fleetflow was relaying raven's em dashes as `U+FFFD`; a test gate now keeps every string raven emits ASCII.
+
 **v0.2.0** (October 2026) — a breaking rewrite; see [v1→v2 migration](#v1v2-migration)
 
 *   🪵 **Append-only channel log** - v1's per-message status column is gone: one SQLite log split into broadcast, queue and stream channels, with cursor-jump acks and leased claims that auto-requeue after a crash and dead-letter after N attempts. The import root is now `raven_bus`; v1 code runs on the deprecated `raven_bus.compat` shim.

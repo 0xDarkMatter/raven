@@ -14,7 +14,7 @@ editing another lane's file.
 
 from __future__ import annotations
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 from raven_bus.exceptions import (
     ClaimDeniedError,
