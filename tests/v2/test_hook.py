@@ -611,6 +611,35 @@ def test_wrapper_missing_interpreter_still_exits_zero(tmp_path):
     assert result.stdout == ""
 
 
+def test_wrapper_honours_raven_python(tmp_path):
+    """RAVEN_PYTHON selects the interpreter: with NO python on PATH (the
+    uv-tool case, where PATH's python can't import raven_bus) the hook
+    still delivers when RAVEN_PYTHON points at the right one."""
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash not available — wrapper smoke is Git Bash/POSIX only")
+
+    db_path = tmp_path / "bus.db"
+    seed_channel(db_path, CHANNEL, [("steer", "prompt", {})])
+    empty_bin = tmp_path / "empty-bin"
+    empty_bin.mkdir()
+    env = _env(RAVEN_CONSUMER=CONSUMER, RAVEN_CHANNELS=CHANNEL, RAVEN_DB=str(db_path))
+    env["PATH"] = str(empty_bin)
+    env["RAVEN_PYTHON"] = Path(sys.executable).as_posix()
+
+    result = subprocess.run(
+        [bash, str(WRAPPER)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30.0,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert f"raven read --channel {CHANNEL} --as {CONSUMER}" in additional_context(result.stdout)
+
+
 # --------------------------------------------------------------------------- #
 # In-process coverage of peek's guard paths (the subprocess drivers above
 # exercise them for real, but a child process is invisible to coverage).
