@@ -19,7 +19,9 @@ import pytest
 from raven_bus import claims
 from raven_bus.claims import claim_next, complete, get_claim
 
-MIGRATION = Path("src/raven_bus/migrations/0002_v2_schema.sql")
+MIGRATION = (
+    Path(__file__).resolve().parents[2] / "src" / "raven_bus" / "migrations" / "0002_v2_schema.sql"
+)
 QUEUE = "run/test/queue"
 CONSUMER = "worker@test"
 OTHER_CONSUMER = "other@test"

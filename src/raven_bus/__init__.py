@@ -19,9 +19,13 @@ __version__ = "0.2.0.dev0"
 from raven_bus.exceptions import (
     ClaimDeniedError,
     InvalidAddressError,
+    InvalidBodyError,
     RavenBusError,
+    SchemaMismatchError,
+    TeardownBlockedError,
     UnknownChannelError,
     UnknownMessageError,
+    WrongChannelKindError,
 )
 from raven_bus.models import (
     Channel,
@@ -41,10 +45,14 @@ __all__ = [
     "Consumer",
     "Cursor",
     "InvalidAddressError",
+    "InvalidBodyError",
     "Message",
     "RavenBusError",
+    "SchemaMismatchError",
+    "TeardownBlockedError",
     "UnknownChannelError",
     "UnknownMessageError",
     "Urgency",
+    "WrongChannelKindError",
     "__version__",
 ]

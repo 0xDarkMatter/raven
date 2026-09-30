@@ -357,8 +357,10 @@ def renew(
 ) -> Claim:
     """Extend a lease this consumer holds. Raises
     :class:`ClaimDeniedError` if the claim is absent, held by another
-    consumer, or not in state 'leased' (a lapsed-and-reaped lease is
-    indistinguishable from never-claimed — by design)."""
+    consumer, or not in state 'leased'. A lease that already lapsed
+    cannot be revived — its row persists as 'lapsed' (open to any
+    claimant, deliveries kept) and renew is denied, the same as for a
+    claim this consumer never held."""
     db.sweep(conn)
     consumers.touch(conn, consumer)
     cursor = conn.execute(
