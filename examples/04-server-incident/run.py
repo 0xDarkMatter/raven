@@ -87,11 +87,11 @@ def main() -> None:
         "--db",
         type=Path,
         default=Path(__file__).with_name("incident.db"),
-        help="SQLite path (default ./incident.db, deleted before run)",
+        help="SQLite path (default: incident.db next to this script, deleted before run)",
     )
     parser.add_argument(
         "--keep-db", action="store_true",
-        help="Keep the DB after the run (default deletes it)",
+        help="Reuse an existing DB instead of deleting it before the run",
     )
     args = parser.parse_args()
 

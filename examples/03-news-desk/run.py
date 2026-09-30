@@ -65,20 +65,21 @@ def main() -> None:
         "--db",
         type=Path,
         default=Path(__file__).with_name("newsdesk.db"),
-        help="SQLite path (default ./newsdesk.db, deleted before run)",
+        help="SQLite path (default: newsdesk.db next to this script, deleted before run)",
     )
     parser.add_argument(
         "--keep-db", action="store_true",
-        help="Keep the DB after the run (default deletes for a clean slate)",
+        help="Reuse an existing DB instead of deleting it before the run",
     )
     args = parser.parse_args()
 
     db = args.db
-    if not args.keep_db and db.exists():
-        db.unlink()
-    for sib in (db.with_suffix(".db-wal"), db.with_suffix(".db-shm")):
-        if sib.exists():
-            sib.unlink()
+    # Delete the DB AND its WAL/SHM siblings together, or not at all: a
+    # kept DB with its -wal removed loses any un-checkpointed writes.
+    if not args.keep_db:
+        for sib in (db, db.with_suffix(".db-wal"), db.with_suffix(".db-shm")):
+            if sib.exists():
+                sib.unlink()
 
     asyncio.run(amain(db, args.articles))
 

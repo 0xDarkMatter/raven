@@ -50,7 +50,7 @@ def _parse_args() -> argparse.Namespace:
         "--db",
         type=Path,
         default=Path(__file__).with_name("hello.db"),
-        help="SQLite path (default ./hello.db, deleted before run)",
+        help="SQLite path (default: hello.db next to this script, deleted before run)",
     )
     return parser.parse_args()
 

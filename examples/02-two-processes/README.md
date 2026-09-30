@@ -32,7 +32,7 @@ finished with `claims.complete`.
   never completed is reaped by the opportunistic sweep once its lease
   lapses, and becomes claimable again.
 - Pass `--db PATH` to either script (or set `RAVEN_DB`) to point them
-  at a non-default location.
+  at a non-default location. All processes must use the same file.
 
 ## Files
 
@@ -40,4 +40,7 @@ finished with `claims.complete`.
   5 typed tasks 200ms apart
 - `consumer.py` — loops `claims.claim_next` / `claims.complete`; each
   instance needs a distinct `--id`
-- the SQLite file is created on first run as `./bus.db`
+- the SQLite file is created on first run as `bus.db` next to the
+  scripts (not in your current directory), unless `--db` or `RAVEN_DB`
+  says otherwise; it is never deleted, so a second run appends to the
+  same queue

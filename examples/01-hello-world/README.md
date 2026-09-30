@@ -17,5 +17,7 @@ bob inbox: 1 message
 acked. inbox now empty: True
 ```
 
-Pass `--db PATH` to point at a specific SQLite file (default
-`./hello.db`, deleted before each run).
+Pass `--db PATH` to point at a specific SQLite file (default:
+`hello.db` next to `hello.py`, wherever you run it from; deleted before
+each run). `RAVEN_DB` is not consulted — this example always uses its
+own file.

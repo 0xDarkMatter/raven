@@ -19,8 +19,8 @@ Pipeline::
                                                    incident)
 
 Every message carries a `correlation_id` equal to the original
-incident's id, so the audit trail of any single fault is one
-``read --json`` away.
+incident's id (the v2 ``thread_id``), so the audit trail of any single
+fault is one ``raven tail --db incident.db --no-follow --json`` away.
 """
 
 from __future__ import annotations
