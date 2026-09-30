@@ -54,6 +54,8 @@ DEFAULT_DIGEST_MAX_AGE_S = 300.0
 _DIGEST_PREVIEW_MAX_CHARS = 80
 
 _TYPE_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]")
+_IDENT_SAFE_RE = re.compile(r"[^a-z0-9@._-]")
+"""The ADR-002 consumer-id alphabet (atoms + the one ``@``)."""
 
 
 def estimate_tokens(text: str) -> int:
@@ -206,24 +208,67 @@ _DIGEST_HEADER = "----- digest (fyi, summarized) -----"
 
 _DELIMS = (_HEADER, _MSG_OPEN, _MSG_CLOSE, _BODY_OPEN, _BODY_CLOSE, _DIGEST_HEADER)
 
+# EVERY code point ``str.splitlines()`` treats as a line boundary. A model
+# (and any consumer that splits on Unicode line semantics) sees a new line
+# at each one, so collapsing only \r/\n let U+2028, NEL, VT, FF and the
+# FS/GS/RS separators forge header lines and digest entries (QA finding
+# A4). tests/v2/test_policy.py enumerates all of Unicode to prove this set
+# equals splitlines' — if Python ever adds a boundary, that test fails.
+_LINE_BREAK_CHARS = "\n\r\x0b\x0c\x1c\x1d\x1e\x85  "
+_LINE_BREAK_RE = re.compile(f"[{re.escape(_LINE_BREAK_CHARS)}]+")
+# json.dumps always escapes the ASCII controls above; with ensure_ascii=False
+# it leaves U+0085/U+2028/U+2029 raw. \uXXXX is the JSON-equivalent spelling,
+# so escaping them changes no decoded value.
+_JSON_LINE_BREAK_ESCAPES = str.maketrans(
+    {ch: f"\\u{ord(ch):04x}" for ch in _LINE_BREAK_CHARS}
+)
+
+
+def single_line(text: str) -> str:
+    """Collapse every ``str.splitlines()`` boundary run in ``text`` to one
+    space, so sender-controlled text can never start a new line.
+
+    Public because every surface that prints a free-text message field
+    for an agent to read (``raven read``'s human form too) must use THIS
+    definition — a second, narrower copy is how U+2028 slipped through
+    (QA finding A3/A4)."""
+    return _LINE_BREAK_RE.sub(" ", text)
+
+
+def _json_one_line(value: object) -> str:
+    """``json.dumps`` (sorted keys, non-ASCII kept readable) that is also
+    guaranteed single-line under ``str.splitlines`` semantics."""
+    dumped = json.dumps(value, sort_keys=True, ensure_ascii=False)
+    return dumped.translate(_JSON_LINE_BREAK_ESCAPES)
+
 
 def _neutralize(text: str) -> str:
     """Break any exact occurrence of a structural marker inside ``text``
     by splicing a visible ``[esc]`` into its middle, so the marker can no
     longer appear byte-for-byte in the rendered output except where we
-    emit it ourselves."""
-    for marker in _DELIMS:
-        if marker in text:
-            mid = len(marker) // 2
-            text = text.replace(marker, marker[:mid] + "[esc]" + marker[mid:])
-    return text
+    emit it ourselves.
+
+    Loops to a fixpoint: ``str.replace`` is one non-overlapping pass, so a
+    self-overlapping payload (``'----- message end ----- message end
+    -----'``) kept its second, overlapping marker intact (QA finding A4).
+    Terminates because no marker contains ``[`` or ``]`` — an inserted
+    ``[esc]`` can never be part of a new occurrence, so every pass
+    strictly reduces the number of raw markers."""
+    while True:
+        found = False
+        for marker in _DELIMS:
+            if marker in text:
+                found = True
+                mid = len(marker) // 2
+                text = text.replace(marker, marker[:mid] + "[esc]" + marker[mid:])
+        if not found:
+            return text
 
 
 def _sanitize_line(text: str) -> str:
-    """Collapse newlines (so content can't inject fake lines) then
-    neutralize structural markers."""
-    text = text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
-    return _neutralize(text)
+    """Collapse every line boundary (so content can't inject fake lines)
+    then neutralize structural markers."""
+    return _neutralize(single_line(text))
 
 
 MAX_BODY_RENDER_CHARS = 8000
@@ -233,9 +278,25 @@ able to dump ~20K tokens into a session; verify finding). Truncation
 happens BEFORE neutralization so a cut can never expose a
 reconstructable marker fragment."""
 
+MAX_IDENT_RENDER_CHARS = 200
+"""Per-field cap for ``sender`` and ``type`` in rendered frames. Neither is
+covered by MAX_BODY_RENDER_CHARS, and neither is length-bounded by the
+store (type is free text; an ADR-002 atom has no maximum), so a blocking
+message with a 200k-char type rendered 200k chars and a 9,000-char
+sender's digest line alone blew any budget (QA findings A9/A2). Clipped
+BEFORE neutralization, like the body."""
+
+
+def _clip(text: str, limit: int, what: str) -> str:
+    """Truncate ``text`` to ``limit`` chars with an explicit, single-line
+    marker naming the field (never a silent cut)."""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"…[{what} truncated: {len(text) - limit} chars omitted]"
+
 
 def _truncated_body_json(message: Message) -> str:
-    body_json = json.dumps(message.body, sort_keys=True, ensure_ascii=False)
+    body_json = _json_one_line(message.body)
     if len(body_json) > MAX_BODY_RENDER_CHARS:
         omitted = len(body_json) - MAX_BODY_RENDER_CHARS
         body_json = (
@@ -246,11 +307,13 @@ def _truncated_body_json(message: Message) -> str:
 
 
 def _render_message(message: Message) -> str:
+    sender = _clip(message.sender, MAX_IDENT_RENDER_CHARS, "sender")
+    msg_type = _clip(message.type, MAX_IDENT_RENDER_CHARS, "type")
     lines = [
         _MSG_OPEN,
         f"id: {message.id}",
-        f"sender: {_sanitize_line(message.sender)}",
-        f"type: {_sanitize_line(message.type)}",
+        f"sender: {_sanitize_line(sender)}",
+        f"type: {_sanitize_line(msg_type)}",
         f"urgency: {message.urgency}",
         _BODY_OPEN,
         _truncated_body_json(message),
@@ -298,18 +361,22 @@ def render(plan_: InjectionPlan, *, source: str = "raven bus") -> str:
 
 def render_digest_line(message: Message) -> str:
     """One compact line for a digested fyi: id, sender, type, and a
-    truncated body preview (no raw newlines)."""
-    preview = json.dumps(message.body, sort_keys=True, ensure_ascii=False)
-    preview = preview.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    truncated body preview (no line boundary of any kind — see
+    ``_LINE_BREAK_CHARS``)."""
+    preview = _json_one_line(message.body)
     if len(preview) > _DIGEST_PREVIEW_MAX_CHARS:
         preview = preview[: _DIGEST_PREVIEW_MAX_CHARS - 1] + "…"
     preview = _neutralize(preview)
-    sender = _sanitize_line(message.sender)
-    # type is FREE TEXT (the store does not grammar-validate it), and the
-    # digest line's structure is positional — a crafted type could forge
-    # a second, fully attributed entry on the same line (verify finding).
-    # Allowlist it down to identifier characters; sender needs no such
-    # filter (ADR-002 grammar already excludes brackets/parens/spaces).
+    # The line's structure is positional ("[id] sender (type): preview"),
+    # so both identifiers are allowlisted, not just escaped. type is FREE
+    # TEXT — a crafted type could forge a second, fully attributed entry
+    # on the same line (verify finding). sender is ADR-002 grammar when it
+    # came through log.append; the clamp is a no-op then, and stops a
+    # raw-SQL row doing the same. Both are length-bounded (QA finding A2:
+    # a 9,000-char sender's line alone exceeded every budget).
+    sender = _clip(
+        _IDENT_SAFE_RE.sub("_", message.sender), MAX_IDENT_RENDER_CHARS, "sender"
+    )
     msg_type = _TYPE_SAFE_RE.sub("_", message.type)[:32]
     return f"[{message.id}] {sender} ({msg_type}): {preview}"
 
@@ -426,10 +493,13 @@ __all__ = [
     "DEFAULT_DIGEST_MIN_COUNT",
     "DEFAULT_TOKEN_BUDGET",
     "HINT_MAX_CHARS",
+    "MAX_BODY_RENDER_CHARS",
+    "MAX_IDENT_RENDER_CHARS",
     "InjectionPlan",
     "estimate_tokens",
     "plan",
     "render",
     "render_digest_line",
     "render_hint",
+    "single_line",
 ]
