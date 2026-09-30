@@ -26,7 +26,10 @@ except ImportError as exc:  # pragma: no cover -- exercised only without the ext
 from raven_bus.exceptions import (
     ClaimDeniedError,
     InvalidAddressError,
+    InvalidBodyError,
     RavenBusError,
+    SchemaMismatchError,
+    TeardownBlockedError,
     UnknownChannelError,
     UnknownMessageError,
     WrongChannelKindError,
@@ -46,14 +49,19 @@ def error_response(code: str, detail: str, status: int) -> JSONResponse:
 
 
 def map_exception(exc: Exception) -> JSONResponse:
-    """Exception → envelope. 400 invalid input, 404 unknown, 409 denied/
-    wrong-kind, 500 anything else raven-shaped."""
-    if isinstance(exc, InvalidAddressError | ValueError):
+    """Exception → envelope. 400 invalid input (incl. a body nested too
+    deep), 404 unknown, 409 denied/wrong-kind/teardown-blocked, 503
+    ``schema_mismatch`` (the DB file is foreign — this ravend can't serve
+    it until pointed elsewhere; not a transient 500), 500 anything else
+    raven-shaped."""
+    if isinstance(exc, InvalidAddressError | InvalidBodyError | ValueError):
         return error_response("bad_request", str(exc), 400)
     if isinstance(exc, UnknownChannelError | UnknownMessageError):
         return error_response("not_found", str(exc), 404)
-    if isinstance(exc, ClaimDeniedError | WrongChannelKindError):
+    if isinstance(exc, ClaimDeniedError | WrongChannelKindError | TeardownBlockedError):
         return error_response("conflict", str(exc), 409)
+    if isinstance(exc, SchemaMismatchError):
+        return error_response("schema_mismatch", str(exc), 503)
     if isinstance(exc, RavenBusError):  # pragma: no cover -- future subclasses
         return error_response("error", str(exc), 500)
     raise exc

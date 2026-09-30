@@ -23,6 +23,7 @@ from raven_bus.cli.main import app, cli_main
 from raven_bus.exceptions import (
     ClaimDeniedError,
     RavenBusError,
+    SchemaMismatchError,
     UnknownChannelError,
     WrongChannelKindError,
 )
@@ -651,6 +652,37 @@ def test_doctor_all_ok() -> None:
     assert "all checks passed" in result.stdout
 
 
+def test_doctor_requests_the_expired_count() -> None:
+    """sweep's expired COUNT is opt-in (QA store #9); doctor is the one
+    caller that reports it, so it must ask."""
+    conn = MagicMock()
+    conn.execute.side_effect = [
+        MagicMock(fetchone=MagicMock(return_value=("2",))),
+        MagicMock(fetchone=MagicMock(return_value=("wal",))),
+    ]
+    with (
+        patch("raven_bus.db.init_db"),
+        patch("raven_bus.db.connection", return_value=_mock_connection(conn)),
+        patch("raven_bus.db.sweep", return_value=SweepResult(expired=4)) as sweep,
+    ):
+        result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 0
+    sweep.assert_called_once_with(conn, count_expired=True)
+    assert "expired=4" in result.stdout
+
+
+def test_doctor_reports_schema_mismatch_as_a_failed_check() -> None:
+    """init_db now REFUSES foreign/unstamped files (QA store #8); doctor
+    must report that as a failed check, not crash with a traceback."""
+    with patch(
+        "raven_bus.db.init_db", side_effect=SchemaMismatchError("foreign file here")
+    ):
+        result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 10
+    assert "foreign file here" in result.stdout
+    assert "one or more checks failed" in result.stdout
+
+
 def test_doctor_db_unreachable_exits_generic_error() -> None:
     with patch("raven_bus.db.init_db", side_effect=OSError("disk full")):
         result = runner.invoke(app, ["doctor"])
@@ -746,3 +778,31 @@ def test_cli_main_ravenbuserror_exits_error(capsys) -> None:
         cli_main()
     assert excinfo.value.code == EXIT_ERROR
     assert "error: boom" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------
+# QA store lane: typed store refusals reach the CLI as one-line errors
+# --------------------------------------------------------------------
+
+
+def test_teardown_blocked_by_outside_reply_is_a_one_line_error(tmp_path) -> None:
+    """QA store #6/#14 end to end: an outside reply used to crash
+    `raven teardown` with a FOREIGN KEY traceback."""
+    from raven_bus import db as bus_db
+    from raven_bus import log
+
+    target = tmp_path / "bus.db"
+    bus_db._reset_init_cache()
+    bus_db.init_db(target)
+    with bus_db.connection(target) as conn:
+        inside = log.append(conn, channel="run/gone/c", sender="a@gone", type="t", body={})
+        log.append(
+            conn, channel="run/kept/c", sender="b@kept", type="t", body={}, reply_to=inside.id
+        )
+
+    result = runner.invoke(app, ["teardown", "--run", "gone", "--yes", "--db", str(target)])
+
+    assert result.exit_code == 10
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "error: cannot tear down run 'gone'" in result.output
+    assert "Traceback" not in result.output

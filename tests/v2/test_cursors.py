@@ -286,6 +286,8 @@ def test_pending_fanout_two_consumers_independent(conn):
 # --------------------------------------------------------------------------- #
 def test_ack_creates_row_when_absent(conn):
     cid = _ensure_channel_row(conn, "run/v0-2/broadcast")
+    for _ in range(5):
+        _insert_message(conn, cid)
     _commit(conn)
 
     cur = cursors.ack(conn, "worker@run-a", "run/v0-2/broadcast", 5)
@@ -301,7 +303,9 @@ def test_ack_creates_row_when_absent(conn):
 
 
 def test_ack_is_monotonic_forwards(conn):
-    _ensure_channel_row(conn, "run/v0-2/broadcast")
+    cid = _ensure_channel_row(conn, "run/v0-2/broadcast")
+    for _ in range(8):
+        _insert_message(conn, cid)
     _commit(conn)
 
     cursors.ack(conn, "worker@run-a", "run/v0-2/broadcast", 5)
@@ -354,6 +358,64 @@ def test_ack_then_pending_only_returns_new_messages(conn):
     got = cursors.pending(conn, "worker@run-a", "run/v0-2/broadcast")
 
     assert [m.id for m in got] == [3, 4]
+
+
+def test_ack_clamps_to_channel_head(conn):
+    """QA store #3: message ids are global, so an ack past THIS channel's
+    head (a typo, or an id from another channel) parked the monotonic
+    cursor beyond every future message here — hidden forever, with no
+    rewind. The cursor now stops at the channel's newest message."""
+    cid = _ensure_channel_row(conn, "run/v0-2/broadcast")
+    other = _ensure_channel_row(conn, "run/v0-2/other")
+    head = _insert_message(conn, cid)
+    foreign = [_insert_message(conn, other) for _ in range(3)][-1]
+    _commit(conn)
+
+    cur = cursors.ack(conn, "worker@run-a", "run/v0-2/broadcast", foreign)
+    assert cur.last_ack_id == head
+
+    fresh = _insert_message(conn, cid)
+    _commit(conn)
+    got = cursors.pending(conn, "worker@run-a", "run/v0-2/broadcast")
+    assert [m.id for m in got] == [fresh]
+
+
+def test_ack_on_empty_channel_stays_at_zero(conn):
+    _ensure_channel_row(conn, "run/v0-2/broadcast")
+    _commit(conn)
+
+    cur = cursors.ack(conn, "worker@run-a", "run/v0-2/broadcast", 5)
+
+    assert cur.last_ack_id == 0
+
+
+@pytest.mark.parametrize("huge", [2**63, 10**30])
+def test_ack_beyond_sqlite_integer_range_clamps_not_overflows(conn, huge):
+    """The clamp happens in Python BEFORE binding, so an id past SQLite's
+    INTEGER range can't raise OverflowError on the way in."""
+    cid = _ensure_channel_row(conn, "run/v0-2/broadcast")
+    head = _insert_message(conn, cid)
+    _commit(conn)
+
+    cur = cursors.ack(conn, "worker@run-a", "run/v0-2/broadcast", huge)
+
+    assert cur.last_ack_id == head
+
+
+@pytest.mark.parametrize("low", [0, -5, -(2**70)])
+def test_ack_zero_or_negative_is_a_noop(conn, low):
+    """Zero/negative acks are backwards acks: no-op on an existing cursor,
+    and a fresh cursor row starts at 0 (never a negative position)."""
+    cid = _ensure_channel_row(conn, "run/v0-2/broadcast")
+    first = _insert_message(conn, cid)
+    _commit(conn)
+
+    fresh = cursors.ack(conn, "worker@run-a", "run/v0-2/broadcast", low)
+    assert fresh.last_ack_id == 0
+
+    cursors.ack(conn, "worker@run-a", "run/v0-2/broadcast", first)
+    again = cursors.ack(conn, "worker@run-a", "run/v0-2/broadcast", low)
+    assert again.last_ack_id == first
 
 
 def test_ack_registers_consumer(conn):

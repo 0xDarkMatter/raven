@@ -32,3 +32,34 @@ class ClaimDeniedError(RavenBusError):
 class WrongChannelKindError(RavenBusError):
     """Operation not valid for this channel kind (e.g. claim on a
     broadcast channel, cursor-ack on a queue)."""
+
+
+class SchemaMismatchError(RavenBusError, RuntimeError):
+    """The file at the DB path is not a raven v2 store this code can use:
+    stamped with another ``schema_version``, or a SQLite file holding
+    tables raven did not create and no stamp. raven never migrates or
+    adopts such files. Also a ``RuntimeError`` because ``init_db`` raised
+    bare RuntimeError for the foreign-version case before this class
+    existed — callers catching that keep working."""
+
+
+class TeardownBlockedError(RavenBusError):
+    """``db.teardown_run`` refused: messages OUTSIDE the run reference
+    (reply_to/thread_id) messages inside it, and the schema's foreign
+    keys forbid orphaning them. Nothing was deleted.
+
+    ``blockers`` holds the first few ``(message_id, channel_name)``
+    referencing messages (id order); ``total`` is the full count."""
+
+    def __init__(
+        self, message: str, *, blockers: list[tuple[int, str]], total: int
+    ) -> None:
+        super().__init__(message)
+        self.blockers = blockers
+        self.total = total
+
+
+class InvalidBodyError(RavenBusError, ValueError):
+    """A message body the store refuses to write — today, one nested
+    deeper than ``log.MAX_BODY_DEPTH`` (readers could not re-serialise
+    it). A ``ValueError`` like :class:`InvalidAddressError`: bad input."""

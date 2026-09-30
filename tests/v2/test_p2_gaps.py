@@ -7,6 +7,7 @@ the 100% gate stays honest rather than pragma'd away.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -16,7 +17,12 @@ from starlette.testclient import TestClient
 from raven_bus import claims as claims_mod
 from raven_bus import db as bus_db
 from raven_bus import log
-from raven_bus.exceptions import UnknownChannelError
+from raven_bus.exceptions import (
+    InvalidBodyError,
+    SchemaMismatchError,
+    TeardownBlockedError,
+    UnknownChannelError,
+)
 from raven_bus.http import app as http_app
 from raven_bus.http import read as read_mod
 
@@ -32,6 +38,33 @@ def test_map_exception_reraises_foreign_exceptions() -> None:
     envelope — they re-raise so genuine bugs surface as 500s."""
     with pytest.raises(KeyError):
         http_app.map_exception(KeyError("not ours"))
+
+
+@pytest.mark.parametrize(
+    ("exc", "status", "code"),
+    [
+        (InvalidBodyError("nested too deep"), 400, "bad_request"),
+        (TeardownBlockedError("blocked", blockers=[], total=1), 409, "conflict"),
+        (SchemaMismatchError("foreign schema"), 503, "schema_mismatch"),
+    ],
+    ids=["invalid-body", "teardown-blocked", "schema-mismatch"],
+)
+def test_map_exception_covers_the_store_lane_exceptions(exc, status, code) -> None:
+    """QA store #14: the store's new typed errors wear the envelope — a
+    foreign DB file is a 503 (the service can't serve this file), not a
+    bare 500."""
+    response = http_app.map_exception(exc)
+    assert response.status_code == status
+    assert json.loads(response.body) == {"error": code, "detail": str(exc)}
+
+
+def test_health_on_a_foreign_schema_is_503(client: TestClient, db: Path) -> None:
+    with bus_db.connection(db) as conn:
+        conn.execute("UPDATE bus_meta SET value = '1' WHERE key = 'schema_version'")
+    bus_db._reset_init_cache()
+    response = client.get("/health")
+    assert response.status_code == 503
+    assert response.json()["error"] == "schema_mismatch"
 
 
 def test_health_maps_init_failure(client: TestClient, monkeypatch) -> None:
@@ -71,14 +104,16 @@ def test_messages_accepts_explicit_false_bool(client: TestClient, db: Path) -> N
     assert len(response.json()["messages"]) == 1
 
 
-def test_frontier_not_advanced_on_full_batch(db: Path) -> None:
+def test_frontier_not_advanced_on_full_batch(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A full candidate batch proves nothing about the ids beyond it —
-    _maybe_advance_frontier must early-return without touching SQL."""
+    _maybe_advance_frontier must leave the watermark alone, however high
+    the (pre-scan) ceiling."""
+    monkeypatch.setattr(claims_mod, "_FRONTIER", {})
     fake_rows = [object()] * claims_mod._CANDIDATE_BATCH
-    poisoned = object()  # would explode if any SQL were attempted
-    claims_mod._maybe_advance_frontier(
-        poisoned, 1, ("k", 1), 0, fake_rows  # type: ignore[arg-type]
-    )
+    claims_mod._maybe_advance_frontier(("k", 1), 0, 99, fake_rows)  # type: ignore[arg-type]
+    assert claims_mod._FRONTIER == {}
 
 
 def test_all_lost_round_advances_frontier_then_returns_none(db: Path) -> None:

@@ -9,6 +9,7 @@ import typer
 
 from raven_bus import db
 from raven_bus.cli._common import EXIT_ERROR, EXIT_OK
+from raven_bus.exceptions import SchemaMismatchError
 from raven_bus.paths import resolve_db_path
 
 
@@ -31,7 +32,7 @@ def cmd_doctor(
             mode_row = conn.execute("PRAGMA journal_mode").fetchone()
             mode = mode_row[0] if mode_row is not None else "unknown"
             checks.append(("wal", str(mode).lower() == "wal", f"journal_mode={mode}"))
-            result = db.sweep(conn)
+            result = db.sweep(conn, count_expired=True)
             sweep_detail = (
                 f"expired={result.expired} requeued={result.requeued} "
                 f"dead_lettered={result.dead_lettered}"
@@ -39,6 +40,9 @@ def cmd_doctor(
             checks.append(("sweep", True, sweep_detail))
     except (OSError, sqlite3.DatabaseError) as exc:
         checks.append(("db", False, f"unreachable: {exc}"))
+    except SchemaMismatchError as exc:
+        # init_db refuses foreign/unstamped files; a check failure, not a crash.
+        checks.append(("db", False, f"schema mismatch: {exc}"))
 
     all_ok = True
     for name, ok, detail in checks:

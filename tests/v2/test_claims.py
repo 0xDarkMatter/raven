@@ -15,7 +15,9 @@ from raven_bus.exceptions import (
     WrongChannelKindError,
 )
 
-MIGRATION = Path("src/raven_bus/migrations/0002_v2_schema.sql")
+MIGRATION = (
+    Path(__file__).resolve().parents[2] / "src" / "raven_bus" / "migrations" / "0002_v2_schema.sql"
+)
 QUEUE = "run/test/queue"
 CONSUMER = "worker@test"
 OTHER_CONSUMER = "other@test"
@@ -318,6 +320,38 @@ def test_release_makes_message_claimable_without_counting_delivery(
     assert claim is not None
     assert claim.consumer == OTHER_CONSUMER
     assert claim.deliveries == 1
+    conn.close()
+
+
+def test_release_keeps_earlier_lapses_so_a_poison_message_dead_letters(
+    raw_db: Path,
+) -> None:
+    """QA store #7: release reset deliveries to 0, erasing every earlier
+    INVOLUNTARY lapse — so a poison message never dead-lettered as long
+    as someone released it in between. A release now undoes only the
+    one delivery its own claim added."""
+    conn = _connect(raw_db)
+    channel_id = _insert_channel(conn, max_deliveries=3)
+    message_id = _insert_message(conn, channel_id)
+    conn.commit()
+
+    for _ in range(2):  # two claims that crash (lease lapses)
+        assert claim_next(conn, CONSUMER, QUEUE).id == message_id
+        _expire_claim(conn, message_id)
+    assert claim_next(conn, CONSUMER, QUEUE).id == message_id  # deliveries=3
+    release(conn, message_id, CONSUMER)
+    row = conn.execute(
+        "SELECT state, deliveries FROM claims WHERE message_id = ?", (message_id,)
+    ).fetchone()
+    assert (row["state"], row["deliveries"]) == ("lapsed", 2)
+
+    assert claim_next(conn, OTHER_CONSUMER, QUEUE).id == message_id  # deliveries=3
+    _expire_claim(conn, message_id)
+    assert claim_next(conn, CONSUMER, QUEUE) is None  # the sweep dead-letters it
+    row = conn.execute(
+        "SELECT state, deliveries FROM claims WHERE message_id = ?", (message_id,)
+    ).fetchone()
+    assert (row["state"], row["deliveries"]) == ("dead", 3)
     conn.close()
 
 

@@ -100,12 +100,29 @@ def ack(
     channel: str,
     up_to_id: int,
 ) -> Cursor:
-    """Advance the cursor to ``max(current, up_to_id)`` (monotonic —
-    acking backwards is a no-op, never an error). Returns the resulting
-    cursor. Creates the cursor row if absent."""
+    """Advance the cursor to ``max(current, clamped)`` where ``clamped``
+    is ``up_to_id`` limited to ``[0, channel head]`` (the channel's
+    newest message id, 0 if empty). Monotonic — acking backwards (incl.
+    zero/negative) is a no-op, never an error. Returns the resulting
+    cursor, which reflects the clamp. Creates the cursor row (at the
+    clamped position) if absent."""
     parse_consumer_id(consumer)  # early ADR-002 validation; touch() re-parses cheaply
     ch = _require_broadcast(conn, channel)
     consumers.touch(conn, consumer)
+
+    # WHY clamp to the channel head (QA store #3): message ids are GLOBAL,
+    # so an id past this channel's newest message (a typo, or an id from
+    # another channel) would park the monotonic cursor beyond every
+    # future message here — permanently hidden, since there is no rewind.
+    # Nobody can have seen a message that doesn't exist yet, so the head
+    # is the furthest meaningful ack. The clamp runs in Python BEFORE
+    # binding, so ids outside SQLite's INTEGER range can't OverflowError;
+    # the floor of 0 keeps a fresh row from starting at a negative id.
+    # touch() above holds the write lock, so the head can't move under us.
+    head = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM messages WHERE channel_id = ?", (ch.id,)
+    ).fetchone()[0]
+    up_to_id = max(0, min(up_to_id, int(head)))
 
     # WHY a single UPSERT with MAX + a guarded updated_at: it is atomic
     # monotonic advancement with no read/modify/write race. The CASE

@@ -10,7 +10,11 @@ from pathlib import Path
 import pytest
 
 from raven_bus import db as bus_db
-from raven_bus.exceptions import InvalidAddressError
+from raven_bus.exceptions import (
+    InvalidAddressError,
+    SchemaMismatchError,
+    TeardownBlockedError,
+)
 
 
 def _iso(dt: datetime) -> str:
@@ -301,7 +305,7 @@ def test_sweep_never_touches_messages_table(db: Path) -> None:
         mid = _insert_message(conn, cid, expires_at=past)
 
     with bus_db.connection(db) as conn:
-        result = bus_db.sweep(conn)
+        result = bus_db.sweep(conn, count_expired=True)
         row = conn.execute("SELECT * FROM messages WHERE id = ?", (mid,)).fetchone()
 
     assert row is not None  # message never deleted by sweep
@@ -314,11 +318,31 @@ def test_sweep_expired_excludes_terminal_claims(db: Path) -> None:
         cid = _insert_channel(conn, "run/t/q", max_deliveries=3)
         mid = _insert_message(conn, cid, expires_at=past)
         _insert_claim(conn, mid, state="done", deliveries=1, lease_until=past)
+        _insert_message(conn, cid, expires_at=past)  # counted: no claim
 
     with bus_db.connection(db) as conn:
+        result = bus_db.sweep(conn, count_expired=True)
+
+    assert result.expired == 1
+
+
+def test_sweep_skips_the_expired_count_unless_asked(db: Path) -> None:
+    """QA store #9: sweep runs on every pending/claim — every hook peek —
+    inside the write transaction, and its expired COUNT scanned every
+    expired message in the DB (18ms -> 119ms as they piled up). The
+    count is observability only, so it is opt-in (raven doctor)."""
+    past = _iso(datetime.now(UTC) - timedelta(seconds=10))
+    with bus_db.connection(db) as conn:
+        cid = _insert_channel(conn, "run/t/q")
+        _insert_message(conn, cid, expires_at=past)
+
+    statements: list[str] = []
+    with bus_db.connection(db) as conn:
+        conn.set_trace_callback(statements.append)
         result = bus_db.sweep(conn)
 
     assert result.expired == 0
+    assert not [sql for sql in statements if "COUNT(" in sql.upper()]
 
 
 def test_sweep_cheap_when_nothing_stale(db: Path) -> None:
@@ -340,6 +364,28 @@ def test_sweep_cheap_when_nothing_stale(db: Path) -> None:
     assert result.requeued == 0
     assert result.dead_lettered == 0
     assert elapsed < 0.5
+
+
+# --- instance_id -----------------------------------------------------------
+
+
+def test_instance_id_backfills_a_stable_uuid(db: Path) -> None:
+    with bus_db.connection(db) as conn:
+        first = bus_db.instance_id(conn)
+    with bus_db.connection(db) as conn:
+        again = bus_db.instance_id(conn)
+    assert first is not None and len(first) == 32
+    assert again == first
+
+
+def test_instance_id_is_none_when_it_cannot_be_backfilled(db: Path) -> None:
+    """A connection that can't write (read-only) and finds no id yields
+    None — callers must then skip anything keyed on it."""
+    conn = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+    try:
+        assert bus_db.instance_id(conn) is None
+    finally:
+        conn.close()
 
 
 # --- teardown_run ----------------------------------------------------------
@@ -443,6 +489,144 @@ def test_teardown_run_returns_zero_for_unknown_run(db: Path) -> None:
     assert deleted == 0
 
 
+def _insert_reply(
+    conn: sqlite3.Connection,
+    channel_id: int,
+    *,
+    reply_to: int | None = None,
+    thread_id: int | None = None,
+) -> int:
+    cur = conn.execute(
+        "INSERT INTO messages (channel_id, sender, type, body, reply_to, thread_id) "
+        "VALUES (?, 'role@run-a', 'test', '{}', ?, ?)",
+        (channel_id, reply_to, thread_id),
+    )
+    assert cur.lastrowid is not None
+    return int(cur.lastrowid)
+
+
+def _row_counts(db: Path) -> tuple[int, int]:
+    with bus_db.connection(db) as conn:
+        return (
+            conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0],
+            conn.execute("SELECT COUNT(*) FROM channels").fetchone()[0],
+        )
+
+
+@pytest.mark.parametrize("ref", ["reply_to", "thread_id"])
+def test_teardown_run_blocked_by_outside_reference_is_typed_and_atomic(
+    db: Path, ref: str
+) -> None:
+    """QA store #6: a message OUTSIDE the run referencing one inside it
+    made teardown die on a raw FOREIGN KEY IntegrityError (a traceback in
+    the CLI), so the run could never be torn down. Existing DBs keep the
+    FK (no migration chain), so teardown pre-checks and refuses with a
+    typed error naming the blockers — and deletes nothing."""
+    with bus_db.connection(db) as conn:
+        inside_cid = _insert_channel(conn, "run/target/c", kind="broadcast")
+        outside_cid = _insert_channel(conn, "run/other/c", kind="broadcast")
+        inside = _insert_message(conn, inside_cid)
+        outside = _insert_reply(conn, outside_cid, **{ref: inside})
+    before = _row_counts(db)
+
+    with pytest.raises(TeardownBlockedError) as info, bus_db.connection(db) as conn:
+        bus_db.teardown_run(conn, "target")
+
+    err = info.value
+    assert err.blockers == [(outside, "run/other/c")]
+    assert err.total == 1
+    assert f"#{outside}" in str(err)
+    assert "run/other/c" in str(err)
+    assert _row_counts(db) == before
+
+
+def test_teardown_run_blocker_list_is_capped(db: Path) -> None:
+    with bus_db.connection(db) as conn:
+        inside_cid = _insert_channel(conn, "run/target/c", kind="broadcast")
+        outside_cid = _insert_channel(conn, "ops/log", kind="broadcast")
+        inside = _insert_message(conn, inside_cid)
+        outside = [_insert_reply(conn, outside_cid, reply_to=inside) for _ in range(12)]
+
+    with pytest.raises(TeardownBlockedError) as info, bus_db.connection(db) as conn:
+        bus_db.teardown_run(conn, "target")
+
+    err = info.value
+    assert err.total == 12
+    assert [mid for mid, _ in err.blockers] == outside[:10]
+    assert "and 2 more" in str(err)
+    assert f"#{outside[10]}" not in str(err)
+
+
+def _blocked_fixture(db: Path) -> None:
+    """A run message with a claim, and an outside reply referencing it."""
+    with bus_db.connection(db) as conn:
+        inside_cid = _insert_channel(conn, "run/target/q")
+        outside_cid = _insert_channel(conn, "run/other/c", kind="broadcast")
+        inside = _insert_message(conn, inside_cid)
+        _insert_claim(
+            conn, inside, lease_until=_iso(datetime.now(UTC) + timedelta(hours=1))
+        )
+        _insert_reply(conn, outside_cid, reply_to=inside)
+
+
+def _claim_count(db: Path) -> int:
+    with bus_db.connection(db) as conn:
+        return conn.execute("SELECT COUNT(*) FROM claims").fetchone()[0]
+
+
+def test_teardown_run_race_backstop_is_typed_and_rolled_back(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pre-check runs before the transaction holds the write lock, so
+    a peer can commit a referencing message in between. Simulated by a
+    pre-check that sees nothing: the DELETE's FK failure must still come
+    out as the typed refusal, and db.connection's rollback must restore
+    the claims/cursors rows deleted before it."""
+    _blocked_fixture(db)
+    before = (_row_counts(db), _claim_count(db))
+    real = bus_db._teardown_blockers
+    calls: list[int] = []
+
+    def blind_first(conn: sqlite3.Connection, ids: list[int]):
+        calls.append(1)
+        return ([], 0) if len(calls) == 1 else real(conn, ids)
+
+    monkeypatch.setattr(bus_db, "_teardown_blockers", blind_first)
+    with pytest.raises(TeardownBlockedError), bus_db.connection(db) as conn:
+        bus_db.teardown_run(conn, "target")
+
+    assert len(calls) == 2
+    assert (_row_counts(db), _claim_count(db)) == before
+
+
+def test_teardown_run_reraises_an_unexplained_integrity_error(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _blocked_fixture(db)
+    monkeypatch.setattr(bus_db, "_teardown_blockers", lambda _c, _ids: ([], 0))
+    with pytest.raises(sqlite3.IntegrityError), bus_db.connection(db) as conn:
+        bus_db.teardown_run(conn, "target")
+
+
+def test_teardown_run_allows_references_within_the_run(db: Path) -> None:
+    """Replies inside the run (even across its channels) go with it."""
+    with bus_db.connection(db) as conn:
+        a = _insert_channel(conn, "run/target/a", kind="broadcast")
+        b = _insert_channel(conn, "run/target/b", kind="broadcast")
+        root = _insert_message(conn, a)
+        _insert_reply(conn, b, reply_to=root, thread_id=root)
+        # A run-internal message replying OUTWARD doesn't block either.
+        outside_cid = _insert_channel(conn, "run/other/c", kind="broadcast")
+        foreign = _insert_message(conn, outside_cid)
+        _insert_reply(conn, a, reply_to=foreign)
+
+    with bus_db.connection(db) as conn:
+        removed = bus_db.teardown_run(conn, "target")
+
+    assert removed > 0
+    assert _row_counts(db) == (1, 1)
+
+
 # --------------------------------------------------------------------------- #
 # init_db concurrency hardening (verify-004 fix round)
 # --------------------------------------------------------------------------- #
@@ -527,7 +711,141 @@ def test_init_db_refuses_foreign_schema_version(db: Path) -> None:
     with bus_db.connection(db) as conn:
         conn.execute("UPDATE bus_meta SET value = '1' WHERE key = 'schema_version'")
     bus_db._reset_init_cache()
-    with pytest.raises(RuntimeError, match="schema version '1'"):
+    with pytest.raises(SchemaMismatchError, match="schema version '1'") as info:
         bus_db.init_db(db)
+    # Still a RuntimeError: that is what init_db raised here before the
+    # typed error existed (QA store #8), so old callers keep working.
+    assert isinstance(info.value, RuntimeError)
     # The stamp must be untouched by the refusal.
     assert bus_db._stored_schema_version(db) == "1"
+
+
+def _tables(path: Path) -> set[str]:
+    conn = sqlite3.connect(path)
+    try:
+        return {
+            row[0]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+    finally:
+        conn.close()
+
+
+def _foreign_file(path: Path, *ddl: str) -> Path:
+    conn = sqlite3.connect(path)
+    for statement in ddl:
+        conn.execute(statement)
+    conn.commit()
+    conn.close()
+    return path
+
+
+@pytest.mark.parametrize(
+    "ddl",
+    [
+        ("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)",),
+        # v1-style: some raven-named tables plus foreign ones.
+        (
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, text TEXT)",
+            "CREATE TABLE aliases (name TEXT)",
+        ),
+    ],
+    ids=["user-table", "v1-like"],
+)
+def test_init_db_refuses_unstamped_file_with_foreign_tables(
+    tmp_path: Path, ddl: tuple[str, ...]
+) -> None:
+    """QA store #8: an unstamped SQLite file holding tables raven did not
+    create was silently adopted and stamped '2' (or half-migrated before
+    a raw OperationalError). It is refused untouched, with a typed error."""
+    bus_db._reset_init_cache()
+    target = _foreign_file(tmp_path / "foreign.db", *ddl)
+    before = _tables(target)
+
+    with pytest.raises(SchemaMismatchError, match="aliases|notes"):
+        bus_db.init_db(target)
+
+    assert _tables(target) == before
+    assert bus_db._stored_schema_version(target) is None
+
+
+def test_init_db_adopts_unstamped_raven_tables(tmp_path: Path) -> None:
+    """Only raven's own tables and no stamp = a peer's first-create in
+    flight (or one that crashed before stamping): finish it, as before."""
+    bus_db._reset_init_cache()
+    target = tmp_path / "half.db"
+    conn = sqlite3.connect(target)
+    conn.executescript(bus_db._V2_MIGRATION.read_text(encoding="utf-8"))
+    conn.close()
+
+    assert bus_db.init_db(target) == target.resolve()
+    assert bus_db._stored_schema_version(target) == bus_db.SCHEMA_VERSION
+
+
+def test_init_db_refuses_raven_named_tables_of_the_wrong_shape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Raven-named tables the v2 script cannot apply over fail
+    deterministically ('no such column'): a SchemaMismatchError at once,
+    never five busy-retries ending in a raw OperationalError."""
+    bus_db._reset_init_cache()
+    sleeps: list[float] = []
+    monkeypatch.setattr(bus_db.time, "sleep", sleeps.append)
+    target = _foreign_file(
+        tmp_path / "shape.db", "CREATE TABLE messages (id INTEGER PRIMARY KEY, text TEXT)"
+    )
+
+    with pytest.raises(SchemaMismatchError, match="no such column"):
+        bus_db.init_db(target)
+    assert sleeps == []
+
+
+class _BrokenConn:
+    """connect() stand-in whose script apply fails deterministically."""
+
+    def executescript(self, _sql: str) -> None:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    def close(self) -> None:  # pragma: no cover -- trivial stub
+        pass
+
+
+def test_init_db_does_not_retry_non_busy_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only busy/locked errors are worth a retry; anything else on a
+    fresh file surfaces immediately, unwrapped (it is not a schema
+    problem)."""
+    bus_db._reset_init_cache()
+    sleeps: list[float] = []
+    monkeypatch.setattr(bus_db.time, "sleep", sleeps.append)
+    monkeypatch.setattr(bus_db.sqlite3, "connect", lambda *_a, **_k: _BrokenConn())
+
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O") as info:
+        bus_db.init_db(tmp_path / "fresh.db")
+    assert not isinstance(info.value, SchemaMismatchError)
+    assert sleeps == []
+
+
+def _coded(message: str, code: int | None) -> sqlite3.OperationalError:
+    exc = sqlite3.OperationalError(message)
+    if code is not None:
+        exc.sqlite_errorcode = code  # set by sqlite3 on real errors (3.11+)
+    return exc
+
+
+@pytest.mark.parametrize(
+    ("exc", "busy"),
+    [
+        (_coded("database is locked", sqlite3.SQLITE_BUSY), True),
+        (_coded("database is locked", 517), True),  # SQLITE_BUSY_SNAPSHOT
+        (_coded("database table is locked", sqlite3.SQLITE_LOCKED), True),
+        (_coded("no such column: channel_id", 1), False),
+        (_coded("database is locked", None), True),  # hand-built: by message
+        (_coded("disk I/O error", None), False),
+    ],
+)
+def test_is_busy_classifies_retryable_errors(
+    exc: sqlite3.OperationalError, busy: bool
+) -> None:
+    assert bus_db._is_busy(exc) is busy

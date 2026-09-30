@@ -9,6 +9,7 @@ on db.py internals.
 from __future__ import annotations
 
 import sqlite3
+import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -313,3 +314,233 @@ def test_read_thread_includes_expired(conn: sqlite3.Connection) -> None:
     )
     thread = log.read_thread(conn, root.id)
     assert reply.id in {m.id for m in thread}
+
+
+# --- QA store-lane regressions: channel get-or-create ---------------------
+
+
+def _is_channel_insert(sql: str) -> bool:
+    return sql.lstrip().upper().startswith("INSERT INTO CHANNELS")
+
+
+def test_ensure_channel_survives_concurrent_first_use(db: Path) -> None:
+    """QA store #1: SELECT-then-INSERT raced. A peer committing the same
+    new channel between our SELECT miss and our INSERT surfaced a raw
+    ``IntegrityError: UNIQUE constraint failed: channels.name`` (8
+    concurrent `raven send` to a fresh channel: up to 57/96 failed).
+    Deterministic interleave: a holder owns the write lock with the row
+    uncommitted; the contender misses on SELECT and blocks in INSERT;
+    the holder commits; the contender must adopt the holder's row."""
+    from raven_bus import db as bus_db
+    from raven_bus.models import Channel
+
+    holder = sqlite3.connect(db, timeout=5.0)
+    holder.execute("BEGIN IMMEDIATE")
+    holder.execute(
+        "INSERT INTO channels (name, kind) VALUES ('run/r/fresh', 'broadcast')"
+    )
+
+    insert_started = threading.Event()
+    outcome: list[object] = []
+
+    def contender() -> None:
+        try:
+            with bus_db.connection(db) as cx:
+                cx.set_trace_callback(
+                    lambda sql: insert_started.set() if _is_channel_insert(sql) else None
+                )
+                outcome.append(channels.ensure_channel(cx, "run/r/fresh"))
+        except BaseException as exc:  # noqa: BLE001 -- surfaced by the assert
+            outcome.append(exc)
+
+    thread = threading.Thread(target=contender)
+    thread.start()
+    try:
+        assert insert_started.wait(5), "contender never reached its INSERT"
+        time.sleep(0.2)  # let the contender park in the busy-wait
+    finally:
+        holder.commit()
+        holder.close()
+    thread.join(10)
+
+    assert len(outcome) == 1
+    assert isinstance(outcome[0], Channel), outcome[0]
+    assert outcome[0].name == "run/r/fresh"
+
+
+def test_ensure_channel_concurrent_first_use_stress(db: Path) -> None:
+    """QA store #1, the reviewer's shape: many connections race the first
+    use of one channel; every one must get the same row, none may crash."""
+    from raven_bus import db as bus_db
+
+    workers = 8
+    barrier = threading.Barrier(workers)
+    ids: list[int] = []
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            with bus_db.connection(db) as cx:
+                barrier.wait(5)
+                ids.append(channels.ensure_channel(cx, "run/r/stress", "queue").id)
+        except BaseException as exc:  # noqa: BLE001 -- surfaced by the assert
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(workers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(20)
+
+    assert errors == []
+    assert len(ids) == workers
+    assert len(set(ids)) == 1
+
+
+def test_ensure_channel_existing_hit_does_not_burn_autoincrement_ids(
+    conn: sqlite3.Connection,
+) -> None:
+    """``INSERT ... ON CONFLICT DO NOTHING`` still advances AUTOINCREMENT
+    on a conflict, so the insert must only run on a SELECT miss —
+    otherwise every send to an existing channel would burn a channel id."""
+    first = channels.ensure_channel(conn, "chan-a")
+    for _ in range(5):
+        channels.ensure_channel(conn, "chan-a")
+    second = channels.ensure_channel(conn, "chan-b")
+    assert second.id == first.id + 1
+
+
+def test_ensure_channel_rejects_unknown_kind(conn: sqlite3.Connection) -> None:
+    """QA store #2: a bogus kind hit the schema's raw CHECK
+    IntegrityError; it is an input error (same class as a bad urgency)."""
+    with pytest.raises(InvalidAddressError, match="kind"):
+        channels.ensure_channel(conn, "chan-k", "bogus")  # type: ignore[arg-type]
+    assert conn.execute("SELECT COUNT(*) FROM channels").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("kind", ["queue", "stream"])
+def test_append_ensure_uses_existing_channel_of_any_kind(
+    conn: sqlite3.Connection, kind: str
+) -> None:
+    """QA store #2: ``append(ensure=True)`` re-ensured with the default
+    kind 'broadcast', so appending to an EXISTING queue/stream raised
+    WrongChannelKindError (broke the Python queue snippet, `raven send`
+    to a queue, and harness telemetry to a stream reply channel).
+    ensure=True is get-or-create: an existing channel is used as-is."""
+    channels.ensure_channel(conn, "run/r/typed", kind)  # type: ignore[arg-type]
+    msg = log.append(conn, channel="run/r/typed", sender=SENDER, type="t", body={})
+    assert msg.channel == "run/r/typed"
+    assert channels.get_channel(conn, "run/r/typed").kind == kind
+
+
+def test_append_ensure_validates_absent_channel_name(conn: sqlite3.Connection) -> None:
+    with pytest.raises(InvalidAddressError):
+        log.append(conn, channel="Bad Name", sender=SENDER, type="t", body={})
+
+
+# --- QA store-lane regressions: reply_to / thread_id references ----------
+
+
+def _message_count(conn: sqlite3.Connection) -> int:
+    return conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+
+
+@pytest.mark.parametrize("missing", [999, 0, -1, 2**63])
+def test_append_unknown_reply_to_raises_unknown_message(
+    conn: sqlite3.Connection, missing: int
+) -> None:
+    """QA store #4: a nonexistent reply_to fell through to a raw FK
+    IntegrityError (or OverflowError past SQLite's INTEGER range)."""
+    with pytest.raises(UnknownMessageError, match="reply_to"):
+        log.append(conn, channel="c", sender=SENDER, type="t", body={}, reply_to=missing)
+    assert _message_count(conn) == 0
+
+
+def test_append_unknown_thread_id_raises_unknown_message(conn: sqlite3.Connection) -> None:
+    with pytest.raises(UnknownMessageError, match="thread_id"):
+        log.append(conn, channel="c", sender=SENDER, type="t", body={}, thread_id=999)
+    assert _message_count(conn) == 0
+
+
+def test_append_explicit_thread_id_is_checked_even_with_valid_reply_to(
+    conn: sqlite3.Connection,
+) -> None:
+    root = log.append(conn, channel="c", sender=SENDER, type="t", body={})
+    with pytest.raises(UnknownMessageError, match="thread_id"):
+        log.append(
+            conn, channel="c", sender=SENDER, type="t", body={},
+            reply_to=root.id, thread_id=999,
+        )
+    assert _message_count(conn) == 1
+
+
+def test_append_explicit_thread_id_is_kept(conn: sqlite3.Connection) -> None:
+    root = log.append(conn, channel="c", sender=SENDER, type="t", body={})
+    other = log.append(conn, channel="c", sender=SENDER, type="t", body={})
+    reply = log.append(
+        conn, channel="c", sender=SENDER, type="t", body={},
+        reply_to=other.id, thread_id=root.id,
+    )
+    assert (reply.reply_to, reply.thread_id) == (other.id, root.id)
+
+
+# --- QA store-lane regressions: body nesting cap --------------------------
+
+
+def _nested_dicts(depth: int) -> dict:
+    """``depth`` dicts nested inside each other (the body itself = 1)."""
+    body: dict = {}
+    inner = body
+    for _ in range(depth - 1):
+        inner["x"] = {}
+        inner = inner["x"]
+    return body
+
+
+def _nested_lists(depth: int) -> dict:
+    """A body dict holding ``depth - 1`` nested lists."""
+    inner: list = []
+    for _ in range(depth - 2):
+        inner = [inner]
+    return {"x": inner}
+
+
+def test_append_accepts_body_at_the_depth_cap_and_readers_can_encode_it(
+    conn: sqlite3.Connection,
+) -> None:
+    """The cap must sit below what the read side can re-serialise:
+    pydantic's JSON serializer (HTTP readers) gives up at ~100 levels."""
+    msg = log.append(
+        conn, channel="c", sender=SENDER, type="t", body=_nested_dicts(log.MAX_BODY_DEPTH)
+    )
+    fetched = log.read_by_id(conn, msg.id)
+    fetched.model_dump(mode="json")
+    fetched.model_dump_json()
+
+
+@pytest.mark.parametrize("builder", [_nested_dicts, _nested_lists])
+def test_append_rejects_body_nested_past_the_cap(
+    conn: sqlite3.Connection, builder
+) -> None:
+    """QA store #12: json.dumps accepted ~1000 levels, so a body nested
+    ≥~100 deep was stored, then broke every HTTP reader (and an HTTP
+    claim leased a message it could not return). The single writer now
+    refuses it with a typed error — nothing is written."""
+    from raven_bus.exceptions import InvalidBodyError
+
+    with pytest.raises(InvalidBodyError, match="nested"):
+        log.append(
+            conn, channel="c", sender=SENDER, type="t",
+            body=builder(log.MAX_BODY_DEPTH + 1),
+        )
+    assert _message_count(conn) == 0
+    assert issubclass(InvalidBodyError, ValueError)
+
+
+def test_append_depth_check_is_iterative(conn: sqlite3.Connection) -> None:
+    """A body deeper than Python's recursion limit gets the typed error,
+    not a RecursionError from a recursive walker or json.dumps."""
+    from raven_bus.exceptions import InvalidBodyError
+
+    with pytest.raises(InvalidBodyError):
+        log.append(conn, channel="c", sender=SENDER, type="t", body=_nested_dicts(5000))

@@ -12,8 +12,10 @@ WHERE message_id=? AND state='lapsed'`` (rowcount 1 wins); a
 never-claimed message by the INSERT above. There is no caller-side
 snapshot, so any sweep call site (cursors, doctor, other channels) is
 harmless to dead-letter accounting. A voluntary ``release`` flips the
-row to lapsed with deliveries=0 (never delete: a deleted row becomes a
-never-claimed candidate below every process's frontier — see release()).
+row to lapsed and undoes only its OWN delivery (``deliveries - 1``,
+floor 0), keeping earlier involuntary lapses on the count (never
+delete: a deleted row becomes a never-claimed candidate below every
+process's frontier — see release()).
 
 Every public operation invokes ``db.sweep`` before observing actionable
 claim state. Valid only on ``queue`` channels
@@ -23,12 +25,14 @@ CLAIM FRONTIER (verify-002 waived-P1 fix): a cold ``claim_next`` scans
 from message id 0, so a channel with a large terminal (done/dead)
 backlog pays an index scan proportional to that backlog on *every*
 call, not just the first. ``_FRONTIER`` is a per-process, in-memory
-``{(db_path, channel_id): id}`` watermark below which no NEVER-CLAIMED
-message can exist -- once a fresh-candidate scan proves it reached the
-true end of the messages table for a channel without filling a batch,
-every id up to that table's current max is known to already carry a
-claims row (or was just about to receive one), so the next call's
-fresh scan starts there instead of at 0. Lapsed rows (leases that
+``{(db_file_key, channel_id): id}`` watermark below which no
+NEVER-CLAIMED message can exist -- once a fresh-candidate scan proves
+it reached the true end of the messages table for a channel without
+filling a batch, every id up to the channel's max id READ BEFORE THAT
+SCAN is known to carry a claims row (or be expired), so the next
+call's fresh scan starts there instead of at 0. ``db_file_key`` names
+the FILE, not just its path: see ``_frontier_db_key`` (a durable
+``bus_meta`` instance id; no id, no cache). Lapsed rows (leases that
 expired) are NOT covered by the frontier -- they can and do exist
 below it, since a message can be claimed-then-lapse long after the
 frontier passed its id -- so they are always found via a direct
@@ -186,57 +190,67 @@ def _denied(message_id: int, consumer: str) -> ClaimDeniedError:
     )
 
 
-def _frontier_db_key(conn: sqlite3.Connection) -> str:
+def _frontier_db_key(conn: sqlite3.Connection) -> str | None:
     """Identify the attached DB FILE (not just its path) for the
-    ``_FRONTIER`` cache key.
+    ``_FRONTIER`` cache key, or None to mean "don't cache".
 
-    ``PRAGMA database_list`` yields the path; the (st_dev, st_ino)
-    stamp is appended so a REPLACED file at the same path (teardown +
-    re-init in tests, or an operator swapping the DB) gets a cold
-    frontier instead of inheriting the dead file's watermark — a stale
-    watermark over a fresh file hides every message in it
-    (raven2-p2 refute-frontier finding). Stat failure degrades to the
-    bare path: worst case is the original staleness only on filesystems
-    that cannot identify files, never a crash."""
+    A REPLACED file at the same path must get a cold frontier: a stale
+    watermark over a fresh file hides every message at or below it
+    (raven2-p2 refute-frontier finding). The inode alone can't tell —
+    ext4 reuses a replaced file's inode deterministically (QA store #11)
+    — so the key carries ``db.instance_id``, a durable id stored IN the
+    file. No readable id means no cache (never fall back to trusting
+    the inode). The (st_dev, st_ino) stamp stays as a cheap extra
+    discriminator (it does catch a backup restored by rename, which
+    carries the old id); stat failure just drops it."""
+    identity = db.instance_id(conn)
+    if identity is None:
+        return None
     row = conn.execute("PRAGMA database_list").fetchone()
     path = "" if row is None else str(row[2])
     try:
         stat = os.stat(path)
-        return f"{path}|{stat.st_dev}:{stat.st_ino}"
     except OSError:
-        return path
+        return f"{path}|{identity}"
+    return f"{path}|{identity}|{stat.st_dev}:{stat.st_ino}"
+
+
+def _channel_ceiling(conn: sqlite3.Connection, channel_id: int) -> int:
+    """The channel's current max message id (0 if empty)."""
+    row = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM messages WHERE channel_id = ?",
+        (channel_id,),
+    ).fetchone()
+    return int(row[0])
 
 
 def _maybe_advance_frontier(
-    conn: sqlite3.Connection,
-    channel_id: int,
-    frontier_key: tuple[str, int],
+    frontier_key: tuple[str, int] | None,
     frontier: int,
+    ceiling: int,
     fresh_rows: list[sqlite3.Row],
 ) -> None:
-    """Advance the cached frontier once a fresh-candidate scan proves
-    it reached the true end of the messages table for this channel.
+    """Advance the cached frontier to ``ceiling`` once a fresh-candidate
+    scan proves it reached the true end of this channel's messages.
 
     Only call this once every row in ``fresh_rows`` has actually been
     attempted (INSERTed) this round -- returning early with a winner
     mid-batch would leave later fresh rows genuinely never-claimed,
     and advancing the watermark past them would starve them forever.
     ``len(fresh_rows) < _CANDIDATE_BATCH`` is what proves the scan hit
-    table end rather than stopping on LIMIT: SQLite only returns fewer
-    than the batch when there was nothing left to examine. Because
-    ``db.sweep``/``_upsert_consumer`` already opened a write
-    transaction earlier in this call, this MAX(id) read shares that
-    transaction's snapshot with the fresh-candidate scan -- no
-    concurrently-committed message can land at or below the ceiling
-    without also having been visible to the scan."""
-    if len(fresh_rows) >= _CANDIDATE_BATCH:
+    table end rather than stopping on LIMIT.
+
+    ``ceiling`` MUST be read BEFORE the fresh scan (QA store #10): every
+    id at or below it was committed before the scan began (one writer
+    at a time allocates ids), so the scan saw all of them. Read after
+    the scan -- as this used to be -- an autocommit connection (no
+    write transaction pinning a snapshot) could see a message committed
+    in between: above everything the scan returned, at/below the
+    ceiling, and so skipped by this process forever."""
+    if frontier_key is None or len(fresh_rows) >= _CANDIDATE_BATCH:
         return
-    ceiling_row = conn.execute(
-        "SELECT MAX(id) FROM messages WHERE channel_id = ?", (channel_id,)
-    ).fetchone()
-    ceiling = ceiling_row[0]
-    if ceiling is not None and ceiling > frontier:
-        _FRONTIER[frontier_key] = int(ceiling)
+    if ceiling > frontier:
+        _FRONTIER[frontier_key] = ceiling
 
 
 def claim_next(
@@ -262,20 +276,29 @@ def claim_next(
     db.sweep(conn)
     consumers.touch(conn, consumer)
     channel_id = _queue_channel_id(conn, channel)
-    frontier_key = (_frontier_db_key(conn), channel_id)
+    db_key = _frontier_db_key(conn)
+    frontier_key = None if db_key is None else (db_key, channel_id)
 
-    after_id = 0
+    # One resume point PER SCAN, never a shared one: after a round lost
+    # in full, a shared "last candidate id" could be a lapsed row far
+    # beyond the fresh batch's end, restarting the fresh scan past fresh
+    # rows it never examined -- which the next short scan then buried
+    # under the frontier (found while fixing QA store #10).
+    lapsed_after = 0
+    fresh_after = 0
     while True:
         # Lease deadline is computed per batch, not once up front: a
         # short lease plus a slow scan over a large terminal backlog
         # could otherwise write an already-expired lease_until
         # (re-verify wave finding).
         lease_until = _lease_until(lease_s)
-        frontier = _FRONTIER.get(frontier_key, 0)
-        fresh_after = max(after_id, frontier)
+        frontier = 0 if frontier_key is None else _FRONTIER.get(frontier_key, 0)
+        fresh_after = max(fresh_after, frontier)
+        ceiling = _channel_ceiling(conn, channel_id)  # BEFORE the scan -- see
+        # _maybe_advance_frontier for why the order is load-bearing.
 
         lapsed_rows = conn.execute(
-            _LAPSED_CANDIDATES_SQL, (channel_id, after_id)
+            _LAPSED_CANDIDATES_SQL, (channel_id, lapsed_after)
         ).fetchall()
         fresh_rows = conn.execute(
             _FRESH_CANDIDATES_SQL, (channel_id, fresh_after)
@@ -285,15 +308,13 @@ def claim_next(
         if not candidates:
             # Vacuously "every fresh row was attempted" (there were
             # none) — safe to advance before returning.
-            _maybe_advance_frontier(
-                conn, channel_id, frontier_key, frontier, fresh_rows
-            )
+            _maybe_advance_frontier(frontier_key, frontier, ceiling, fresh_rows)
             return None
 
         for row in candidates:
             message_id = int(row["id"])
-            after_id = message_id
             if row["claim_state"] == "lapsed":
+                lapsed_after = message_id
                 # Re-claim: the guarded UPDATE is the atomic winner test
                 # AND the durable attempt increment in one statement.
                 cursor = conn.execute(
@@ -307,6 +328,7 @@ def claim_next(
                     (consumer, lease_until, message_id),
                 )
             else:
+                fresh_after = message_id
                 cursor = conn.execute(
                     """
                     INSERT INTO claims(
@@ -323,7 +345,7 @@ def claim_next(
         # every fresh row) lost its race — each now genuinely carries
         # a claims row, so it is safe to advance the frontier past
         # them before the next iteration re-queries.
-        _maybe_advance_frontier(conn, channel_id, frontier_key, frontier, fresh_rows)
+        _maybe_advance_frontier(frontier_key, frontier, ceiling, fresh_rows)
 
 
 def renew(
@@ -335,8 +357,10 @@ def renew(
 ) -> Claim:
     """Extend a lease this consumer holds. Raises
     :class:`ClaimDeniedError` if the claim is absent, held by another
-    consumer, or not in state 'leased' (a lapsed-and-reaped lease is
-    indistinguishable from never-claimed — by design)."""
+    consumer, or not in state 'leased'. A lease that already lapsed
+    cannot be revived — its row persists as 'lapsed' (open to any
+    claimant, deliveries kept) and renew is denied, the same as for a
+    claim this consumer never held."""
     db.sweep(conn)
     consumers.touch(conn, consumer)
     cursor = conn.execute(
@@ -382,10 +406,16 @@ def complete(conn: sqlite3.Connection, message_id: int, consumer: str) -> Claim:
 
 def release(conn: sqlite3.Connection, message_id: int, consumer: str) -> None:
     """Voluntarily give a leased message back: flips the claim row to
-    'lapsed' with ``deliveries=0``, so the message is immediately
-    re-claimable and the next claim starts at deliveries=1 — voluntary
-    release is cooperative, not a failure signal, so it never counts
-    toward dead-lettering. Same denial rules as :func:`renew`.
+    'lapsed' with ``deliveries - 1`` (floor 0), so the message is
+    immediately re-claimable and the release itself never counts toward
+    dead-lettering — voluntary release is cooperative, not a failure
+    signal. Same denial rules as :func:`renew`.
+
+    WHY decrement, not reset (QA store #7): ``deliveries=0`` also erased
+    every EARLIER involuntary lapse, so a poison message never reached
+    ``max_deliveries`` as long as someone released it in between. The
+    release undoes exactly the one delivery its own claim added:
+    claim → release → reclaim still yields deliveries=1.
 
     WHY flip-not-delete (raven2-p2 refute-frontier finding): deleting
     the row turned the message back into a NEVER-CLAIMED candidate at
@@ -398,7 +428,8 @@ def release(conn: sqlite3.Connection, message_id: int, consumer: str) -> None:
     cursor = conn.execute(
         f"""
         UPDATE claims
-        SET state = 'lapsed', deliveries = 0, updated_at = {_NOW_SQL}
+        SET state = 'lapsed', deliveries = MAX(deliveries - 1, 0),
+            updated_at = {_NOW_SQL}
         WHERE message_id = ? AND consumer = ? AND state = 'leased'
         """,
         (message_id, consumer),
