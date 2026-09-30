@@ -56,7 +56,8 @@ from raven_bus.exceptions import RavenBusError
 
 app = typer.Typer(
     name="raven",
-    help="SQLite-backed role-addressable message bus for agent sessions (v2).",
+    help="Channel-based coordination bus for multi-agent runs: an append-only "
+    "SQLite log partitioned into broadcast, queue and stream channels.",
     no_args_is_help=True,
     add_completion=False,
 )
@@ -114,7 +115,7 @@ def _global(
         help="Print version and exit.",
     ),
 ) -> None:
-    """raven — SQLite-backed role-addressable message bus (v2)."""
+    """raven — channel-based coordination bus for multi-agent runs."""
 
 
 def cli_main() -> None:

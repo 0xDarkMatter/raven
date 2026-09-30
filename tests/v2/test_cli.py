@@ -754,6 +754,14 @@ def test_version_flag() -> None:
     assert "raven" in result.stdout
 
 
+def test_top_level_help_describes_v2() -> None:
+    """QA cli #6: the app help still carried v1's "role-addressable
+    message bus for agent sessions" wording."""
+    assert app.info.help is not None
+    assert "role-addressable" not in app.info.help
+    assert "coordination bus for multi-agent runs" in app.info.help
+
+
 # --------------------------------------------------------------------
 # cli_main() — the console-script entry point's last-resort net
 # --------------------------------------------------------------------
