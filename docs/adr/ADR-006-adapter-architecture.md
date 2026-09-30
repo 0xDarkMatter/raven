@@ -48,15 +48,23 @@ P3 implements them. buzz-acp proved the harness shape (batch → one
 - Testing uses a **fake ACP agent** subprocess (ships in tests/) — the
   protocol client is tested against it, never against a live model.
 
-## Amendment (2026-09-30, issues #2 and #3)
+## Amendment (2026-09-30, issues #1, #2 and #3)
 
-Two implementation defects, fixed without changing the decision:
+Fixed without changing the decision (policy owns all text; the hook peeks
+and never acks; the harness acks after delivery):
 
-- **Hook transport.** "A compact text block" must travel as PreToolUse
+- **Hook transport (#2).** The hook's output must travel as PreToolUse
   `hookSpecificOutput.additionalContext` JSON. Claude Code writes plain
   PreToolUse stdout to its debug log, never the model's context, so the
-  shipped hook rendered correctly and delivered nothing. The text and its
-  `policy.render` framing are unchanged; only the envelope is new.
+  shipped hook rendered correctly and delivered nothing.
+- **Hook content (#1).** The hook's "compact text block" is
+  `policy.render_hint` — a bounded pull notice (counts, ids, senders, the
+  `raven read` command; ≤2,000 chars; no bodies or types) — not
+  `policy.render`'s full blocks. A peek-only adapter that fires every tool
+  call and never acks re-pushed the entire backlog on every call. It stays
+  stateless (no hook-local "already shown" record), so the hook remains
+  read-only. `render_hint` shares `plan`'s fyi due-rule. Only the harness,
+  which owns the loop and acks, pushes full `render` blocks.
 - **Harness redelivery guard.** The in-memory guard that stops a session
   re-injecting what it already delivered is a set of exact ids. A
   per-channel max hid deferred lower ids from `plan`, breaking the

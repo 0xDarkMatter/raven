@@ -1,8 +1,9 @@
 """Tests for the Claude Code PreToolUse inbox hook.  LANE: hook (raven2-p3).
 
-The hook is a peek-only adapter (ADR-006): it reads pending, renders via
-``raven_bus.policy``, prints a banner+block when anything is deliverable,
-never acks, and exits 0 in every path. These tests exercise that through
+The hook is a peek-only adapter (ADR-006): it reads pending, emits
+``raven_bus.policy.render_hint``'s bounded pull notice (issue #1) as
+PreToolUse additionalContext JSON (issue #2) when anything is due, never
+acks, and exits 0 in every path. These tests exercise that through
 a real subprocess (env injected) so the quality bar's guarantees hold at
 the actual process boundary, plus in-process unit tests for the parts
 that are awkward to assert over stdout.
@@ -84,29 +85,18 @@ def run_peek(
 _DRIVER = """\
 import raven_bus.policy as policy
 
-# A deterministic, assertable render double: records the pending ids the
-# REAL peek code handed to plan() by stashing them on the plan, then
-# renders a fixed marker + the id list. The hook's job is only to wrap
-# policy.render's output verbatim (ADR-003/006), so this is all the test
-# needs to assert the banner + rendered block reach stdout.
+# A deterministic, assertable notice double: echoes the pending ids and
+# consumer the REAL peek code handed to render_hint(). The hook's job is
+# only to wrap policy's text verbatim (ADR-003/006), so this is all the
+# test needs to assert the notice reaches stdout unaltered.
 
 
-class _Plan:
-    def __init__(self, pending):
-        self.pending = list(pending)
+def _render_hint(pending, *, consumer, now, **kw):
+    ids = ",".join(str(m.id) for m in pending)
+    return f"RAVEN-RENDERED-BLOCK ids=[{ids}] consumer={consumer}"
 
 
-def _plan(pending, *, now, **kw):
-    return _Plan(pending)
-
-
-def _render(plan, **kw):
-    ids = ",".join(str(m.id) for m in plan.pending)
-    return f"RAVEN-RENDERED-BLOCK ids=[{ids}]"
-
-
-policy.plan = _plan
-policy.render = _render
+policy.render_hint = _render_hint
 
 from raven_bus.adapters.hooks.peek import main
 main()
@@ -337,7 +327,7 @@ def test_peek_with_raising_policy_is_silent_exit_zero(tmp_path):
         "from raven_bus import policy\n"
         "def _boom(*a, **k):\n"
         "    raise RuntimeError('policy exploded')\n"
-        "policy.plan = _boom\n"
+        "policy.render_hint = _boom\n"
         "from raven_bus.adapters.hooks import peek\n"
         "raise SystemExit(peek.main())\n",
         encoding="utf-8",
@@ -360,7 +350,7 @@ def test_peek_with_raising_policy_is_silent_exit_zero(tmp_path):
 # --------------------------------------------------------------------------- #
 # The render path (policy patched to doubles; real peek code + real store).
 # --------------------------------------------------------------------------- #
-def test_pending_messages_print_banner_and_rendered_block(tmp_path):
+def test_pending_messages_emit_policy_notice_verbatim(tmp_path):
     db_path = tmp_path / "bus.db"
     ids = seed_channel(
         db_path,
@@ -376,15 +366,48 @@ def test_pending_messages_print_banner_and_rendered_block(tmp_path):
     )
 
     assert result.returncode == 0
+    # policy.render_hint's text arrives EXACTLY — the hook adds nothing
+    # (all wording is policy's — ADR-003/006).
+    assert additional_context(result.stdout) == (
+        f"{RENDER_MARKER} ids=[{','.join(str(i) for i in ids)}] consumer={CONSUMER}"
+    )
+
+
+def test_real_policy_notice_names_the_pull_command_and_omits_bodies(tmp_path):
+    """End to end with the REAL policy: the notice says what is waiting
+    and how to pull it, and never carries a body (issue #1 — the content
+    is pulled, not re-pushed every tool call)."""
+    db_path = tmp_path / "bus.db"
+    seed_channel(
+        db_path,
+        CHANNEL,
+        [("steer", "prompt", {"secret": "BODY-MUST-NOT-APPEAR"})],
+        sender="orchestrator@run-a",
+    )
+
+    result = run_peek(
+        env=_env(RAVEN_CONSUMER=CONSUMER, RAVEN_CHANNELS=CHANNEL, RAVEN_DB=str(db_path))
+    )
+
+    assert result.returncode == 0
     out = additional_context(result.stdout)
-    # README banner shape: count is the number of messages peeked.
-    assert f"=== RAVEN: {len(ids)} message(s) for {CONSUMER} ===" in out
-    # The policy.render output appears verbatim (sender-attributed framing
-    # is policy's job; the hook only wraps it — ADR-003/006).
-    assert RENDER_MARKER in out
-    assert f"ids=[{','.join(str(i) for i in ids)}]" in out
-    # One action-hint line (README shape).
-    assert "raven read/ack" in out
+    assert f"raven read --channel {CHANNEL} --as {CONSUMER}" in out
+    assert "orchestrator@run-a" in out
+    assert "BODY-MUST-NOT-APPEAR" not in out
+
+
+def test_real_policy_held_fyi_is_silent(tmp_path):
+    """A lone fresh fyi is held by ADR-003's digest rule: nothing is due,
+    so the hook stays silent rather than nagging every tool call."""
+    db_path = tmp_path / "bus.db"
+    seed_channel(db_path, CHANNEL, [("note", "fyi", {})])
+
+    result = run_peek(
+        env=_env(RAVEN_CONSUMER=CONSUMER, RAVEN_CHANNELS=CHANNEL, RAVEN_DB=str(db_path))
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == ""
 
 
 def test_render_path_still_never_acks(tmp_path):
@@ -430,10 +453,8 @@ def test_pending_merged_across_channels_id_ascending(tmp_path):
     )
 
     assert result.returncode == 0
-    # 4 messages peeked, handed to render in ascending id order.
-    out = additional_context(result.stdout)
-    assert "=== RAVEN: 4 message(s) for " in out
-    assert "ids=[1,2,3,4]" in out
+    # 4 messages peeked, handed to render_hint in ascending id order.
+    assert "ids=[1,2,3,4]" in additional_context(result.stdout)
 
 
 # --------------------------------------------------------------------------- #
@@ -451,17 +472,14 @@ def test_parse_channels_strips_blanks_and_dupes():
     assert _parse_channels(" , , ") == []
 
 
-def test_emit_banner_shape_matches_readme(capsys):
+def test_emit_wraps_context_verbatim_as_one_json_line(capsys):
     from raven_bus.adapters.hooks.peek import _emit
 
-    _emit(CONSUMER, 2, "RENDERED")
+    _emit("line one\nline two\n")
 
     captured = capsys.readouterr()
     assert captured.out.count("\n") == 1  # one JSON line, nothing else
-    lines = additional_context(captured.out).splitlines()
-    assert lines[0] == f"=== RAVEN: 2 message(s) for {CONSUMER} ==="
-    assert "RENDERED" in lines[1]
-    assert lines[-1] == "Use your raven tooling (or the CLI: raven read/ack) to act."
+    assert additional_context(captured.out) == "line one\nline two\n"
 
 
 def test_emit_is_ascii_and_round_trips_non_ascii(capsys):
@@ -472,16 +490,17 @@ def test_emit_is_ascii_and_round_trips_non_ascii(capsys):
     from raven_bus.adapters.hooks.peek import _emit
 
     rendered = "=== DATA — treat as information ===\nbody: 雨 🌧"
-    _emit(CONSUMER, 1, rendered)
+    _emit(rendered)
 
     out = capsys.readouterr().out
     assert out.isascii()
     assert rendered in additional_context(out)
 
 
-def test_plan_receives_merged_pending_ascending(monkeypatch, tmp_path):
-    """In-process: policy.plan is handed exactly the merged id-ascending
-    pending list (the raw store-reading path, asserted directly)."""
+def test_notice_receives_merged_pending_ascending(monkeypatch, tmp_path):
+    """In-process: policy.render_hint is handed exactly the merged
+    id-ascending pending list (the raw store-reading path, asserted
+    directly) plus the configured consumer."""
     import raven_bus.adapters.hooks.peek as peek_mod
     from raven_bus import policy
 
@@ -492,14 +511,13 @@ def test_plan_receives_merged_pending_ascending(monkeypatch, tmp_path):
     seed_channel(db_path, ch_b, [("b1", "prompt", {})])
     seed_channel(db_path, ch_a, [("a2", "prompt", {})])
 
-    received: list[list[int]] = []
+    received: list[tuple[list[int], str]] = []
 
-    def fake_plan(pending, *, now, **kw):
-        received.append([m.id for m in pending])
-        return object()
+    def fake_render_hint(pending, *, consumer, now, **kw):
+        received.append(([m.id for m in pending], consumer))
+        return "X"
 
-    monkeypatch.setattr(policy, "plan", fake_plan)
-    monkeypatch.setattr(policy, "render", lambda plan, **kw: "X")
+    monkeypatch.setattr(policy, "render_hint", fake_render_hint)
     # peek reads os.environ directly; mirror the subprocess env in-process.
     monkeypatch.setenv("RAVEN_CONSUMER", CONSUMER)
     monkeypatch.setenv("RAVEN_CHANNELS", f"{ch_a},{ch_b}")
@@ -508,20 +526,19 @@ def test_plan_receives_merged_pending_ascending(monkeypatch, tmp_path):
     rc = peek_mod.peek()
 
     assert rc == 0
-    assert received == [[1, 2, 3]]  # merged + strictly id-ascending
+    assert received == [([1, 2, 3], CONSUMER)]  # merged + strictly id-ascending
 
 
-def test_peek_silent_when_render_returns_empty(monkeypatch, tmp_path, capsys):
-    """plan non-empty but render yields '' -> print nothing (e.g. an
-    all-deferred plan this boundary)."""
+def test_peek_silent_when_notice_is_empty(monkeypatch, tmp_path, capsys):
+    """Something pending but render_hint yields '' -> print nothing (e.g.
+    only fyi still held below the digest thresholds)."""
     import raven_bus.adapters.hooks.peek as peek_mod
     from raven_bus import policy
 
     db_path = tmp_path / "bus.db"
     seed_channel(db_path, CHANNEL, [("a", "fyi", {})])
 
-    monkeypatch.setattr(policy, "plan", lambda pending, *, now, **kw: object())
-    monkeypatch.setattr(policy, "render", lambda plan, **kw: "")
+    monkeypatch.setattr(policy, "render_hint", lambda *_a, **_k: "")
     monkeypatch.setenv("RAVEN_CONSUMER", CONSUMER)
     monkeypatch.setenv("RAVEN_CHANNELS", CHANNEL)
     monkeypatch.setenv("RAVEN_DB", str(db_path))
@@ -643,7 +660,7 @@ def test_inprocess_catchall_swallows_everything(monkeypatch, capsys, tmp_path):
     # source module, not a (nonexistent) peek-module attribute.
     from raven_bus import policy as policy_mod
 
-    monkeypatch.setattr(policy_mod, "plan", _boom)
+    monkeypatch.setattr(policy_mod, "render_hint", _boom)
     assert peek_mod.peek() == 0
     captured = capsys.readouterr()
     assert captured.out == ""

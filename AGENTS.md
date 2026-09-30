@@ -55,9 +55,10 @@ src/raven_bus/
 ├── cursors.py    broadcast: pending() + ack() (cursor-jump only) + get_cursor()
 ├── claims.py     queue: claim_next / renew / complete / release / get_claim
 ├── compat.py     v1 BusClient shim on the v2 store (deprecated, one release)
-├── policy.py     THE attention layer (ADR-003/006) — plan() + render(); pure,
+├── policy.py     THE attention layer (ADR-003/006) — plan() + render() (push form,
+│                 the harness) and render_hint() (bounded pull notice, the hook); pure,
 │                 deterministic, NO I/O and NO clock reads (now + budget are inputs).
-│                 The ONLY composer of injection text; adapters call these two and
+│                 The ONLY composer of injection text; adapters call it and
 │                 shuttle bytes, never building framing themselves.
 ├── http/         ravend — optional loopback HTTP bridge (the `[http]` extra; ADR-005)
 │                 app.py = frozen route table + error envelope + exception→status map;
@@ -67,7 +68,8 @@ src/raven_bus/
 │   │             stdio: initialize/session/new/session/prompt/session/update/cancel);
 │   │             harness.py = the dumb-pipe loop (gather pending → plan → deliver → ack-after)
 │   └── hooks/    Claude Code PreToolUse hook: peek.py (runnable as a module) +
-│                 raven-inbox-hook.sh (trivial exec wrapper). PEEK-ONLY — never acks.
+│                 raven-inbox-hook.sh (trivial wrapper, forces exit 0). PEEK-ONLY —
+│                 never acks; emits render_hint as additionalContext JSON.
 ├── migrations/0002_v2_schema.sql
 └── cli/          Typer `raven`: send read ack claim done release tail
                   channels doctor teardown version serve acp  (_common.py = exit codes + error map)
@@ -137,10 +139,16 @@ frozen in `http/app.py`'s route table (= ADR-005's endpoint table).
 `policy` + two thin adapters. Same rule shape as the store landmines: the
 decision text owns the *why*; treat each as a build-breaker.
 
-- **Only `policy.render` composes injection text.** An adapter that builds its
+- **Only `policy` composes injection text.** An adapter that builds its
   own framing — even a header line — is a **defect**. The sender-attributed data
   frame IS the prompt-injection defense (ADR-003); two implementations drift.
-  Adapters call `policy.plan` then `policy.render` and print/submit the result.
+  The harness calls `policy.plan` then `policy.render`; the hook calls
+  `policy.render_hint`; each prints/submits the result verbatim.
+- **The hook announces, never re-injects (issue #1).** It fires on every tool
+  call and never acks, so it emits `render_hint`'s bounded notice (≤2,000
+  chars, no bodies/types) — never `render`'s full blocks, which repeated the
+  whole backlog each call. The fyi due-rule is `policy._fyi_due`, shared by
+  `plan` and `render_hint`; don't fork it.
 - **`policy` stays pure: no clock reads, no I/O, no randomness.** `now` and the
   token budget are *inputs* to `plan` (`datetime` is passed in; the harness
   passes `datetime.now(UTC)`, the hook the same). A `datetime.now()` or file

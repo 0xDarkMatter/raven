@@ -1,12 +1,16 @@
 """PreToolUse inbox peek.  LANE: hook (raven2-p3).
 
 Runnable as ``python -m raven_bus.adapters.hooks.peek``. ADR-006: this
-hook PEEKS ONLY — it reads the consumer's pending messages, renders them
-via :mod:`raven_bus.policy`, and emits a banner+block when anything is
-deliverable; it NEVER acks and NEVER composes its own message framing.
-The block travels as PreToolUse ``hookSpecificOutput.additionalContext``
-JSON — the only PreToolUse stdout Claude Code shows the model (see
-``_emit``). Silent (empty stdout) when nothing is pending. Always exits 0 — a broken
+hook PEEKS ONLY — it reads the consumer's pending messages and emits
+:func:`raven_bus.policy.render_hint`'s bounded PULL notice (counts, ids,
+senders, the ``raven read`` command — never bodies) when anything is due;
+it NEVER acks and NEVER composes its own text. A notice, not the full
+``policy.render`` block, because this fires on EVERY tool call and never
+acks: re-pushing whole messages repeated the entire backlog each call
+(issue #1). The notice travels as PreToolUse
+``hookSpecificOutput.additionalContext`` JSON — the only PreToolUse stdout
+Claude Code shows the model (see ``_emit``). Silent (empty stdout) when
+nothing is due. Always exits 0 — a broken
 hook must never block a tool call, so EVERY failure path (missing/locked
 DB, bad config, a still-stubbed policy) is swallowed and leaves only a
 single stderr breadcrumb.
@@ -107,18 +111,16 @@ def _peek_inner() -> int:
         # Silent when nothing pending (ADR-006 BLUF).
         return 0
 
-    # policy.plan + policy.render own ALL framing (ADR-003/006) — the
-    # hook never composes message text. A plan that delivers nothing AND
-    # builds no digest must print nothing (an all-fyi-held plan stays
-    # quiet this boundary).
+    # policy owns ALL text (ADR-003/006) — the hook never composes any.
+    # Nothing due (e.g. only fyi still held below digest thresholds)
+    # renders "" and the hook stays quiet this call.
     from raven_bus import policy
 
-    plan = policy.plan(pending, now=datetime.now(UTC))
-    rendered = policy.render(plan)
-    if not rendered:
+    notice = policy.render_hint(pending, consumer=consumer, now=datetime.now(UTC))
+    if not notice:
         return 0
 
-    _emit(consumer, len(pending), rendered)
+    _emit(notice)
     return 0
 
 
@@ -146,9 +148,8 @@ def _read_pending(consumer: str, channels: list[str], db_path: str | None) -> li
     return merged
 
 
-def _emit(consumer: str, count: int, rendered: str) -> None:
-    """Emit the README's banner shape (banner + render + action hint) as
-    ONE line of PreToolUse hook JSON.
+def _emit(context: str) -> None:
+    """Emit ``context`` VERBATIM as ONE line of PreToolUse hook JSON.
 
     Transport, not framing: for PreToolUse, Claude Code writes PLAIN
     stdout to its debug log and never adds it to the model's context —
@@ -156,24 +157,15 @@ def _emit(consumer: str, count: int, rendered: str) -> None:
     (code.claude.com/docs/en/hooks, "Exit code 0" + PreToolUse decision
     control). Printing the text bare was issue #2: the hook fired and
     rendered, the session never saw a byte. ``ensure_ascii`` (json's
-    default) keeps stdout pure ASCII so a body outside the console
+    default) keeps stdout pure ASCII so text outside the console
     codepage (cp1252 on Windows pipes) can't raise inside peek's
-    catch-all and silently drop the delivery.
-
-    The count is the number of messages peeked (pending), per the
-    README's ``=== RAVEN: N message(s) for <consumer> ===`` form. The
-    rendered block already carries sender attribution + data framing
-    (ADR-003); the hook adds only the header and one action-hint line.
+    catch-all and silently drop the delivery. The text itself is
+    policy's (``render_hint``); the hook adds nothing to it.
     """
-    text = (
-        f"=== RAVEN: {count} message(s) for {consumer} ===\n"
-        f"{rendered}\n"
-        "Use your raven tooling (or the CLI: raven read/ack) to act."
-    )
     envelope = {
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
-            "additionalContext": text,
+            "additionalContext": context,
         }
     }
     print(json.dumps(envelope), file=sys.stdout)

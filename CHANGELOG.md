@@ -128,8 +128,8 @@ replaces v1's per-message delivery state with an append-only log + per-channel
   used to die with `UnknownChannelError`).
 - **Claude Code PreToolUse hook** (`src/raven_bus/adapters/hooks/`) — a
   **peek-only** adapter for interactive sessions (ADR-006): on every tool call
-  it reads pending, renders via `policy`, prints a compact block when anything
-  is deliverable, prints nothing when the inbox is empty, **always exits 0**.
+  it reads pending and emits a bounded pull notice from `policy.render_hint`
+  when anything is due (see *Changed*), nothing otherwise, **always exits 0**.
   Config is env-only (`RAVEN_CONSUMER` to activate; `RAVEN_CHANNELS`;
   `RAVEN_DB`). **The hook never acks** — so it can run beside a `raven acp`
   harness on the same consumer without double-delivery. Install is documented,
@@ -155,9 +155,9 @@ replaces v1's per-message delivery state with an append-only log + per-channel
   ([#2](https://github.com/0xDarkMatter/raven/issues/2)). Claude Code sends
   plain PreToolUse stdout to its debug log, never the model's context — the
   hook fired and rendered but sessions never saw a message. It now emits
-  `hookSpecificOutput.additionalContext` JSON (ASCII-only, so a non-ASCII
-  body can't hit a console-codepage error and be silently dropped); the
-  text and `policy.render` framing are unchanged. The wrapper no longer
+  `hookSpecificOutput.additionalContext` JSON (ASCII-only, so non-ASCII
+  text can't hit a console-codepage error and be silently dropped). The
+  text itself is now a pull notice (see *Changed*). The wrapper no longer
   `exec`s python (its `|| true` never ran, so a missing interpreter exited
   127 and raised a hook-error notice on every tool call), ships executable,
   and `*.sh` is pinned to LF via `.gitattributes`.
@@ -170,6 +170,18 @@ replaces v1's per-message delivery state with an append-only log + per-channel
 
 ### Changed
 
+- **The hook announces; the agent pulls**
+  ([#1](https://github.com/0xDarkMatter/raven/issues/1)). The hook fires on
+  every tool call and never acks, so re-injecting the full `policy.render`
+  block repeated the whole backlog on every call — thousands of tokens per
+  call for a modest backlog, and past Claude Code's 10,000-char
+  additionalContext cap it degraded to a file preview. It now emits
+  `policy.render_hint`: one line per channel (count, ids, highest urgency,
+  senders, the exact `raven read` command) plus an ack reminder, hard-capped
+  at 2,000 chars and carrying **no bodies or types**. `fyi` is announced only
+  once ADR-003's digest rule releases it (the same `_fyi_due` rule `plan`
+  uses). The ACP harness still pushes full `render` blocks — it owns the
+  loop and acks after delivery.
 - **Import root renamed `claude_bus` → `raven_bus`** (ADR-004). The CLI stays
   `raven`. The **pip distribution name is undecided** — do not `pip install
   raven` (Sentry's legacy client); install from source (`pip install -e .`)

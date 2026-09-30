@@ -1,9 +1,10 @@
 """Claude Code PreToolUse inbox hook.  LANE: hook (raven2-p3).
 
 A peek-only adapter (ADR-006): on every tool call it reads the consumer's
-pending messages, renders them via :mod:`raven_bus.policy`, and emits a
-compact block as PreToolUse ``additionalContext`` JSON when any are
-deliverable. Silent when the inbox is empty; always exits 0. The real
+pending messages and emits :func:`raven_bus.policy.render_hint`'s bounded
+pull notice as PreToolUse ``additionalContext`` JSON when any are due —
+never the message bodies (the agent pulls those with ``raven read``).
+Silent when nothing is due; always exits 0. The real
 logic lives in :mod:`raven_bus.adapters.hooks.peek` (runnable as
 ``python -m raven_bus.adapters.hooks.peek``); the shell wrapper in this
 directory runs that module with stderr discarded and forces exit 0, so
