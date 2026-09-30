@@ -1,6 +1,6 @@
 # raven2-p3 — fleetflow run plan (P3: policy + ACP harness + hook)
 
-> Status: ready to spawn. Disposable plan — cites, never owns.
+> Status: **executed 2026-08-12 — historical; do not re-run.** Disposable plan — cites, never owns.
 > Decisions: [ADR-003](../adr/ADR-003-injection-in-adapters-messages-are-data.md)
 > (tiers + data framing), [ADR-006](../adr/ADR-006-adapter-architecture.md)
 > (thin adapters, dumb-pipe harness, hook peeks / harness acks).

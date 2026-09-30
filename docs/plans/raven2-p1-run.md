@@ -1,6 +1,6 @@
 # raven2-p1 — fleetflow run plan (P1: core store rewrite)
 
-> Status: ready to spawn. Disposable run plan — cites decisions, never owns
+> Status: **executed 2026-08-12 — historical; do not re-run.** Disposable run plan — cites decisions, never owns
 > them. Governing decisions: [ADR-001](../adr/ADR-001-append-only-log-channel-kind-read-state.md),
 > [ADR-002](../adr/ADR-002-addressing-and-single-host-db.md),
 > [ADR-003](../adr/ADR-003-injection-in-adapters-messages-are-data.md) (P3 —

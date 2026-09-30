@@ -65,6 +65,13 @@ and never acks; the harness acks after delivery):
   stateless (no hook-local "already shown" record), so the hook remains
   read-only. `render_hint` shares `plan`'s fyi due-rule. Only the harness,
   which owns the loop and acks, pushes full `render` blocks.
+- **Hook config (as built).** `RAVEN_CHANNELS` is *required* whenever
+  `RAVEN_CONSUMER` is set (the BLUF's "optional" is superseded): the hook
+  derives no channel names, and a consumer with no channels stays silent.
+  `RAVEN_PYTHON` optionally names the interpreter the wrapper runs.
+- **Client subset (as built).** Besides the BLUF's list, the harness sends
+  `session/set_mode` right after `session/new` when `--mode` is given — a
+  headless lane must leave a prompting permission mode to use tools.
 - **Harness redelivery guard.** The in-memory guard that stops a session
   re-injecting what it already delivered is a set of exact ids. A
   per-channel max hid deferred lower ids from `plan`, breaking the

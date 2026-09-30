@@ -64,7 +64,7 @@ src/raven_bus/
 ├── __init__.py        public re-exports (models, exceptions, __version__)
 ├── models.py          pydantic models + ADR-002 address grammar (atom/consumer/channel validation)
 ├── exceptions.py      RavenBusError hierarchy
-├── paths.py           resolve_db_path() — RAVEN_DB > arg > ~/.raven/bus.db
+├── paths.py           resolve_db_path() — arg > RAVEN_DB > ~/.raven/bus.db
 ├── db.py              init_db(), connection(), data_version(), sweep(), teardown_run()
 ├── channels.py        channel registry (ensure/get/list by kind)
 ├── log.py             append() + read primitives (the only writer of messages rows)
@@ -371,6 +371,13 @@ Config is environment-only:
 | `RAVEN_CONSUMER` | required to activate; absent → silent no-op |
 | `RAVEN_CHANNELS` | comma-separated channel names; required when a consumer is set (no `run/<run>/lane/<role>` derivation — explicit only) |
 | `RAVEN_DB` | optional; the store's normal resolution otherwise |
+| `RAVEN_PYTHON` | optional; interpreter the wrapper runs (default `python` on PATH) |
+
+The wrapper runs `python -m raven_bus.adapters.hooks.peek`, so that interpreter
+must be one `raven_bus` is installed into (Python ≥3.12). With a `uv tool`
+install, or any setup where plain `python` on PATH is a different interpreter,
+set `RAVEN_PYTHON` to the right one (e.g. the tool venv's `python`) — otherwise
+the hook can't import `raven_bus` and silently stays quiet.
 
 Install (documented, not automated) — copy the wrapper somewhere stable and add
 a PreToolUse entry to `~/.claude/settings.json`:
@@ -475,9 +482,10 @@ are documented loudly in `compat.py` and the CHANGELOG:
 
 ## Roadmap
 
-v0.2.0 ships P1 (core store + CLI + compat) and P2 (the optional ravend HTTP
-bridge). Later phases are described in the
-design doc ([§8 Phasing](docs/design/raven2-architecture.md#8-phasing)); this
+v0.2.0 ships P1-P4: the core store + CLI + compat (P1), ravend (P2), the
+adapters (P3) and the fleetflow integration (P4); P5 is open. The phasing
+lives in the design doc
+([§8 Phasing](docs/design/raven2-architecture.md#8-phasing)); this
 section points rather than restates:
 
 - **P2 — ravend:** shipped — the optional loopback HTTP bridge, `raven serve`,
@@ -487,7 +495,7 @@ section points rather than restates:
   the Claude Code PreToolUse hook, sharing one injection-policy module
   `raven_bus.policy` (ADR-003/006 — injection policy lives in adapters, *not*
   the store; the bus never decides when a message enters an agent's context).
-  See [Adapters](#adapters-delivering-into-a-running-agent).
+  See [Adapters](#adapters--delivering-into-a-running-agent).
 - **P4 — fleetflow:** shipped — opt-in bus heartbeats (P4a, fleetflow ADR-022)
   and `ff-spawn --acp` steerable claude lanes (P4b, fleetflow ADR-023: packet
   as trusted boundary 0, verdict from telemetry, `acceptEdits` default).
@@ -496,6 +504,7 @@ section points rather than restates:
 ## Documentation
 
 - [docs/QUICKSTART.md](docs/QUICKSTART.md) — 5-minute walkthrough
+- [docs/00_INDEX.md](docs/00_INDEX.md) — map of everything in docs/
 - [AGENTS.md](AGENTS.md) — developer guide (architecture, landmines, testing)
 - [docs/design/raven2-architecture.md](docs/design/raven2-architecture.md) — the v2 design
 - [docs/adr/](docs/adr/) — decisions of record (ADR-001…006)
@@ -503,8 +512,10 @@ section points rather than restates:
 
 ## Troubleshooting
 
-- **`raven doctor`** — checks the DB is reachable, reports `schema_version`,
-  WAL mode, and a dry sweep tally (`expired`/`requeued`/`dead_lettered`).
+- **`raven doctor`** — checks the DB is reachable, reports `schema_version`
+  and WAL mode, and runs one real sweep (it reaps lapsed leases, exactly as
+  any read would), reporting `expired`/`requeued`/`dead_lettered`. Not a dry
+  run: inspecting a stuck lease with `doctor` requeues it.
 - **Bad address:** consumer ids must be `<role>@<run>` and channel names
   path-style, all lowercase atoms `[a-z0-9][a-z0-9._-]*` — a violation is a
   usage error (exit 2), not a traceback (ADR-002).

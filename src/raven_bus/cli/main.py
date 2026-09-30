@@ -11,11 +11,20 @@ Commands (frozen surface — flags may grow, commands may not):
     raven done      --id ID --as R@RUN                       (complete claim)
     raven release   --id ID --as R@RUN
     raven tail      [--channel C] [--from ID] [--no-follow] [--json]
+                    [--interval S]
                     (identity-free, includes expired — forensic surface)
     raven channels  [--prefix P] [-j]
-    raven doctor    (db reachable, schema version, WAL, sweep dry stats)
+    raven doctor    [--db P]  (db reachable, schema version, WAL; runs one
+                    real sweep and reports its tallies — not a dry run)
     raven teardown  --run RUN [--yes]
     raven version
+    raven serve     [--host H] [--port 7713] [--db P] [--yes-expose]
+                    (ravend, the `[http]` extra — ADR-005)
+    raven acp       --as R@RUN --channel C... [--reply-to C] [--mode M]
+                    [--initial-prompt-file F] ... -- <agent cmd...>
+                    (dumb-pipe ACP harness — ADR-006)
+
+AGENTS.md "CLI surface" carries the full flag list for serve/acp.
 
 Conventions carried from v1: one-line ``error: ...`` on failure, exit
 codes 0 ok / 2 usage / 3 not-found / 10 error, ``-j/--json`` on read

@@ -1,4 +1,4 @@
-"""``raven doctor`` — db reachable, schema version, WAL, sweep dry stats."""
+"""``raven doctor`` — db reachable, schema version, WAL, runs one real sweep (reaps lapsed leases) and reports it."""
 
 from __future__ import annotations
 

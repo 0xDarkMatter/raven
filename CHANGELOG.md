@@ -91,9 +91,10 @@ replaces v1's per-message delivery state with an append-only log + per-channel
   `fyi` → held as a token-capped **digest** until `digest_min_count` (5) pile
   up or the oldest exceeds `digest_max_age_s` (300 s), else `deferred`.
   **Pure and deterministic** — `now` and the token budget are inputs, never
-  read from a clock or I/O. `render()` is the **only** composer of injection
+  read from a clock or I/O. `policy` is the **only** composer of injection
   text (the sender-attributed data framing that **is** the prompt-injection
-  defense); adapters call `plan`+`render` and never build framing themselves.
+  defense); the harness calls `plan`+`render`, the hook `render_hint` (see
+  *Changed*), and neither builds framing itself.
   A `blocking` message is never starved by budget; deferred ids are excluded
   from the plan's `ack_up_to`.
 - **`raven acp`** — a **dumb-pipe** harness (ADR-006) driving an
@@ -215,17 +216,13 @@ in `raven_bus/compat.py`):
 - **`task_id` in body.** v2 has no `task_id` column; the shim carries it under
   `body["__task_id__"]` on send and strips it on read.
 
-## P2+ roadmap
+## Roadmap
 
 The pre-v2 "Phase 2" wish-list (archive/search, persistent aliases, sessions
-table, schema discovery) is superseded by the v2 design. The real roadmap is
-the phasing in [docs/design/raven2-architecture.md §8](docs/design/raven2-architecture.md#8-phasing):
-
-- **P2 — ravend:** loopback HTTP read+write, SSE tail, Process-Compose registration.
-- **P3 — adapters:** shipped — `raven acp` harness + Claude Code hook adapter;
-  shared injection-policy module (ADR-003/006; see *Added — adapters (P3)* above).
-- **P4 — fleetflow:** `ff-spawn --acp`, heartbeat switch, `ff-clean` teardown, dashboard SSE.
-- **P5 — bridges:** raven↔Buzz relay.
+table, schema discovery) is superseded by the v2 design. The roadmap lives in
+[docs/design/raven2-architecture.md §8](docs/design/raven2-architecture.md#8-phasing):
+P1-P4 shipped in 0.2.0 (store + CLI, ravend, adapters, fleetflow
+integration); P5 (raven↔Buzz relay) is open.
 
 ## [0.1.1] — 2026-04-25
 
@@ -306,6 +303,6 @@ The hackathon ship target — minimum viable bus that tells the
   internal store still uses Raven's four-state model (`sent`, `delivered`,
   `resolved`, `expired`) and the BusClient maps between them.
 
-[Unreleased]: https://github.com/0xDarkMatter/raven/compare/v0.1.1...HEAD
+[0.2.0]: https://github.com/0xDarkMatter/raven/compare/v0.1.1...HEAD
 [0.1.1]: https://github.com/0xDarkMatter/raven/releases/tag/v0.1.1
 [0.1.0]: https://github.com/0xDarkMatter/raven/releases/tag/v0.1.0

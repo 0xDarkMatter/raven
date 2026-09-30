@@ -17,7 +17,7 @@ def cmd_release(
     ),
     db_path: Path | None = typer.Option(None, "--db", help="DB path override."),  # noqa: B008
 ) -> None:
-    """Release a leased message back to the queue, deliveries unaffected."""
+    """Release a leased message back to the queue, deliveries reset to 0 (does not count toward dead-lettering)."""
     with handle_errors():
         models.parse_consumer_id(as_)
         db.init_db(db_path)

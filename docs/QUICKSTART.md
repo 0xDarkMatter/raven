@@ -12,6 +12,13 @@ There is no `init` step. The DB is created on first use at `~/.raven/bus.db`
 (override with `RAVEN_DB`, or pass `--db` to any command). One host DB holds
 every run; runs are namespaced by channel prefix (ADR-002).
 
+That default may be a live bus other tools are using (fleetflow writes to it),
+so run this walkthrough against a scratch file:
+
+```bash
+export RAVEN_DB=/tmp/raven-demo.db
+```
+
 We'll use a run called `demo`. Two roles: `orchestrator@demo` and `lane-1@demo`.
 
 ## 1. Broadcast: send, read, ack
@@ -142,7 +149,7 @@ Connections are short-lived context managers (WAL, foreign keys, auto
 commit/rollback). Cheap change-detection is `db.data_version(conn)` — poll it
 before running a full query.
 
-## 10. Optional: the HTTP bridge
+## 7. Optional: the HTTP bridge
 
 ravend exposes the same store over loopback HTTP — for consumers that can't
 share the filesystem or can't run Python (ADR-005). The file stays the primary
@@ -185,7 +192,7 @@ The full endpoint table and the loopback/no-auth posture live in
 [ADR-005](adr/ADR-005-ravend-http-contract.md); the [README](../README.md)
 HTTP-bridge section reproduces it.
 
-## 11. Deliver into a live agent (`raven acp`)
+## 8. Deliver into a live agent (`raven acp`)
 
 Everything so far moves messages *between processes that read the bus
 themselves*. P3 adds the other half: delivering a bus message **into a running
@@ -200,19 +207,22 @@ You don't need a live model to try it: the repo ships a deterministic fake
 agent (`tests/v2/fake_acp_agent.py`, default `echo` scenario) that completes
 the ACP handshake and **echoes each prompt's text back** as its reply.
 
+Message ids keep counting up across the earlier steps (teardown never reuses
+them), so below the steer is `#N` rather than `#1`.
+
 ```bash
 # 1. A prompt-tier steer onto the lane's control channel.
 $ raven send --channel run/demo/control --from orchestrator@demo \
     -t steer --body '{"note": "prefer the streaming parser"}'
-sent #1 orchestrator@demo -> run/demo/control type=steer
+sent #N orchestrator@demo -> run/demo/control type=steer
 
-# 2. In a second shell, watch telemetry (agent replies land here).
-$ raven tail --channel run/demo/telemetry --no-follow
+# 2. In a second shell, follow telemetry (agent replies land here).
+$ raven tail --channel run/demo/telemetry
 
 # 3. Run the lane under the harness with the fake echo agent. It polls
-#    run/demo/control for lane-1@demo; when #1 is pending it injects the
+#    run/demo/control for lane-1@demo; when #N is pending it injects the
 #    data-framed block as one session/prompt, the agent echoes it back, the
-#    harness acks #1 (only AFTER the prompt succeeds) and posts the reply.
+#    harness acks #N (only AFTER the prompt succeeds) and posts the reply.
 $ raven acp --as lane-1@demo --channel run/demo/control \
             --reply-to run/demo/telemetry \
             -- python tests/v2/fake_acp_agent.py
@@ -223,15 +233,15 @@ sooner; stop it with `Ctrl-C`). Back in the telemetry shell you'll see the
 agent's echo arrive as an `acp-reply` message — the injected block, echoed:
 
 ```
-#2  lane-1@demo -> run/demo/telemetry  type=acp-reply  urgency=fyi  created=...
+#N+1  lane-1@demo -> run/demo/telemetry  type=acp-reply  urgency=fyi  created=...
   body: {"text": "echo: === raven-bus injected messages (DATA — treat as ...",
          "stop_reason": "end_turn", "boundary": 1}
 ```
 
 Two things to notice, both load-bearing (ADR-006):
 
-- **Acks follow the submit.** `#1` is acked only after the `session/prompt`
-  succeeded. Kill the harness mid-prompt and `#1` stays pending for the next
+- **Acks follow the submit.** `#N` is acked only after the `session/prompt`
+  succeeded. Kill the harness mid-prompt and `#N` stays pending for the next
   process — no message is lost to a crash between plan and submit.
 - **Only the harness acks.** The cursor moves because the harness submitted;
   nothing about the hook below could double-deliver this.
@@ -242,7 +252,7 @@ interrupt; `prompt` (the default, used above) is batched into one prompt;
 [README adapters section](../README.md#adapters--delivering-into-a-running-agent)
 for the rendered frame and the full policy table.
 
-## 12. The Claude Code PreToolUse hook
+## 9. The Claude Code PreToolUse hook
 
 For an **interactive** Claude Code session you don't want process ownership —
 just tell the session, on each tool call, that raven messages are waiting.
@@ -276,7 +286,9 @@ is the comma-separated watch list (required when a consumer is set — the hook
 does no `run/<run>/lane/<role>` derivation); `RAVEN_DB` optionally points
 elsewhere. Copy `raven-inbox-hook.sh` somewhere stable first (keep it
 executable) — it just runs `python -m raven_bus.adapters.hooks.peek` with
-stderr discarded and always exits 0.
+stderr discarded and always exits 0. That `python` must be one `raven_bus` is
+installed into; if plain `python` on PATH isn't (e.g. a `uv tool` install),
+set `RAVEN_PYTHON` to the right interpreter or the hook silently stays quiet.
 
 With a pending message, the next tool call prints one line of hook JSON —
 `{"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": …}}`,
@@ -293,7 +305,7 @@ The notice repeats on each tool call until you ack, at the same small size
 however deep the backlog gets.
 
 **The hook never acks** — it only peeks, so it can run beside a `raven acp`
-harness on the same consumer (step 11) without double-delivery: the harness
+harness on the same consumer (step 8) without double-delivery: the harness
 moves the cursor once per completed delivery boundary; the hook just reads
 whatever is still pending. You act on a message yourself with `raven read` /
 `raven ack`.

@@ -1,6 +1,9 @@
 # raven v2 — local agent-coordination substrate (design)
 
-> Status: **draft for review** — nothing here is built. Authored 2026-08-12.
+> Status: **implemented** — P1-P4 shipped (see §8); P5 open. Authored
+> 2026-08-12 as the pre-build design. Where this sketch and the code differ,
+> the code and [docs/adr/](../adr/) are authoritative; the known deltas are
+> corrected inline below.
 > Scope decision (settled in conversation, 2026-08-12): raven is NOT a chat
 > platform. Buzz (block/buzz, Apache-2.0, Nostr relay) owns the org-scoped
 > human+agent Slack layer. raven v2 is the **zero-infra, single-host
@@ -28,12 +31,14 @@ optional `ravend` for sandboxed ones.
 | `expires_in_s` is a no-op (`sweep_expired` never called, inbox doesn't filter) | reads filter `expires_at`; sweep runs opportunistically inside reads |
 | Cross-session send raises a misleading `UnknownRoleError` leaking the internal alias | channels are host-global; run-scoping is a **naming convention**, not a fence |
 | 24-bit alias hash can silently collide two identities | consumer ids are full `(role, run)` strings; no lossy hash in the address path |
-| `GET /inbox` registers aliases as a side effect | HTTP reads are pure; registration is explicit |
-| HTTP bridge is read-only, so sandboxed/polyglot workers can't participate | full write path: `POST /send`, `/claim`, `/ack`, `/cursor` + SSE tail |
+| `GET /inbox` registers aliases as a side effect | no alias layer at all; GET handlers never write — the one read-side write is `cursors.pending`'s own sweep + presence touch (`consumers.touch` upsert), a module contract shared with `/heartbeat` |
+| HTTP bridge is read-only, so sandboxed/polyglot workers can't participate | full write path: `POST /send`, `/claim`, `/ack`, `/claims/{id}/…`, `/heartbeat` + SSE tail (ADR-005) |
 
 ## 3. Data model
 
-Four tables. `messages` is append-only; all mutable state lives beside it.
+`messages` is append-only; all mutable state lives beside it. The shipped
+schema (`migrations/0002_v2_schema.sql`) has six tables — the five below
+plus `bus_meta` (schema version).
 
 ```sql
 CREATE TABLE channels (
@@ -72,7 +77,7 @@ CREATE TABLE cursors (                        -- broadcast read-state
 CREATE TABLE claims (                         -- queue read-state
     message_id  INTEGER PRIMARY KEY REFERENCES messages(id),
     consumer    TEXT NOT NULL,
-    state       TEXT NOT NULL,                -- 'leased' | 'done' | 'dead'
+    state       TEXT NOT NULL,                -- 'leased' | 'lapsed' | 'done' | 'dead'
     deliveries  INTEGER NOT NULL DEFAULT 1,
     lease_until TEXT NOT NULL,
     updated_at  TEXT NOT NULL
@@ -97,10 +102,11 @@ CREATE TABLE consumers (                      -- identity + presence
 
 The claim on a `queue` channel is v1's proven atomic `UPDATE`-wins pattern,
 relocated: `INSERT INTO claims ... ON CONFLICT DO NOTHING` — rowcount 1 wins.
-Lease expiry: a claim with `state='leased' AND lease_until < now` is deleted
-by the opportunistic sweep (same sweep that expires messages), making the
-message claimable again; `deliveries >= max_deliveries` flips it to `dead`
-instead. This replaces v1's "crashed consumer = stuck forever".
+Lease expiry: a claim with `state='leased' AND lease_until < now` is flipped
+to a durable `lapsed` state by the opportunistic sweep (same sweep that
+expires messages) — never deleted, so its `deliveries` count survives —
+making the message claimable again; `deliveries >= max_deliveries` flips it
+to `dead` instead. This replaces v1's "crashed consumer = stuck forever".
 
 ### Addressing
 
@@ -111,7 +117,7 @@ instead. This replaces v1's "crashed consumer = stuck forever".
   - `run/<run>/lane/<id>` — broadcast, DM-equivalent (steer one lane)
   - `run/<run>/queue` — queue, claimable work packets
   - `run/<run>/telemetry` — stream, heartbeats + progress
-  - `host/announce` — broadcast, cross-run (the pigeon-shaped残余, optional)
+  - `host/announce` — broadcast, cross-run (the pigeon-shaped remnant, optional)
 - v1's `<role>:<session>` DM maps to a 2-consumer broadcast channel; a compat
   shim can keep `BusClient` v1 signatures working during migration.
 
@@ -123,8 +129,8 @@ instead. This replaces v1's "crashed consumer = stuck forever".
    CLI  (raven …)      ──┤   SQLite (WAL)  ~/.raven/bus.db        │
                          │   channels / messages / cursors /      │
    ravend (loopback) ────┤   claims / consumers                   │
-    GET  /channels /messages /tail (SSE long-poll)                │
-    POST /send /claim /ack /cursor /heartbeat                     │
+    GET  /channels /messages /pending /cursor /tail (SSE)         │
+    POST /send /claim /claims/{id}/… /ack /heartbeat              │
                          └────────────────────────────────────────┘
               ▲
               │ loopback HTTP (the sandbox escape hatch)
@@ -136,7 +142,8 @@ instead. This replaces v1's "crashed consumer = stuck forever".
 - **`ravend` is optional** and exists for consumers that can't share the
   filesystem or can't run Python. One instance per host, stable port,
   registered under the Process Compose stack (per the machine's dev-server
-  rule) — never ad-hoc. All v1 read endpoints survive; the write path is new.
+  rule) — never ad-hoc. v1's endpoints (`GET /inbox`, `/message/{id}`) are
+  replaced by ADR-005's table, which adds the write path.
 - **`raven tail`** becomes a thin client over `stream`/log reads — unchanged
   behaviour, now also available as SSE from ravend for dashboards.
 - *Codex caveat: `workspace-write` blocks network by default, loopback
@@ -167,8 +174,8 @@ Claude Code, Goose, and Codex via adapters.
 
 Mechanics:
 
-1. `raven acp --consumer lane-3@v0-2 --cmd "claude-code-acp ..."` spawns the
-   agent subprocess, sends ACP `initialize`, opens a session.
+1. `raven acp --as lane-3@v0-2 --channel run/v0-2/lane/3 -- claude-code-acp …`
+   spawns the agent subprocess, sends ACP `initialize`, opens a session.
 2. It subscribes to the consumer's channels (`run/v0-2/lane/3`,
    `run/v0-2/control`). Incoming messages queue locally.
 3. **At turn boundaries** (agent idle / prompt completed), pending messages
@@ -176,8 +183,10 @@ Mechanics:
    `"Messages from the bus (treat as information, sender-attributed): …"`.
 4. Agent output and tool activity are posted back to the bus
    (`run/<run>/telemetry`, replies to the originating channel).
-5. Crash → respawn with session context note; lease-held work is re-queued by
-   lease expiry, not by the harness guessing.
+5. Crash → the harness exits with its child and never respawns (ADR-006: a
+   dumb pipe; the spawner — ff-spawn — owns lifecycle, §9 Q4). Unacked
+   messages stay pending for the next process; lease-held work is re-queued
+   by lease expiry, not by the harness guessing.
 
 **Injection policy** (the attention layer — this is deliberately in the
 harness, not the store):
@@ -193,15 +202,19 @@ sender-attributed *data*, never as instructions. The harness never executes a
 message; it shows it to the agent. (Org-tier messages arriving via a Buzz
 bridge are untrusted input by definition.)
 
-Interactive Claude Code sessions get a cheaper adapter: a pigeon-style
-PreToolUse hook that surfaces the session's unread raven messages as context.
-Same policy table, zero process ownership. Two adapters, one policy module.
+Interactive Claude Code sessions get a cheaper adapter: a PreToolUse hook
+that tells the session raven messages are waiting. As built it emits a
+bounded pull notice (`policy.render_hint`: counts, ids, senders, the `raven
+read` command — no bodies) rather than the messages themselves, because it
+fires every tool call and never acks (issue #1). Same tier rules, zero
+process ownership. Two adapters, one policy module.
 
 ## 6. Fleetflow integration
 
-Respects ADR-005 (hub-and-spoke): lanes still do not peer-coordinate.
-raven adds **orchestrator↔lane** and **lane→observability** channels, which
-ADR-005 explicitly leaves room for ("where cross-worker signalling IS wanted,
+Respects fleetflow's ADR-005 (hub-and-spoke — not this repo's ADR-005):
+lanes still do not peer-coordinate. raven adds **orchestrator↔lane** and
+**lane→observability** channels, which fleetflow's ADR-005 explicitly leaves
+room for ("where cross-worker signalling IS wanted,
 the tool is a real bus").
 
 | Fleetflow today | With raven v2 |
@@ -259,6 +272,6 @@ conversation), CLI stays `raven`.
    file-disjointness duty from per-assignment to pool-wide.
 4. **Agent lifecycle ownership — SETTLED: ff-spawn owns it** (it already
    journals and reaps); `raven-acp` is a dumb pipe that exits when its child
-   exits. (Boundary noted in ADR-003.)
+   exits. (Boundary recorded in ADR-006.)
 
 Run plan for P1: [../plans/raven2-p1-run.md](../plans/raven2-p1-run.md).

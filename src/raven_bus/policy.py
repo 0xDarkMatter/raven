@@ -3,9 +3,10 @@
 FROZEN signatures (wave-0). The ENTIRE brain of message delivery into a
 running agent session (ADR-003/006): pure, deterministic functions —
 no I/O, no clock reads (``now`` is an input), no randomness. Adapters
-(the ACP harness, the hook) call ``plan`` then ``render`` and MUST NOT
-compose injection text themselves — the sender-attributed data framing
-produced here IS the prompt-injection defense.
+call it — the ACP harness ``plan`` then ``render``, the hook
+``render_hint`` — and MUST NOT compose injection text themselves: the
+sender-attributed data framing produced here IS the prompt-injection
+defense. (tests/v2/test_invariants.py enforces the purity mechanically.)
 
 Tier semantics (ADR-003, restated as the enforcement site):
 

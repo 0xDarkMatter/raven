@@ -23,19 +23,16 @@ coordination.
 ## Run & test
 
 ```bash
-# Full suite (the gate)
-python -m pytest tests/ -p no:cacheprovider --tb=short -q
-
-# Coverage is locked at 100%
-python -m pytest tests/ --cov=raven_bus --cov-fail-under=100 -q
-
-# One v2 module's tests
-python -m pytest tests/v2/test_claims.py -q
+just check      # THE gate: ruff + full suite at 100% coverage (run before landing)
+just test       # full suite, no coverage (fast loop); `just test -k claims` filters
+python -m pytest tests/v2/test_claims.py -q   # one module's tests
 ```
 
 Every code change ships its tests in the same change. New code with no test
-fails the 100% gate. v2 tests live under `tests/v2/`; the legacy v1 suite
-(`tests/unit/`, `tests/integration/`) stays untouched until retired.
+fails the 100% gate. Tests: `tests/v2/` (unit, one file per module) and
+`tests/integration/` (subprocess runs of `examples/01-04`; 03/04 exercise the
+compat shim). `tests/v2/test_invariants.py` turns the landmines below into
+failing tests — if it fails, read the landmine before touching its allowlist.
 
 ## Architecture map
 
@@ -54,6 +51,7 @@ src/raven_bus/
 ├── log.py        append() (the ONLY messages writer) + read_after/read_by_id/read_thread
 ├── cursors.py    broadcast: pending() + ack() (cursor-jump only) + get_cursor()
 ├── claims.py     queue: claim_next / renew / complete / release / get_claim
+├── consumers.py  touch() — the ONLY writer of `consumers` (heartbeat + upsert)
 ├── compat.py     v1 BusClient shim on the v2 store (deprecated, one release)
 ├── policy.py     THE attention layer (ADR-003/006) — plan() + render() (push form,
 │                 the harness) and render_hint() (bounded pull notice, the hook); pure,
@@ -65,7 +63,8 @@ src/raven_bus/
 │                 read.py / write.py / sse.py = the 1:1 handlers; cli/serve.py runs it
 ├── adapters/     deliver bus messages INTO a running agent session (ADR-006 — THIN):
 │   ├── acp/      protocol.py = minimal ACP client (JSON-RPC 2.0 over the child's
-│   │             stdio: initialize/session/new/session/prompt/session/update/cancel);
+│   │             stdio: initialize, session/new, session/set_mode (--mode),
+│   │             session/prompt, session/update, session/cancel);
 │   │             harness.py = the dumb-pipe loop (gather pending → plan → deliver → ack-after)
 │   └── hooks/    Claude Code PreToolUse hook: peek.py (runnable as a module) +
 │                 raven-inbox-hook.sh (trivial wrapper, forces exit 0). PEEK-ONLY —
@@ -104,7 +103,15 @@ Treat each as a build-breaker if violated. The decision text owns the *why*.
   `claim_next` re-wins a lapsed row via a guarded `UPDATE … WHERE
   state='lapsed'` that increments `deliveries` atomically — there is no
   caller-side snapshot, so any sweep call site is harmless to dead-letter
-  accounting. A voluntary `release` deletes the row and does not count.
+  accounting. A voluntary `release` flips the row to `lapsed` with
+  `deliveries=0` (immediately re-claimable, doesn't count) — **never
+  delete** a claim row: a deleted row falls below every process's claim
+  frontier and the message becomes unclaimable.
+- **There is no migration chain — `~/.raven/bus.db` is live (fleetflow).**
+  `init_db` skips the SQL when the stored `schema_version` matches, so
+  editing `0002_v2_schema.sql` in place never reaches existing DBs; and it
+  *refuses* any other version, so bumping `SCHEMA_VERSION` bricks every
+  existing DB. A schema change needs a real, tested migration step first.
 
 ## Landmines — the HTTP bridge (ADR-005)
 
@@ -120,7 +127,9 @@ frozen in `http/app.py`'s route table (= ADR-005's endpoint table).
 - **GET handlers never write.** v1's `GET /inbox` registered alias rows as a
   side effect — that bug class is the reason this line exists. (The one nuance:
   `GET /pending` calls `cursors.pending`, which by module contract runs the
-  opportunistic sweep and bumps `last_seen_at`. That is the *module's* write,
+  opportunistic sweep and upserts the consumer's presence row via
+  `consumers.touch` — a never-seen consumer gets registered, like
+  `/heartbeat` (ADR-005 Amendment). That is the *module's* write,
   not the handler's — the handler still makes exactly one contract call.)
 - **The claim frontier is a pure per-process optimisation.** `claims._FRONTIER`
   is an in-memory `{(db_path, channel_id): id}` watermark that lets a warm
@@ -243,7 +252,9 @@ raven channels  [--prefix P] [-j]
 raven doctor    [--db P]
 raven teardown  --run RUN [--yes]
 raven version
-raven serve    [--host 127.0.0.1] [--port 7713] [--db P]   (run ravend under uvicorn; `[http]` extra)
+raven serve    [--host 127.0.0.1] [--port 7713] [--db P] [--yes-expose]
+                                                            (run ravend under uvicorn; `[http]` extra;
+                                                             non-loopback --host needs --yes-expose)
 raven acp      --as R@RUN --channel C [--channel C]... [--reply-to C]
                [--db P] [--poll-interval S] [--budget N] [--cwd .]
                [--mode M] [--initial-prompt-file F] -- <agent cmd...>

@@ -54,7 +54,7 @@ def _parse_channels(raw: str) -> list[str]:
 
 
 def peek() -> int:
-    """Read env, validate, peek pending, print banner+render. Exit 0.
+    """Read env, validate, peek pending, emit render_hint as JSON. Exit 0.
 
     The whole body is wrapped in ``except BaseException`` so that a
     missing or locked DB, a stubbed policy, or any store error leaves

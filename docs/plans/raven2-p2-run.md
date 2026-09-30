@@ -1,6 +1,6 @@
 # raven2-p2 — fleetflow run plan (P2: ravend + claim frontier)
 
-> Status: ready to spawn. Disposable plan — cites, never owns.
+> Status: **executed 2026-08-12 — historical; do not re-run.** Disposable plan — cites, never owns.
 > Decisions: [ADR-005](../adr/ADR-005-ravend-http-contract.md) (HTTP
 > contract), [ADR-001/002/004](../adr/) (store invariants, addressing,
 > naming). Architecture: [raven2-architecture.md](../design/raven2-architecture.md) §4/§8.

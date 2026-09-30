@@ -78,6 +78,22 @@ The verify wave hardened the contract without changing the route table:
 - **`consumers.touch()`** is the store contract behind `/heartbeat`,
   ending the raw-SQL drift this ADR's thin-bridge rule forbade.
 
+## Amendment (2026-09-30, QA pass)
+
+Two behaviours the BLUF under-specified, recorded as deliberate:
+
+- **Claim ops on an unheld id return 409, not 404.** `POST
+  /claims/{id}/{renew,done,release}` answers 409 `conflict` whenever the
+  caller does not hold a leased claim on that id — including when no such
+  message exists. The claims module reports "you don't hold it" without a
+  separate existence probe; the 404 row in the BLUF applies to unknown
+  *channels* and to reads.
+- **`GET /pending` touches the consumer's presence row.** Via
+  `cursors.pending`'s module contract (the same `consumers.touch` upsert as
+  `/heartbeat`), a first read by a never-seen consumer registers it. That is
+  a module-contract write, not handler logic — GET handlers themselves still
+  never write.
+
 ## Consequences
 
 - Port 7713 (unclaimed in the machine port registry as of 2026-08-12).
