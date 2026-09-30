@@ -1,7 +1,11 @@
 [project]
+# PLACEHOLDER dist name (ADR-004): the distribution name is UNDECIDED.
+# "raven" on PyPI is Sentry's legacy client - NEVER publish under it (or
+# any name) without a fresh decision. Install from source: pip install -e .
 name = "raven"
-version = "0.1.1"
-description = "SQLite-backed role-addressable message bus for agent sessions"
+# Single-sourced from raven_bus.__version__ (see [tool.hatch.version]).
+dynamic = ["version"]
+description = "Channel-based coordination bus for multi-agent runs: an append-only SQLite log with broadcast, queue and stream channels"
 authors = [{ name = "0xDarkMatter" }]
 license = { text = "MIT" }
 readme = "README.md"
@@ -16,9 +20,7 @@ classifiers = [
 ]
 dependencies = [
     "pydantic>=2.0",
-    "structlog>=24.0",
     "typer>=0.12",
-    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -42,6 +44,11 @@ Homepage = "https://github.com/0xDarkMatter/raven"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+# The ONE version string lives in the package (__version__ = "..."), so
+# importlib.metadata / pip / uv report what `raven version` prints.
+path = "src/raven_bus/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/raven_bus"]

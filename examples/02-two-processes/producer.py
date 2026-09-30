@@ -18,7 +18,7 @@ PRODUCER = "producer@demo"
 
 
 def _default_db() -> Path:
-    """``$RAVEN_DB`` if set, else ``./bus.db`` next to this script."""
+    """``$RAVEN_DB`` if set, else ``bus.db`` next to this script (not the cwd)."""
     env = os.environ.get("RAVEN_DB")
     return Path(env) if env else Path(__file__).with_name("bus.db")
 
@@ -50,7 +50,7 @@ def _parse_args() -> argparse.Namespace:
         "--db",
         type=Path,
         default=None,
-        help="SQLite path (default: $RAVEN_DB, else ./bus.db)",
+        help="SQLite path (default: $RAVEN_DB, else bus.db next to this script)",
     )
     return parser.parse_args()
 

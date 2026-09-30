@@ -38,6 +38,14 @@ _CHANNELS = "raven_bus.compat.channels"
 
 _NOW = datetime(2026, 8, 12, 12, 0, 0, tzinfo=UTC)
 
+# Every BusClient construction warns (ADR-004: deprecated from day one).
+# That's asserted once, explicitly, in TestDeprecation; everywhere else it
+# is expected noise, so filter exactly that message (other warnings still
+# surface in the summary).
+pytestmark = pytest.mark.filterwarnings(
+    "ignore:raven_bus.compat.BusClient is deprecated:DeprecationWarning"
+)
+
 
 def _v2msg(
     *,
@@ -421,7 +429,7 @@ class TestInboxReadAck:
             patch(_LOG) as log_mod,
             patch(_CURSORS) as cur_mod,
         ):
-            log_mod.read_by_id.return_value = _v2msg(mid=7)
+            log_mod.read_by_id.return_value = _v2msg(mid=7, channel="compat/s1/bob")
             c.ack(7)
         cur_mod.ack.assert_called_once()
         call = cur_mod.ack.call_args
@@ -441,6 +449,68 @@ class TestInboxReadAck:
             with pytest.raises(UnknownMessageError):
                 c.ack(404)
         cur_mod.ack.assert_not_called()                  # cursor untouched
+
+    @pytest.mark.usefixtures("stub_store")
+    def test_ack_foreign_channel_id_is_noop(self) -> None:
+        # Ids are global: acking a message on ANOTHER client's channel
+        # (here one bob sent to alice) must not jump bob's own cursor.
+        c = BusClient(session_id="s1", role="bob")
+        with (
+            patch(_LOG) as log_mod,
+            patch(_CURSORS) as cur_mod,
+        ):
+            log_mod.read_by_id.return_value = _v2msg(
+                mid=6, channel="compat/s1/alice", sender="bob@s1"
+            )
+            assert c.ack(6) is None                      # no error (v1 parity)
+        cur_mod.ack.assert_not_called()
+
+    @pytest.mark.usefixtures("stub_store")
+    def test_read_foreign_message_uses_recipient_cursor(self) -> None:
+        # A message bob SENT lives on alice's channel: its status is
+        # alice's read-state there, never bob's own-channel cursor.
+        c = BusClient(session_id="s1", role="bob")
+        with (
+            patch(_LOG) as log_mod,
+            patch(_CURSORS) as cur_mod,
+        ):
+            log_mod.read_by_id.return_value = _v2msg(
+                mid=6, channel="compat/s1/alice", sender="bob@s1"
+            )
+            cur_mod.get_cursor.return_value = None
+            msg = c.read(6)
+        assert cur_mod.get_cursor.call_args.args[1:] == ("alice@s1", "compat/s1/alice")
+        assert msg.status == "unread"
+
+    @pytest.mark.usefixtures("stub_store")
+    def test_read_non_compat_channel_uses_own_consumer(self) -> None:
+        # A native v2 channel has no v1 recipient: fall back to this
+        # client's consumer on THAT channel.
+        c = BusClient(session_id="s1", role="bob")
+        with (
+            patch(_LOG) as log_mod,
+            patch(_CURSORS) as cur_mod,
+        ):
+            log_mod.read_by_id.return_value = _v2msg(mid=3, channel="run/s1/control")
+            cur_mod.get_cursor.return_value = None
+            c.read(3)
+        assert cur_mod.get_cursor.call_args.args[1:] == ("bob@s1", "run/s1/control")
+
+    @pytest.mark.usefixtures("stub_store")
+    @pytest.mark.parametrize("role", ["Bob", "BOB", "bob", "Bob:S1", "bob:s1"])
+    def test_inbox_role_is_case_folded_like_constructor(self, role: str) -> None:
+        # BusClient("S1", "Bob") folds to bob:s1; inbox(role=...) must
+        # accept the same spellings the constructor did.
+        c = BusClient(session_id="S1", role="Bob")
+        with patch(_CURSORS) as cur_mod:
+            cur_mod.pending.return_value = []
+            assert c.inbox(role=role) == []
+
+    @pytest.mark.usefixtures("stub_store")
+    def test_inbox_non_str_role_raises(self) -> None:
+        c = BusClient(session_id="s1", role="bob")
+        with pytest.raises(ValueError, match="own role"):
+            c.inbox(role=7)  # type: ignore[arg-type]
 
 
 # =====================================================================
@@ -521,6 +591,26 @@ class TestSubscribe:
             asyncio.run(drive())
 
     @pytest.mark.usefixtures("stub_store")
+    def test_subscribe_role_is_case_folded(self) -> None:
+        c = BusClient(session_id="Demo", role="Carol")
+        with (
+            patch(_CURSORS) as cur_mod,
+            patch.object(c, "ack"),
+        ):
+            cur_mod.pending.return_value = [
+                _v2msg(mid=1, channel="compat/demo/carol", sender="alice@demo"),
+            ]
+
+            async def drive() -> Message:
+                async for m in c.subscribe(role="Carol:Demo", poll_interval_s=0):
+                    return m
+                raise AssertionError("subscribe yielded nothing")
+
+            import asyncio
+
+            assert asyncio.run(drive()).id == 1
+
+    @pytest.mark.usefixtures("stub_store")
     def test_subscribe_cancellation_propagates(self) -> None:
         # An empty inbox + sleep that gets cancelled must surface
         # CancelledError, not swallow it.
@@ -544,6 +634,22 @@ class TestSubscribe:
 
 class _StopLoop(Exception):
     """Sentinel to break out of the infinite subscribe loop in tests."""
+
+
+# =====================================================================
+# Deprecation: every construction warns (ADR-004)
+# =====================================================================
+
+
+class TestDeprecation:
+    @pytest.mark.usefixtures("stub_store")
+    def test_construction_emits_deprecation_warning_at_caller(self) -> None:
+        with pytest.warns(DeprecationWarning, match="raven_bus.compat.BusClient") as rec:
+            BusClient(session_id="s1", role="alice")
+        assert len(rec) == 1                             # once per construction
+        # stacklevel=2 -> attributed to THIS file (the caller), which is
+        # what keeps it hidden by default outside __main__.
+        assert rec[0].filename == __file__
 
 
 # =====================================================================
@@ -625,3 +731,27 @@ def test_e2e_send_inbox_ack_read(tmp_path: Path) -> None:
 
     reread = bob.read(sent.id)
     assert reread.status == "read"                         # cursor now past id
+
+
+@pytest.mark.skipif(
+    not _store_implemented(),
+    reason="v2 store siblings are stubs in this worktree; mapping is covered by mocks above",
+)
+def test_e2e_ack_of_foreign_id_keeps_own_unread(tmp_path: Path) -> None:
+    """QA regression: bob has m5 unread; bob sends m6 to alice; bob.ack(m6)
+    used to jump bob's cursor to 6 and silently lose m5."""
+    db_path = tmp_path / "bus.db"
+    alice = BusClient(session_id="s1", role="alice", db_path=db_path)
+    bob = BusClient(session_id="s1", role="bob", db_path=db_path)
+
+    m5 = alice.send(to=bob.address, type="t", body={"n": 5})
+    m6 = bob.send(to=alice.address, type="t", body={"n": 6})
+    assert m6.id > m5.id
+
+    bob.ack(m6.id)                                          # foreign id: no-op
+    assert [m.id for m in bob.inbox()] == [m5.id]           # m5 NOT lost
+    assert [m.id for m in alice.inbox()] == [m6.id]         # alice untouched
+    assert bob.read(m6.id).status == "unread"               # alice hasn't read it
+
+    alice.ack(m6.id)
+    assert bob.read(m6.id).status == "read"                 # recipient's state
