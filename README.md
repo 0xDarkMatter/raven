@@ -25,15 +25,21 @@ lanes (fleetflow ADR-022/ADR-023 record that integration's contract).
 > would pull Sentry's legacy client — install from source until naming is
 > settled (ADR-004): `pip install -e .`
 
-## Recent updates
+## Recent Updates
 
-**v0.2.0 (unreleased)** is a breaking rewrite. raven v2 replaces v1's
-per-message `status` column with an append-only log + per-channel-kind
-read-state, fixes crash-stranded queues with lease auto-requeue, renames
-the import root to `raven_bus`, and adds P3 **adapters** — `raven acp`
-and the Claude Code hook — for delivering bus messages *into* a running
-agent session. See [CHANGELOG.md](CHANGELOG.md) and the
-[v1→v2 migration](#v1v2-migration) section.
+**v0.2.0** (October 2026) — a breaking rewrite; see [v1→v2 migration](#v1v2-migration)
+
+*   🪵 **Append-only channel log** - v1's per-message status column is gone: one SQLite log split into broadcast, queue and stream channels, with cursor-jump acks and leased claims that auto-requeue after a crash and dead-letter after N attempts. The import root is now `raven_bus`; v1 code runs on the deprecated `raven_bus.compat` shim.
+*   🌉 **ravend HTTP bridge** - `raven serve` (the `[http]` extra) exposes the store read + write + SSE over loopback for sandboxed and non-Python workers, behind a frozen route table ([ADR-005](docs/adr/ADR-005-ravend-http-contract.md)).
+*   🔌 **Delivery into running agents** - `raven acp` drives an [ACP](https://agentclientprotocol.com) agent and injects bus messages at turn boundaries as sender-attributed data; a Claude Code PreToolUse hook announces waiting messages, which agents pull with `raven read --framed`.
+*   🛰️ **fleetflow's live bus** - raven now carries [fleetflow](https://github.com/0xDarkMatter/fleetflow)'s opt-in lane heartbeats and its steerable `ff-spawn --acp` claude lanes.
+*   🛡️ **Hardened before release** - An adversarial five-reviewer QA pass; every fix ships a regression test (792 tests at 100% coverage), and AGENTS.md's landmines are now enforced by tests behind one `just check` gate.
+
+**v0.1.1** (April 2026)
+
+*   🧹 **QOL polish** - `raven tail` and `raven version`, one-line CLI errors instead of tracebacks, and v1 identity-hygiene fixes.
+
+[View full changelog →](CHANGELOG.md)
 
 ## Why raven?
 

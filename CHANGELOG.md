@@ -4,7 +4,7 @@ All notable changes to **raven** are recorded here.
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.0] — Unreleased
+## [0.2.0] — 2026-10-01
 
 The v2 rewrite. A breaking rewrite of the store, not a feature drop: raven v2
 replaces v1's per-message delivery state with an append-only log + per-channel
@@ -406,6 +406,6 @@ The hackathon ship target — minimum viable bus that tells the
   internal store still uses Raven's four-state model (`sent`, `delivered`,
   `resolved`, `expired`) and the BusClient maps between them.
 
-[0.2.0]: https://github.com/0xDarkMatter/raven/compare/v0.1.1...HEAD
+[0.2.0]: https://github.com/0xDarkMatter/raven/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/0xDarkMatter/raven/releases/tag/v0.1.1
 [0.1.0]: https://github.com/0xDarkMatter/raven/releases/tag/v0.1.0
