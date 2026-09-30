@@ -13,9 +13,16 @@ Config via environment:
   derivation is NOT attempted — explicit only)
 - `RAVEN_DB`        (optional; the store's normal resolution otherwise)
 
-Output shape when pending (rendered via `raven_bus.policy` — the hook
+Output when pending: ONE line of PreToolUse hook JSON — plain PreToolUse
+stdout goes to Claude Code's debug log and never reaches the model, so
+the text rides in `hookSpecificOutput.additionalContext` (the hook
 shells out to `python -m raven_bus.adapters.hooks.peek`, which does the
 store read + policy render; the .sh wrapper stays trivial):
+
+    {"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                            "additionalContext": "<text below>"}}
+
+where the `additionalContext` text is:
 
     === RAVEN: 2 message(s) for lane-3@v0-2 ===
     <policy.render output — sender-attributed, data-framed>

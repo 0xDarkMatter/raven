@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 # raven inbox hook (Claude Code PreToolUse) — LANE: hook (raven2-p3)
 #
-# Trivial wrapper (ADR-006): exec the real logic in
-# raven_bus.adapters.hooks.peek, discard stderr, and coerce any
-# failure (even a missing interpreter) to exit 0. A broken hook must
-# NEVER block a tool call. Git Bash on Windows is POSIX + exec only —
-# no bashisms beyond those.
-exec python -m raven_bus.adapters.hooks.peek 2>/dev/null || true
+# Trivial wrapper (ADR-006): run the real logic in
+# raven_bus.adapters.hooks.peek, discard stderr, and force exit 0 on
+# every path. A broken hook must NEVER error a tool call.
+#
+# Deliberately NOT `exec python ... || true`: exec replaces this shell,
+# so the `|| true` never ran — a missing interpreter exited 127 and
+# Claude Code showed a hook-error notice on every tool call. peek's
+# stdout (the additionalContext JSON) passes through untouched.
+# Git Bash on Windows is POSIX only — no bashisms.
+python -m raven_bus.adapters.hooks.peek 2>/dev/null
+exit 0

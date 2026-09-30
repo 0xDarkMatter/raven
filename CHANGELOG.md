@@ -151,6 +151,16 @@ replaces v1's per-message delivery state with an append-only log + per-channel
   It is now a set of exact delivered ids (pruned to still-pending), so
   `plan()` keeps seeing every undelivered id, `ack_up_to` stops before
   them again, and a deferred fyi's digest trigger can still fire.
+- **The PreToolUse hook's output now reaches the model**
+  ([#2](https://github.com/0xDarkMatter/raven/issues/2)). Claude Code sends
+  plain PreToolUse stdout to its debug log, never the model's context — the
+  hook fired and rendered but sessions never saw a message. It now emits
+  `hookSpecificOutput.additionalContext` JSON (ASCII-only, so a non-ASCII
+  body can't hit a console-codepage error and be silently dropped); the
+  text and `policy.render` framing are unchanged. The wrapper no longer
+  `exec`s python (its `|| true` never ran, so a missing interpreter exited
+  127 and raised a hook-error notice on every tool call), ships executable,
+  and `*.sh` is pinned to LF via `.gitattributes`.
 - **Per-batch lease deadline.** `claim_next` now computes `lease_until` per
   batch rather than once up front, so a slow scan can't stamp an
   already-expired lease onto the rows it eventually writes.

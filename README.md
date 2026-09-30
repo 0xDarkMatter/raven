@@ -348,11 +348,11 @@ submit: a crash between plan and prompt can never lose a message.
 ### The Claude Code PreToolUse hook
 
 For interactive sessions that don't need process ownership. On every tool call
-it **peeks** at the consumer's pending messages and prints a compact block when
-any are deliverable; prints nothing when the inbox is empty; always exits 0.
+it **peeks** at the consumer's pending messages and emits a compact block when
+any are deliverable; emits nothing when the inbox is empty; always exits 0.
 The logic runs as `python -m raven_bus.adapters.hooks.peek`; the shell wrapper
-just execs it and discards stderr so even an interpreter failure can't block a
-tool call.
+runs it, discards stderr, and forces exit 0, so even a missing interpreter
+can't error a tool call.
 
 Config is environment-only:
 
@@ -385,7 +385,11 @@ a PreToolUse entry to `~/.claude/settings.json`:
 }
 ```
 
-When something is pending it prints (render via `policy.render`):
+When something is pending it prints one line of hook JSON,
+`{"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": …}}`
+— for PreToolUse, Claude Code sends plain stdout to its debug log and only
+`additionalContext` reaches the model. The context text (render via
+`policy.render`) is:
 
 ```
 === RAVEN: 2 message(s) for lane-3@v0-2 ===

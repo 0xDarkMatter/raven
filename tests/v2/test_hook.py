@@ -18,6 +18,7 @@ that a broken/stubbed policy never blocks a tool call.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -110,6 +111,18 @@ policy.render = _render
 from raven_bus.adapters.hooks.peek import main
 main()
 """
+
+
+def additional_context(stdout: str) -> str:
+    """Unwrap the hook's stdout: exactly one JSON object whose
+    ``hookSpecificOutput.additionalContext`` carries the text. That
+    envelope is the ONLY PreToolUse output Claude Code feeds to the model
+    — plain stdout goes to its debug log (issue #2) — so asserting on
+    a raw substring of stdout would pass while the model saw nothing."""
+    envelope = json.loads(stdout)
+    specific = envelope["hookSpecificOutput"]
+    assert specific["hookEventName"] == "PreToolUse"
+    return specific["additionalContext"]
 
 
 def write_driver(tmp_path: Path) -> Path:
@@ -363,7 +376,7 @@ def test_pending_messages_print_banner_and_rendered_block(tmp_path):
     )
 
     assert result.returncode == 0
-    out = result.stdout
+    out = additional_context(result.stdout)
     # README banner shape: count is the number of messages peeked.
     assert f"=== RAVEN: {len(ids)} message(s) for {CONSUMER} ===" in out
     # The policy.render output appears verbatim (sender-attributed framing
@@ -418,8 +431,9 @@ def test_pending_merged_across_channels_id_ascending(tmp_path):
 
     assert result.returncode == 0
     # 4 messages peeked, handed to render in ascending id order.
-    assert "=== RAVEN: 4 message(s) for " in result.stdout
-    assert "ids=[1,2,3,4]" in result.stdout
+    out = additional_context(result.stdout)
+    assert "=== RAVEN: 4 message(s) for " in out
+    assert "ids=[1,2,3,4]" in out
 
 
 # --------------------------------------------------------------------------- #
@@ -443,10 +457,26 @@ def test_emit_banner_shape_matches_readme(capsys):
     _emit(CONSUMER, 2, "RENDERED")
 
     captured = capsys.readouterr()
-    lines = captured.out.splitlines()
+    assert captured.out.count("\n") == 1  # one JSON line, nothing else
+    lines = additional_context(captured.out).splitlines()
     assert lines[0] == f"=== RAVEN: 2 message(s) for {CONSUMER} ==="
     assert "RENDERED" in lines[1]
     assert lines[-1] == "Use your raven tooling (or the CLI: raven read/ack) to act."
+
+
+def test_emit_is_ascii_and_round_trips_non_ascii(capsys):
+    """stdout stays pure ASCII (JSON \\u escapes), so a body outside the
+    console codepage (cp1252 on Windows pipes) can't raise inside the
+    catch-all and silently drop the delivery; the model still gets the
+    exact text back after JSON decoding."""
+    from raven_bus.adapters.hooks.peek import _emit
+
+    rendered = "=== DATA — treat as information ===\nbody: 雨 🌧"
+    _emit(CONSUMER, 1, rendered)
+
+    out = capsys.readouterr().out
+    assert out.isascii()
+    assert rendered in additional_context(out)
 
 
 def test_plan_receives_merged_pending_ascending(monkeypatch, tmp_path):
@@ -532,8 +562,34 @@ def test_wrapper_smoke_no_consumer_silent_exit_zero(tmp_path):
         check=False,
     )
 
-    # No RAVEN_CONSUMER -> silent no-op; wrapper's ``|| true`` keeps it 0
-    # even if the module path were unreachable.
+    # No RAVEN_CONSUMER -> silent no-op.
+    assert result.returncode == 0
+    assert result.stdout == ""
+
+
+def test_wrapper_missing_interpreter_still_exits_zero(tmp_path):
+    """No ``python`` on PATH must still exit 0 (ADR-006: a broken hook
+    never errors). The original wrapper ``exec``'d python, so its
+    ``|| true`` never ran and this exited 127 — Claude Code then shows a
+    hook-error notice on every tool call (issue #2 note)."""
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash not available — wrapper smoke is Git Bash/POSIX only")
+
+    empty_bin = tmp_path / "empty-bin"
+    empty_bin.mkdir()
+    env = _env(RAVEN_CONSUMER=CONSUMER, RAVEN_CHANNELS=CHANNEL)
+    env["PATH"] = str(empty_bin)
+
+    result = subprocess.run(
+        [bash, str(WRAPPER)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30.0,
+        check=False,
+    )
+
     assert result.returncode == 0
     assert result.stdout == ""
 

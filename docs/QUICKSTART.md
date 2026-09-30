@@ -247,8 +247,8 @@ for the rendered frame and the full policy table.
 For an **interactive** Claude Code session you don't want process ownership —
 just surface the session's unread raven messages as context on each tool call.
 That's the peek-only hook (`src/raven_bus/adapters/hooks/`): it reads pending,
-renders via `policy`, prints a compact block when anything is deliverable,
-prints nothing when the inbox is empty, and always exits 0 (ADR-006 — a broken
+renders via `policy`, emits a compact block when anything is deliverable,
+emits nothing when the inbox is empty, and always exits 0 (ADR-006 — a broken
 hook must never block a tool call).
 
 Install it by adding a PreToolUse entry to `~/.claude/settings.json`. Config is
@@ -273,10 +273,14 @@ environment-only:
 `RAVEN_CONSUMER` activates the hook (absent → silent no-op); `RAVEN_CHANNELS`
 is the comma-separated watch list (required when a consumer is set — the hook
 does no `run/<run>/lane/<role>` derivation); `RAVEN_DB` optionally points
-elsewhere. Copy `raven-inbox-hook.sh` somewhere stable first — it just execs
-`python -m raven_bus.adapters.hooks.peek` with stderr discarded.
+elsewhere. Copy `raven-inbox-hook.sh` somewhere stable first (keep it
+executable) — it just runs `python -m raven_bus.adapters.hooks.peek` with
+stderr discarded and always exits 0.
 
-With a pending message, the next tool call prints:
+With a pending message, the next tool call prints one line of hook JSON —
+`{"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": …}}`,
+the only PreToolUse output Claude Code puts in front of the model (plain
+stdout goes to its debug log). The `additionalContext` text reads:
 
 ```
 === RAVEN: 1 message(s) for lane-1@demo ===

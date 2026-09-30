@@ -2,9 +2,11 @@
 
 Runnable as ``python -m raven_bus.adapters.hooks.peek``. ADR-006: this
 hook PEEKS ONLY — it reads the consumer's pending messages, renders them
-via :mod:`raven_bus.policy`, and prints a banner+block when anything is
+via :mod:`raven_bus.policy`, and emits a banner+block when anything is
 deliverable; it NEVER acks and NEVER composes its own message framing.
-Silent (empty stdout) when nothing is pending. Always exits 0 — a broken
+The block travels as PreToolUse ``hookSpecificOutput.additionalContext``
+JSON — the only PreToolUse stdout Claude Code shows the model (see
+``_emit``). Silent (empty stdout) when nothing is pending. Always exits 0 — a broken
 hook must never block a tool call, so EVERY failure path (missing/locked
 DB, bad config, a still-stubbed policy) is swallowed and leaves only a
 single stderr breadcrumb.
@@ -24,6 +26,7 @@ never acks, so it may run beside a harness serving the same consumer.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from datetime import UTC, datetime
@@ -144,20 +147,36 @@ def _read_pending(consumer: str, channels: list[str], db_path: str | None) -> li
 
 
 def _emit(consumer: str, count: int, rendered: str) -> None:
-    """Print the README's banner shape: banner + render + action hint.
+    """Emit the README's banner shape (banner + render + action hint) as
+    ONE line of PreToolUse hook JSON.
+
+    Transport, not framing: for PreToolUse, Claude Code writes PLAIN
+    stdout to its debug log and never adds it to the model's context —
+    only ``hookSpecificOutput.additionalContext`` reaches the model
+    (code.claude.com/docs/en/hooks, "Exit code 0" + PreToolUse decision
+    control). Printing the text bare was issue #2: the hook fired and
+    rendered, the session never saw a byte. ``ensure_ascii`` (json's
+    default) keeps stdout pure ASCII so a body outside the console
+    codepage (cp1252 on Windows pipes) can't raise inside peek's
+    catch-all and silently drop the delivery.
 
     The count is the number of messages peeked (pending), per the
     README's ``=== RAVEN: N message(s) for <consumer> ===`` form. The
     rendered block already carries sender attribution + data framing
     (ADR-003); the hook adds only the header and one action-hint line.
     """
-    out = sys.stdout
-    print(f"=== RAVEN: {count} message(s) for {consumer} ===", file=out)
-    print(rendered, file=out)
-    print(
-        "Use your raven tooling (or the CLI: raven read/ack) to act.",
-        file=out,
+    text = (
+        f"=== RAVEN: {count} message(s) for {consumer} ===\n"
+        f"{rendered}\n"
+        "Use your raven tooling (or the CLI: raven read/ack) to act."
     )
+    envelope = {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "additionalContext": text,
+        }
+    }
+    print(json.dumps(envelope), file=sys.stdout)
 
 
 def main() -> None:

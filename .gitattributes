@@ -1,0 +1,4 @@
+# Shell scripts are LF everywhere: core.autocrlf=true checkouts would
+# otherwise hand the PreToolUse wrapper CRLF endings, and a copy run by a
+# non-Git-Bash shell (WSL, Linux) can misparse `exit 0\r`.
+*.sh text eol=lf

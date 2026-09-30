@@ -1,13 +1,13 @@
 """Claude Code PreToolUse inbox hook.  LANE: hook (raven2-p3).
 
 A peek-only adapter (ADR-006): on every tool call it reads the consumer's
-pending messages, renders them via :mod:`raven_bus.policy`, and prints a
-compact block when any are deliverable. Silent when the inbox is empty;
-always exits 0. The real logic lives in
-:mod:`raven_bus.adapters.hooks.peek` (runnable as
+pending messages, renders them via :mod:`raven_bus.policy`, and emits a
+compact block as PreToolUse ``additionalContext`` JSON when any are
+deliverable. Silent when the inbox is empty; always exits 0. The real
+logic lives in :mod:`raven_bus.adapters.hooks.peek` (runnable as
 ``python -m raven_bus.adapters.hooks.peek``); the shell wrapper in this
-directory execs that module with stderr discarded so even an interpreter
-failure can't block a tool call.
+directory runs that module with stderr discarded and forces exit 0, so
+even a missing interpreter can't error a tool call.
 
 This package intentionally re-exports nothing: ``peek`` is both the
 submodule name and a function within it, so re-exporting the function

@@ -161,6 +161,10 @@ decision text owns the *why*; treat each as a build-breaker.
   `policy.plan`, which then computes `ack_up_to` without them — the cursor
   jumps over messages injected zero times (issue #3). `plan` must always
   see every undelivered pending id.
+- **The hook's output is `hookSpecificOutput.additionalContext` JSON, never
+  bare text.** Claude Code logs plain PreToolUse stdout and never shows it
+  to the model (issue #2); `peek._emit` owns the envelope. The wrapper must
+  not `exec` python — `exec` makes its exit-0 guarantee unreachable.
 - **The harness is a dumb pipe: no respawn.** `run_harness` exits when the child
   exits or ACP errors; lifecycle (spawn/reap/restart) belongs to the spawner
   (design §9 Q4 — ff-spawn's journal). Two owners of respawn = orphan factories.
