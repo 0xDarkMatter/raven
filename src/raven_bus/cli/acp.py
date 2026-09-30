@@ -22,9 +22,13 @@ from pathlib import Path
 
 import typer
 
-from raven_bus import channels as channels_mod
 from raven_bus import db, models
-from raven_bus.adapters.acp.harness import HarnessConfig, parse_channels, run_harness
+from raven_bus.adapters.acp.harness import (
+    HarnessConfig,
+    ensure_absent_as_broadcast,
+    parse_channels,
+    run_harness,
+)
 from raven_bus.adapters.hooks.peek import ENV_ACP_CHANNELS, ENV_ACP_CONSUMER
 from raven_bus.cli._common import EXIT_ERROR, EXIT_USAGE, die, handle_errors
 
@@ -133,17 +137,28 @@ def acp(
             if initial_prompt is None or not initial_prompt.strip():
                 die("--initial-prompt-file is empty", EXIT_USAGE)
         db.init_db(db_path)
-        # Ensure the lane's channels exist BEFORE the loop: a lane must be
-        # startable before its orchestrator has sent anything (the first
-        # pending() poll on a never-used channel raised UnknownChannelError
-        # and killed the harness — found by the P4b live run). Broadcast is
-        # the only kind the cursor loop can serve; a kind mismatch on an
-        # existing channel fails loudly here (WrongChannelKindError).
+        # Create the lane's channels BEFORE the loop, but only when ABSENT:
+        # a lane must be startable before its orchestrator has sent
+        # anything (the first pending() poll on a never-used channel raised
+        # UnknownChannelError and killed the harness — P4b live run), yet
+        # ensure_channel(kind="broadcast") on an EXISTING channel of another
+        # kind raised WrongChannelKindError — so a reply channel the design
+        # makes a `stream` (run/<run>/telemetry) killed lane startup (store-
+        # lane finding). Existing channels of any kind are left alone; the
+        # reply channel only receives log.append, which any kind accepts.
+        # WATCHED channels must be broadcast (the loop reads cursors), so a
+        # watched channel of another kind is a one-line usage error.
         with db.connection(db_path) as conn:
             for name in channels:
-                channels_mod.ensure_channel(conn, name, kind="broadcast")
+                kind = ensure_absent_as_broadcast(conn, name)
+                if kind != "broadcast":
+                    die(
+                        f"watched channel {name!r} is kind {kind!r}; raven acp "
+                        "reads cursors, which need a 'broadcast' channel",
+                        EXIT_USAGE,
+                    )
             if reply_to is not None:
-                channels_mod.ensure_channel(conn, reply_to, kind="broadcast")
+                ensure_absent_as_broadcast(conn, reply_to)
 
     config = HarnessConfig(
         consumer=as_,

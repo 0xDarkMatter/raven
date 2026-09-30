@@ -1263,3 +1263,85 @@ def test_cli_marks_the_agent_env_with_what_the_harness_serves(
     assert env["RAVEN_ACP_CONSUMER"] == CONSUMER
     assert env["RAVEN_ACP_CHANNELS"] == f"{CHANNEL},run/run1/ctl"
     assert env["SOME_PARENT_VAR"] == "kept"  # the rest of the env passes through
+
+
+# --------------------------------------------------------------------------- #
+# Store-lane finding — startup pre-create must not fight existing kinds.
+# --------------------------------------------------------------------------- #
+def test_cli_startup_leaves_an_existing_stream_reply_channel_alone(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The design's run/<run>/telemetry is a `stream`; ensure_channel(kind=
+    "broadcast") on it raised WrongChannelKindError and killed startup."""
+    from raven_bus import channels
+
+    with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+        channels.ensure_channel(conn, "run/run1/telemetry", "stream")
+
+    class _FakeProc:
+        def __init__(self, argv, **kwargs) -> None:
+            pass
+
+        def poll(self):
+            return 0
+
+        def terminate(self) -> None:
+            pass  # pragma: no cover -- child already exited
+
+    monkeypatch.setattr("raven_bus.cli.acp.subprocess.Popen", _FakeProc)
+    monkeypatch.setattr("raven_bus.cli.acp.run_harness", lambda *a, **k: 0)
+
+    result = runner.invoke(
+        app,
+        ["acp", "--as", CONSUMER, "--channel", CHANNEL, "--reply-to", "run/run1/telemetry",
+         "--db", str(db), "--", "agent"],
+    )
+
+    assert result.exit_code == 0, result.output
+    with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+        assert channels.get_channel(conn, "run/run1/telemetry").kind == "stream"
+        assert channels.get_channel(conn, CHANNEL).kind == "broadcast"  # absent -> created
+
+
+@pytest.mark.parametrize("kind", ["queue", "stream"])
+def test_cli_watched_channel_of_another_kind_is_one_line_usage_error(
+    db: Path, kind: str, no_launch: None
+) -> None:
+    from raven_bus import channels
+
+    with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+        channels.ensure_channel(conn, CHANNEL, kind)  # type: ignore[arg-type]
+
+    result = runner.invoke(
+        app, ["acp", "--as", CONSUMER, "--channel", CHANNEL, "--db", str(db), "--", "agent"]
+    )
+
+    assert result.exit_code == 2
+    assert f"error: watched channel '{CHANNEL}' is kind '{kind}'" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_telemetry_posts_to_an_existing_stream_reply_channel(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """log.append(ensure=True) re-ensured the reply channel as broadcast
+    and raised on a `stream` one — the harness now posts to any kind."""
+    from raven_bus import channels
+
+    with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+        channels.ensure_channel(conn, "run/run1/telemetry", "stream")
+        msg = _append(conn, urgency="blocking")
+    _stub_plan(monkeypatch, InjectionPlan(interrupt=[msg], ack_up_to=msg.id))
+
+    code = run_harness(
+        _config(db_path=db, reply_channel="run/run1/telemetry"),
+        _never_dies(),
+        client=FakeAcpClient(),
+        max_boundaries=1,
+    )
+
+    assert code == 0
+    with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+        posted = log.read_after(conn, "run/run1/telemetry", 0)
+        assert channels.get_channel(conn, "run/run1/telemetry").kind == "stream"
+    assert [m.type for m in posted] == ["acp-reply", "acp-activity"]

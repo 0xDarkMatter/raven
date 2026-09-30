@@ -41,9 +41,9 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
-from raven_bus import cursors, log, policy
+from raven_bus import channels, cursors, log, policy
 from raven_bus.adapters.acp.protocol import AcpClient, AcpError, PromptResult
-from raven_bus.exceptions import RavenBusError
+from raven_bus.exceptions import RavenBusError, UnknownChannelError
 from raven_bus.db import connection as db_connection
 from raven_bus.models import Message, validate_channel_name
 
@@ -347,6 +347,11 @@ def _post_telemetry(config: HarnessConfig, result: PromptResult, boundary: int) 
     if config.reply_channel is None:
         return
     with db_connection(config.db_path) as conn:
+        # ensure=False after an absent-only create: append's own ensure
+        # re-ensures as broadcast and raised WrongChannelKindError on a
+        # reply channel that exists as a `stream` (the design's
+        # run/<run>/telemetry). Posting accepts any kind.
+        ensure_absent_as_broadcast(conn, config.reply_channel)
         log.append(
             conn,
             channel=config.reply_channel,
@@ -354,6 +359,7 @@ def _post_telemetry(config: HarnessConfig, result: PromptResult, boundary: int) 
             type="acp-reply",
             urgency="fyi",
             body={"text": result.text, "stop_reason": result.stop_reason, "boundary": boundary},
+            ensure=False,
         )
         log.append(
             conn,
@@ -362,7 +368,23 @@ def _post_telemetry(config: HarnessConfig, result: PromptResult, boundary: int) 
             type="acp-activity",
             urgency="fyi",
             body={"updates": len(result.raw_updates), "boundary": boundary},
+            ensure=False,
         )
+
+
+def ensure_absent_as_broadcast(conn: sqlite3.Connection, name: str) -> str:
+    """Create channel ``name`` as ``broadcast`` only if it doesn't exist;
+    return its kind. An EXISTING channel of any kind is left alone.
+
+    Deliberately not ``channels.ensure_channel(kind="broadcast")``, which
+    raises WrongChannelKindError on an existing channel of another kind —
+    that killed `raven acp` startup when the reply channel was a `stream`
+    (store-lane finding). Callers that need broadcast (watched channels:
+    the loop reads cursors) check the returned kind themselves."""
+    try:
+        return channels.get_channel(conn, name).kind
+    except UnknownChannelError:
+        return channels.ensure_channel(conn, name, kind="broadcast").kind
 
 
 def parse_channels(raw: Sequence[str]) -> tuple[str, ...]:
@@ -381,4 +403,4 @@ def parse_channels(raw: Sequence[str]) -> tuple[str, ...]:
     return channels
 
 
-__all__ = ["HarnessConfig", "parse_channels", "run_harness"]
+__all__ = ["HarnessConfig", "ensure_absent_as_broadcast", "parse_channels", "run_harness"]
