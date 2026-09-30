@@ -6,6 +6,7 @@ import io
 import json
 import subprocess
 import sys
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -400,3 +401,66 @@ def test_build_agent_command_accepts_non_list_sequences() -> None:
 def test_build_agent_command_rejects_empty_argv() -> None:
     with pytest.raises(ValueError, match="must not be empty"):
         build_agent_command([])
+
+
+# --------------------------------------------------------------------------- #
+# QA finding A7: timeout_s was a TOTAL per-request deadline (an active turn
+# streaming past it was aborted) that a silent agent never hit (readline
+# blocked past it), and a dead agent went unnoticed while a grandchild held
+# its stdout open. It is now an inactivity limit on a reader thread.
+# --------------------------------------------------------------------------- #
+def test_active_turn_longer_than_timeout_completes(children) -> None:
+    """10 chunks over ~1.5 s with a 0.6 s timeout: every chunk restarts
+    the clock, so the turn completes (the old total deadline aborted it)."""
+    _, client, session_id = ready_client(children, "stream")
+    client._timeout_s = 0.6
+
+    result = client.prompt(session_id, "go")
+
+    assert result.stop_reason == "end_turn"
+    assert len(result.raw_updates) == 10
+
+
+def test_silent_agent_times_out_promptly(children) -> None:
+    """The old readline blocked for the agent's whole 60 s silence."""
+    _, client, session_id = ready_client(children, "hang")
+    client._timeout_s = 0.5
+    started = time.monotonic()
+
+    with pytest.raises(AcpError, match="timed out"):
+        client.prompt(session_id, "hello?")
+
+    assert time.monotonic() - started < 5
+
+
+def test_dead_agent_detected_while_a_grandchild_holds_stdout(children) -> None:
+    """No timeout configured: the agent exits mid-prompt but a grandchild
+    keeps the pipe open for 4 s. The old client only saw EOF when the
+    grandchild died; the liveness check reports it within the grace."""
+    child, client, session_id = ready_client(children, "orphan-stdout")
+    started = time.monotonic()
+
+    with pytest.raises(AcpError, match="agent exited"):
+        client.prompt(session_id, "work")
+
+    assert time.monotonic() - started < 3
+    assert child.poll() == 1
+
+
+def test_default_is_no_inactivity_limit() -> None:
+    client = AcpClient(ScriptedChild([]))  # type: ignore[arg-type]
+    assert client._timeout_s is None
+
+
+def test_terminal_read_states_stay_terminal() -> None:
+    """After EOF (or a read error) every later call fails the same way
+    instead of blocking on an empty queue forever."""
+    client = AcpClient(ScriptedChild([]))  # type: ignore[arg-type]
+    for _ in range(2):
+        with pytest.raises(AcpError, match="agent exited"):
+            client.initialize()
+
+    broken = AcpClient(SimpleNamespace(stdin=io.StringIO(), stdout=BrokenReader()))  # type: ignore[arg-type]
+    for _ in range(2):
+        with pytest.raises(AcpError, match="failed to read agent output"):
+            broken.initialize()

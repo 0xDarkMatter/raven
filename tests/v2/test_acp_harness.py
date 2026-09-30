@@ -472,6 +472,8 @@ def test_cli_double_dash_parsing_and_exit_code(
             "/tmp/agent",
             "--mode",
             "bypassPermissions",
+            "--timeout",
+            "90",
             "--",
             "some-agent",
             "--flag",
@@ -489,6 +491,7 @@ def test_cli_double_dash_parsing_and_exit_code(
     assert config.token_budget == 111
     assert config.cwd == "/tmp/agent"
     assert config.mode == "bypassPermissions"
+    assert config.timeout_s == 90.0
 
 
 def test_cli_initial_prompt_file_read_and_passed_verbatim(
@@ -880,7 +883,7 @@ def test_store_error_exits_ten_not_traceback(
     escaped run_harness as a crash; it must exit 10 like AcpError."""
     import sqlite3 as sqlite3_mod
 
-    def _busy(_config):
+    def _busy(*_args):
         raise sqlite3_mod.OperationalError("database is locked")
 
     monkeypatch.setattr(harness, "_gather_pending", _busy)
@@ -900,3 +903,445 @@ def test_cli_unlaunchable_agent_is_one_line_error() -> None:
     assert "error:" in result.output
     assert "cannot launch agent" in result.output
     assert "Traceback" not in result.output
+
+
+# --------------------------------------------------------------------------- #
+# QA findings A1/A6 — per-channel prefix acking and gathering past a pin.
+#
+# The old ack acked only THIS boundary's ids, capped at the plan's GLOBAL
+# ack_up_to. Ids delivered under a pin (an undelivered lower id) were never
+# acked afterwards; once cursors.pending's 100-row window was all such ids
+# the channel stalled for the session (later BLOCKING messages included), a
+# clean restart re-injected them, and one channel's deferred fyi pinned
+# every other channel. These run the REAL policy against the real store.
+# --------------------------------------------------------------------------- #
+A_CH = "run/run1/a"
+B_CH = "run/run1/b"
+
+
+class _StagedChild(FakeChild):
+    """Alive for ``alive`` polls; runs ``hooks[n]`` on the n-th poll (a
+    sender publishing, a clock jump) before answering."""
+
+    def __init__(self, alive: int, hooks: dict[int, Callable[[], None]]) -> None:
+        super().__init__([None])
+        self.polls = 0
+        self._alive = alive
+        self._hooks = hooks
+
+    def poll(self) -> int | None:
+        self.polls += 1
+        if self.polls in self._hooks:
+            self._hooks[self.polls]()
+        return None if self.polls < self._alive else 0
+
+
+def _clock(monkeypatch: pytest.MonkeyPatch) -> dict:
+    """Fake harness clock; bump ``state['offset']`` to age fyi mid-run."""
+    from datetime import datetime as real_datetime
+    from datetime import timedelta
+
+    state = {"offset": timedelta(0)}
+
+    class _FakeDatetime:
+        @staticmethod
+        def now(tz=None):
+            return real_datetime.now(tz) + state["offset"]
+
+    monkeypatch.setattr(harness, "datetime", _FakeDatetime)
+    return state
+
+
+def _all_injected(client: FakeAcpClient) -> list[int]:
+    return [i for _, t in client.prompts for i in _injected_ids(t)]
+
+
+def _cursor(db: Path, channel: str) -> int | None:
+    with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+        cur = cursors.get_cursor(conn, CONSUMER, channel)
+    return None if cur is None else cur.last_ack_id
+
+
+def test_pin_on_one_channel_neither_stalls_nor_pins_another(db: Path) -> None:
+    """probe_stall: a held fyi on A + a 110-message burst on B + a later
+    BLOCKING on B, one session. Old code: B's window filled with
+    delivered-but-unackable ids and the blocking message was never seen."""
+    from raven_bus import channels
+
+    late: list[Message] = []
+    with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+        channels.ensure_channel(conn, A_CH)
+        fyi = _append(conn, urgency="fyi", channel=A_CH)
+        burst = [_append(conn, channel=B_CH) for _ in range(110)]
+
+    def _publish() -> None:
+        with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+            late.append(_append(conn, urgency="blocking", channel=B_CH))
+
+    client = FakeAcpClient()
+    code = run_harness(
+        _config(db_path=db, channels=(A_CH, B_CH)),
+        _StagedChild(40, {20: _publish}),
+        client=client,
+    )
+
+    assert code == 0
+    injected = _all_injected(client)
+    assert sorted(injected) == [m.id for m in burst] + [late[0].id]  # each once
+    assert _cursor(db, B_CH) == late[0].id  # B fully acked despite A's pin
+    assert _cursor(db, A_CH) is None  # the held fyi was never injected
+    with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+        assert [m.id for m in cursors.pending(conn, CONSUMER, A_CH)] == [fyi.id]
+
+
+def test_blocking_beyond_a_delivered_window_is_injected_promptly(db: Path) -> None:
+    """probe_starve1 (A6): ONE channel, a held fyi pinning 110 delivered
+    prompts. A blocking message landing past the 100-row window must be
+    injected at once, not after the fyi ages out."""
+    late: list[Message] = []
+    with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+        fyi = _append(conn, urgency="fyi")
+        prompts = [_append(conn) for _ in range(110)]
+
+    def _publish() -> None:
+        with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+            late.append(_append(conn, urgency="blocking"))
+
+    client = FakeAcpClient()
+    child = _StagedChild(40, {20: _publish})
+    code = run_harness(_config(db_path=db), child, client=client)
+
+    assert code == 0
+    injected = _all_injected(client)
+    assert sorted(injected) == [m.id for m in prompts] + [late[0].id]
+    assert fyi.id not in injected
+    assert _cursor(db, CHANNEL) is None  # pinned by the held fyi, correctly
+
+
+def test_cleared_pin_acks_the_whole_prefix_so_restart_reinjects_nothing(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """probe_followup: once the fyi pin is digested, every id delivered
+    under it is acked; a clean restart then injects nothing again."""
+    from datetime import timedelta
+
+    from raven_bus import channels
+
+    clock = _clock(monkeypatch)
+    with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+        channels.ensure_channel(conn, B_CH)
+        f = _append(conn, urgency="fyi", channel=A_CH)
+        pa = _append(conn, channel=A_CH)
+        pb = _append(conn, channel=B_CH)
+
+    def _age() -> None:
+        clock["offset"] = timedelta(minutes=10)
+
+    cfg = _config(db_path=db, channels=(A_CH, B_CH))
+    first = FakeAcpClient()
+    assert run_harness(cfg, _StagedChild(20, {10: _age}), client=first) == 0
+    assert [_injected_ids(t) for _, t in first.prompts] == [[pa.id, pb.id], [f.id]]
+    assert _cursor(db, A_CH) == pa.id
+    assert _cursor(db, B_CH) == pb.id
+
+    second = FakeAcpClient()
+    assert run_harness(cfg, _StagedChild(5, {}), client=second) == 0
+    assert second.prompts == []
+
+
+def test_idle_tick_acks_a_prefix_whose_pin_cleared_without_a_delivery(
+    db: Path,
+) -> None:
+    """The pin can leave pending with no delivery (another process acks
+    past it, or it expires): the next idle tick acks the delivered
+    prefix instead of waiting for some later message on the channel."""
+    with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+        fyi = _append(conn, urgency="fyi")
+        msg = _append(conn)
+
+    def _external_ack() -> None:
+        with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+            cursors.ack(conn, CONSUMER, CHANNEL, fyi.id)
+
+    client = FakeAcpClient()
+    code = run_harness(_config(db_path=db), _StagedChild(12, {6: _external_ack}), client=client)
+
+    assert code == 0
+    assert [_injected_ids(t) for _, t in client.prompts] == [[msg.id]]
+    assert _cursor(db, CHANNEL) == msg.id
+
+
+def test_gather_pages_past_delivered_ids_and_is_bounded(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(harness, "_GATHER_PAGE", 2)
+    monkeypatch.setattr(harness, "_GATHER_MAX_PAGES", 3)
+    with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+        ids = [_append(conn).id for _ in range(10)]
+    cfg = _config(db_path=db)
+
+    # nothing delivered: one page, as before
+    assert [m.id for m in harness._gather_pending(cfg, {})[CHANNEL]] == ids[:2]
+    # first 3 delivered: pages until a page-worth (2) is undelivered
+    got = harness._gather_pending(cfg, {CHANNEL: set(ids[:3])})[CHANNEL]
+    assert [m.id for m in got] == ids[:6][:len(got)] and len(got) == 6
+    # everything delivered: stops at the page bound, contiguous
+    got = harness._gather_pending(cfg, {CHANNEL: set(ids)})[CHANNEL]
+    assert [m.id for m in got] == ids[:6]
+
+
+def test_prune_forgets_only_ids_that_can_never_be_pending_again() -> None:
+    def _m(i: int) -> Message:
+        from datetime import UTC, datetime
+
+        return Message(id=i, channel=CHANNEL, sender="p@run1", type="t", body={},
+                       created_at=datetime.now(UTC))
+
+    delivered = {CHANNEL: {3, 10, 500}, A_CH: {7}}
+    harness._prune_delivered(delivered, {CHANNEL: [_m(10), _m(11)], A_CH: []})
+    # 3 is below the lowest pending id (acked/expired); 500 is past the
+    # gathered window and may still be pending — kept.
+    assert delivered == {CHANNEL: {10, 500}, A_CH: set()}
+
+
+# --------------------------------------------------------------------------- #
+# QA finding A7 — the ACP inactivity timeout is configurable end to end.
+# --------------------------------------------------------------------------- #
+def test_harness_builds_its_client_with_the_configured_timeout(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict = {}
+
+    class _Recorder(FakeAcpClient):
+        def __init__(self, child, *, timeout_s=None) -> None:
+            super().__init__(init_error=AcpError("stop after construction"))
+            seen["timeout_s"] = timeout_s
+
+    monkeypatch.setattr(harness, "AcpClient", _Recorder)
+    assert run_harness(_config(db_path=db, timeout_s=90.0), _never_dies()) == 10
+    assert seen == {"timeout_s": 90.0}
+
+
+@pytest.fixture()
+def no_launch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Usage-error tests must fail BEFORE any spawn: a real binary named
+    like the dummy command (there is an ``agent`` on some PATHs) would
+    otherwise be launched and the harness would wait on it forever."""
+
+    def _refuse(*_a, **_k):
+        raise AssertionError("raven acp launched the agent despite a usage error")
+
+    monkeypatch.setattr("raven_bus.cli.acp.subprocess.Popen", _refuse)
+
+
+@pytest.mark.parametrize("bad", ["0", "-5"])
+def test_cli_non_positive_timeout_is_usage_error(db: Path, bad: str, no_launch: None) -> None:
+    result = runner.invoke(
+        app,
+        ["acp", "--as", CONSUMER, "--channel", CHANNEL, "--db", str(db),
+         "--timeout", bad, "--", "agent"],
+    )
+    assert result.exit_code == 2
+    assert "--timeout must be a positive" in result.output
+
+
+# --------------------------------------------------------------------------- #
+# QA finding A13 — exit codes, CLI usage errors, breadcrumbs.
+# --------------------------------------------------------------------------- #
+def test_child_crash_while_idle_returns_ten_not_zero(
+    db: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """probe_exit: an agent OOM-killed while idle (status 137) made
+    run_harness return 0 — "child exited cleanly" to the spawner."""
+    _stub_plan(monkeypatch, InjectionPlan())
+    code = run_harness(_config(db_path=db), FakeChild([137]), client=FakeAcpClient())
+    assert code == 10
+    assert "raven-acp: agent exited with status 137" in capsys.readouterr().err
+
+
+def test_boundary_zero_telemetry_store_error_exits_ten_not_traceback(
+    db: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def _locked(*_a, **_k) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(harness, "_post_telemetry", _locked)
+    code = run_harness(
+        _config(db_path=db, reply_channel="run/run1/telemetry", initial_prompt="task"),
+        _never_dies(),
+        client=FakeAcpClient(),
+    )
+    assert code == 10
+    assert "raven-acp: session setup failed: OperationalError: database is locked" in (
+        capsys.readouterr().err
+    )
+
+
+@pytest.mark.parametrize(
+    ("client", "mode"),
+    [
+        (FakeAcpClient(init_error=AcpError("child EOF")), None),
+        (FakeAcpClient(set_mode_error=AcpError("mode refused")), "nope"),
+    ],
+    ids=["handshake", "set_mode"],
+)
+def test_setup_failures_leave_a_breadcrumb(
+    db: Path, capsys: pytest.CaptureFixture[str], client: FakeAcpClient, mode: str | None
+) -> None:
+    assert run_harness(_config(db_path=db, mode=mode), _never_dies(), client=client) == 10
+    assert capsys.readouterr().err.startswith("raven-acp: session setup failed: AcpError: ")
+
+
+@pytest.mark.parametrize(
+    ("flag", "value", "message"),
+    [
+        ("--poll-interval", "0", "--poll-interval must be a positive"),
+        ("--poll-interval", "-1", "--poll-interval must be a positive"),
+        ("--poll-interval", "inf", "--poll-interval must be a positive"),
+        ("--budget", "0", "--budget must be at least 1"),
+        ("--budget", "-3", "--budget must be at least 1"),
+    ],
+)
+def test_cli_nonsense_loop_settings_are_usage_errors(
+    db: Path, flag: str, value: str, message: str, no_launch: None
+) -> None:
+    result = runner.invoke(
+        app,
+        ["acp", "--as", CONSUMER, "--channel", CHANNEL, "--db", str(db),
+         flag, value, "--", "agent"],
+    )
+    assert result.exit_code == 2
+    assert message in result.output
+    assert "Traceback" not in result.output
+
+
+def test_cli_non_utf8_initial_prompt_file_is_one_line_usage_error(
+    db: Path, tmp_path: Path, no_launch: None
+) -> None:
+    packet = tmp_path / "packet.txt"
+    packet.write_bytes("café task\n".encode("cp1252"))
+    result = runner.invoke(
+        app,
+        ["acp", "--as", CONSUMER, "--channel", CHANNEL, "--db", str(db),
+         "--initial-prompt-file", str(packet), "--", "agent"],
+    )
+    assert result.exit_code == 2
+    assert "--initial-prompt-file is not valid UTF-8" in result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+
+
+def test_cli_marks_the_agent_env_with_what_the_harness_serves(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """QA finding A11 mitigation: the spawned agent's env names this
+    harness's consumer + channels, so a raven hook inside it skips them
+    instead of re-announcing messages during the turn that injects them."""
+    captured: dict = {}
+
+    class _FakeProc:
+        def __init__(self, argv, **kwargs) -> None:
+            captured["env"] = kwargs["env"]
+
+        def poll(self):
+            return 0
+
+        def terminate(self) -> None:
+            pass  # pragma: no cover -- child already exited
+
+    monkeypatch.setattr("raven_bus.cli.acp.subprocess.Popen", _FakeProc)
+    monkeypatch.setattr("raven_bus.cli.acp.run_harness", lambda *a, **k: 0)
+    monkeypatch.setenv("SOME_PARENT_VAR", "kept")
+
+    result = runner.invoke(
+        app,
+        ["acp", "--as", CONSUMER, "--channel", CHANNEL, "--channel", "run/run1/ctl",
+         "--db", str(db), "--", "agent"],
+    )
+
+    assert result.exit_code == 0
+    env = captured["env"]
+    assert env["RAVEN_ACP_CONSUMER"] == CONSUMER
+    assert env["RAVEN_ACP_CHANNELS"] == f"{CHANNEL},run/run1/ctl"
+    assert env["SOME_PARENT_VAR"] == "kept"  # the rest of the env passes through
+
+
+# --------------------------------------------------------------------------- #
+# Store-lane finding — startup pre-create must not fight existing kinds.
+# --------------------------------------------------------------------------- #
+def test_cli_startup_leaves_an_existing_stream_reply_channel_alone(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The design's run/<run>/telemetry is a `stream`; ensure_channel(kind=
+    "broadcast") on it raised WrongChannelKindError and killed startup."""
+    from raven_bus import channels
+
+    with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+        channels.ensure_channel(conn, "run/run1/telemetry", "stream")
+
+    class _FakeProc:
+        def __init__(self, argv, **kwargs) -> None:
+            pass
+
+        def poll(self):
+            return 0
+
+        def terminate(self) -> None:
+            pass  # pragma: no cover -- child already exited
+
+    monkeypatch.setattr("raven_bus.cli.acp.subprocess.Popen", _FakeProc)
+    monkeypatch.setattr("raven_bus.cli.acp.run_harness", lambda *a, **k: 0)
+
+    result = runner.invoke(
+        app,
+        ["acp", "--as", CONSUMER, "--channel", CHANNEL, "--reply-to", "run/run1/telemetry",
+         "--db", str(db), "--", "agent"],
+    )
+
+    assert result.exit_code == 0, result.output
+    with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+        assert channels.get_channel(conn, "run/run1/telemetry").kind == "stream"
+        assert channels.get_channel(conn, CHANNEL).kind == "broadcast"  # absent -> created
+
+
+@pytest.mark.parametrize("kind", ["queue", "stream"])
+def test_cli_watched_channel_of_another_kind_is_one_line_usage_error(
+    db: Path, kind: str, no_launch: None
+) -> None:
+    from raven_bus import channels
+
+    with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+        channels.ensure_channel(conn, CHANNEL, kind)  # type: ignore[arg-type]
+
+    result = runner.invoke(
+        app, ["acp", "--as", CONSUMER, "--channel", CHANNEL, "--db", str(db), "--", "agent"]
+    )
+
+    assert result.exit_code == 2
+    assert f"error: watched channel '{CHANNEL}' is kind '{kind}'" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_telemetry_posts_to_an_existing_stream_reply_channel(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """log.append(ensure=True) re-ensured the reply channel as broadcast
+    and raised on a `stream` one — the harness now posts to any kind."""
+    from raven_bus import channels
+
+    with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+        channels.ensure_channel(conn, "run/run1/telemetry", "stream")
+        msg = _append(conn, urgency="blocking")
+    _stub_plan(monkeypatch, InjectionPlan(interrupt=[msg], ack_up_to=msg.id))
+
+    code = run_harness(
+        _config(db_path=db, reply_channel="run/run1/telemetry"),
+        _never_dies(),
+        client=FakeAcpClient(),
+        max_boundaries=1,
+    )
+
+    assert code == 0
+    with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+        posted = log.read_after(conn, "run/run1/telemetry", 0)
+        assert channels.get_channel(conn, "run/run1/telemetry").kind == "stream"
+    assert [m.type for m in posted] == ["acp-reply", "acp-activity"]

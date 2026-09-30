@@ -3,6 +3,7 @@
     raven acp --as lane-3@v0-2 --channel run/v0-2/lane/3 \
               [--channel run/v0-2/control]... [--reply-to run/v0-2/telemetry] \
               [--db PATH] [--poll-interval 1.0] [--budget 2000] [--cwd .] \
+              [--mode MODE] [--initial-prompt-file FILE] [--timeout S] \
               -- <agent command...>
 
 Spawns the agent command (everything after ``--``) with piped stdio,
@@ -14,14 +15,21 @@ conventions as the rest of the app (one-line error:, exit 2 usage /
 
 from __future__ import annotations
 
+import math
+import os
 import subprocess
 from pathlib import Path
 
 import typer
 
-from raven_bus import channels as channels_mod
 from raven_bus import db, models
-from raven_bus.adapters.acp.harness import HarnessConfig, parse_channels, run_harness
+from raven_bus.adapters.acp.harness import (
+    HarnessConfig,
+    ensure_absent_as_broadcast,
+    parse_channels,
+    run_harness,
+)
+from raven_bus.adapters.hooks.peek import ENV_ACP_CHANNELS, ENV_ACP_CONSUMER
 from raven_bus.cli._common import EXIT_ERROR, EXIT_USAGE, die, handle_errors
 
 # Registration note (mirrors cli/main.py's pattern for other commands):
@@ -78,6 +86,16 @@ def acp(
             "agent refuses it."
         ),
     ),
+    timeout: float | None = typer.Option(
+        None,
+        "--timeout",
+        help=(
+            "Inactivity limit in seconds: exit 10 when the agent sends "
+            "nothing for this long (every streamed update resets it). "
+            "Default: none — a healthy agent is silent while a long tool "
+            "call runs, and a dead agent is detected without it."
+        ),
+    ),
 ) -> None:
     """Spawn an agent (everything after ``--``) under the bus<->ACP
     harness: a dumb pipe (ADR-006) — no respawn, exit when the child
@@ -98,26 +116,49 @@ def acp(
             models.validate_channel_name(reply_to)
         if mode is not None and not mode.strip():
             die("--mode must be a non-empty mode id", EXIT_USAGE)
+        if timeout is not None and not timeout > 0:
+            die("--timeout must be a positive number of seconds", EXIT_USAGE)
+        # Usage errors, not runtime ones (QA finding A13): a zero poll
+        # interval busy-looped the idle path at full CPU, a negative one
+        # raised ValueError from time.sleep (a traceback), and a budget
+        # below 1 token defers everything but the escape-valve rescue.
+        if not (math.isfinite(poll_interval) and poll_interval > 0):
+            die("--poll-interval must be a positive number of seconds", EXIT_USAGE)
+        if budget < 1:
+            die("--budget must be at least 1 token", EXIT_USAGE)
         initial_prompt: str | None = None
         if initial_prompt_file is not None:
             try:
                 initial_prompt = initial_prompt_file.read_text(encoding="utf-8")
             except OSError as exc:
                 die(f"cannot read --initial-prompt-file: {exc}", EXIT_USAGE)
+            except UnicodeDecodeError as exc:
+                die(f"--initial-prompt-file is not valid UTF-8: {exc}", EXIT_USAGE)
             if initial_prompt is None or not initial_prompt.strip():
                 die("--initial-prompt-file is empty", EXIT_USAGE)
         db.init_db(db_path)
-        # Ensure the lane's channels exist BEFORE the loop: a lane must be
-        # startable before its orchestrator has sent anything (the first
-        # pending() poll on a never-used channel raised UnknownChannelError
-        # and killed the harness — found by the P4b live run). Broadcast is
-        # the only kind the cursor loop can serve; a kind mismatch on an
-        # existing channel fails loudly here (WrongChannelKindError).
+        # Create the lane's channels BEFORE the loop, but only when ABSENT:
+        # a lane must be startable before its orchestrator has sent
+        # anything (the first pending() poll on a never-used channel raised
+        # UnknownChannelError and killed the harness — P4b live run), yet
+        # ensure_channel(kind="broadcast") on an EXISTING channel of another
+        # kind raised WrongChannelKindError — so a reply channel the design
+        # makes a `stream` (run/<run>/telemetry) killed lane startup (store-
+        # lane finding). Existing channels of any kind are left alone; the
+        # reply channel only receives log.append, which any kind accepts.
+        # WATCHED channels must be broadcast (the loop reads cursors), so a
+        # watched channel of another kind is a one-line usage error.
         with db.connection(db_path) as conn:
             for name in channels:
-                channels_mod.ensure_channel(conn, name, kind="broadcast")
+                kind = ensure_absent_as_broadcast(conn, name)
+                if kind != "broadcast":
+                    die(
+                        f"watched channel {name!r} is kind {kind!r}; raven acp "
+                        "reads cursors, which need a 'broadcast' channel",
+                        EXIT_USAGE,
+                    )
             if reply_to is not None:
-                channels_mod.ensure_channel(conn, reply_to, kind="broadcast")
+                ensure_absent_as_broadcast(conn, reply_to)
 
     config = HarnessConfig(
         consumer=as_,
@@ -129,13 +170,24 @@ def acp(
         cwd=cwd,
         mode=mode,
         initial_prompt=initial_prompt,
+        timeout_s=timeout,
     )
 
     try:
+        # Tell a raven hook inside the agent which consumer/channels this
+        # harness already delivers, so it doesn't re-announce them during
+        # the very turn that injects them (QA finding A11; peek skips
+        # exactly these channels for exactly this consumer).
+        child_env = {
+            **os.environ,
+            ENV_ACP_CONSUMER: as_,
+            ENV_ACP_CHANNELS: ",".join(channels),
+        }
         child = subprocess.Popen(
             agent_argv,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
+            env=child_env,
         )
     except OSError as exc:
         # A missing/unlaunchable agent must render as the CLI's one-line

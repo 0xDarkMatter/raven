@@ -267,8 +267,9 @@ def test_bad_channel_grammar_is_silent_exit_zero(tmp_path):
 
 
 def test_missing_db_path_is_exit_zero(tmp_path):
-    # A genuinely absent DB in a creatable dir: init_db creates it, the
-    # inbox is empty, and the hook stays silent. Graceful, exit 0.
+    # A genuinely absent DB in a creatable dir: silent, exit 0 — and the
+    # hook must NOT create it (it is read-only; QA finding A10 — it used
+    # to run init_db on every tool call).
     missing = tmp_path / "nested" / "does-not-exist.db"
 
     result = run_peek(
@@ -277,6 +278,8 @@ def test_missing_db_path_is_exit_zero(tmp_path):
 
     assert result.returncode == 0
     assert result.stdout == ""
+    assert not missing.exists()
+    assert not missing.parent.exists()
 
 
 def test_unopenable_db_is_caught_exit_zero(tmp_path):
@@ -391,7 +394,7 @@ def test_real_policy_notice_names_the_pull_command_and_omits_bodies(tmp_path):
 
     assert result.returncode == 0
     out = additional_context(result.stdout)
-    assert f"raven read --channel {CHANNEL} --as {CONSUMER}" in out
+    assert f"raven read --framed --channel {CHANNEL} --as {CONSUMER}" in out
     assert "orchestrator@run-a" in out
     assert "BODY-MUST-NOT-APPEAR" not in out
 
@@ -637,7 +640,7 @@ def test_wrapper_honours_raven_python(tmp_path):
     )
 
     assert result.returncode == 0
-    assert f"raven read --channel {CHANNEL} --as {CONSUMER}" in additional_context(result.stdout)
+    assert f"raven read --framed --channel {CHANNEL} --as {CONSUMER}" in additional_context(result.stdout)
 
 
 # --------------------------------------------------------------------------- #
@@ -725,3 +728,286 @@ def test_inprocess_empty_inbox_is_silent(monkeypatch, capsys, tmp_path):
     assert peek_mod.peek() == 0
     captured = capsys.readouterr()
     assert captured.out == ""
+
+
+# --------------------------------------------------------------------------- #
+# QA finding A8 — one bad watched channel silenced the whole notice.
+# --------------------------------------------------------------------------- #
+def _inprocess_env(monkeypatch, db_path: Path, channels: str) -> None:
+    monkeypatch.setenv("RAVEN_CONSUMER", CONSUMER)
+    monkeypatch.setenv("RAVEN_CHANNELS", channels)
+    monkeypatch.setenv("RAVEN_DB", str(db_path))
+    for key in ("RAVEN_ACP_CONSUMER", "RAVEN_ACP_CHANNELS"):
+        monkeypatch.delenv(key, raising=False)
+
+
+@pytest.mark.parametrize("order", ["bad-first", "bad-last"])
+def test_missing_or_non_broadcast_channel_is_skipped_not_fatal(
+    monkeypatch, capsys, tmp_path, order
+):
+    """probe_hook_unknown: a watched channel that doesn't exist (or is a
+    queue) raised inside the catch-all and dropped the notice for the
+    valid channel — a BLOCKING message included. Now it's skipped, with
+    one breadcrumb, and never created."""
+    from raven_bus import channels, db
+    from raven_bus.adapters.hooks import peek as peek_mod
+
+    db_path = tmp_path / "bus.db"
+    seed_channel(db_path, CHANNEL, [("stop", "blocking", {})], sender="boss@run-a")
+    with db.connection(db_path) as conn:
+        channels.ensure_channel(conn, "run/v0-2/jobs", "queue")
+    bad = "run/v0-2/nope,run/v0-2/jobs"
+    _inprocess_env(
+        monkeypatch, db_path, f"{bad},{CHANNEL}" if order == "bad-first" else f"{CHANNEL},{bad}"
+    )
+
+    assert peek_mod.peek() == 0
+
+    captured = capsys.readouterr()
+    notice = additional_context(captured.out)
+    assert "highest urgency: blocking" in notice
+    assert f"--channel {CHANNEL} " in notice
+    assert captured.err == (
+        "raven-inbox-hook: skipped channel(s) that are missing or not broadcast: "
+        "run/v0-2/nope, run/v0-2/jobs\n"
+    )
+    with db.connection(db_path) as conn:
+        names = [c.name for c in channels.list_channels(conn)]
+    assert "run/v0-2/nope" not in names  # the hook stays read-only
+
+
+# --------------------------------------------------------------------------- #
+# QA finding A10 — the hook wrote on every tool call (init_db, sweep,
+# consumers.touch) and stalled ~5 s under another writer's lock.
+# --------------------------------------------------------------------------- #
+def test_hook_read_path_issues_no_writes(monkeypatch, capsys, tmp_path):
+    """Every statement the hook runs is a SELECT, on a connection SQLite
+    itself makes read-only; no other connection sees a commit
+    (data_version unchanged) and no presence row appears."""
+    import sqlite3
+
+    from raven_bus.adapters.hooks import peek as peek_mod
+
+    db_path = tmp_path / "bus.db"
+    seed_channel(db_path, CHANNEL, [("a", "prompt", {}), ("b", "fyi", {})])
+    _inprocess_env(monkeypatch, db_path, CHANNEL)
+
+    statements: list[str] = []
+    real_connect = peek_mod._connect
+
+    def _traced(path):
+        conn = real_connect(path)
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(peek_mod, "_connect", _traced)
+    observer = sqlite3.connect(db_path)
+    before = observer.execute("PRAGMA data_version").fetchone()[0]
+
+    assert peek_mod.peek() == 0
+
+    assert "raven read --framed" in additional_context(capsys.readouterr().out)
+    assert statements and all(s.lstrip().upper().startswith("SELECT") for s in statements)
+    assert observer.execute("PRAGMA data_version").fetchone()[0] == before
+    assert observer.execute(
+        "SELECT COUNT(*) FROM consumers WHERE id = ?", (CONSUMER,)
+    ).fetchone()[0] == 0
+    observer.close()
+
+
+def test_hook_connection_refuses_writes(tmp_path):
+    import sqlite3
+
+    from raven_bus.adapters.hooks import peek as peek_mod
+
+    db_path = tmp_path / "bus.db"
+    seed_channel(db_path, CHANNEL, [])
+    conn = peek_mod._connect(db_path)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            conn.execute("DELETE FROM channels")
+    finally:
+        conn.close()
+
+
+def test_hook_is_not_stalled_by_another_writers_lock(monkeypatch, capsys, tmp_path):
+    """probe_hooklock: with another process mid-transaction (BEGIN
+    IMMEDIATE), the old hook blocked ~5 s on its sweep UPDATE and then
+    dropped the notice. A pure WAL reader is not blocked at all."""
+    import sqlite3
+    import time
+
+    from raven_bus.adapters.hooks import peek as peek_mod
+
+    db_path = tmp_path / "bus.db"
+    seed_channel(db_path, CHANNEL, [("stop", "blocking", {})])
+    _inprocess_env(monkeypatch, db_path, CHANNEL)
+    writer = sqlite3.connect(db_path, isolation_level=None)
+    writer.execute("BEGIN IMMEDIATE")
+    try:
+        started = time.monotonic()
+        assert peek_mod.peek() == 0
+        elapsed = time.monotonic() - started
+    finally:
+        writer.execute("ROLLBACK")
+        writer.close()
+
+    assert elapsed < 1.5
+    assert "highest urgency: blocking" in additional_context(capsys.readouterr().out)
+
+
+def test_inprocess_missing_db_is_silent_and_not_created(monkeypatch, capsys, tmp_path):
+    from raven_bus.adapters.hooks import peek as peek_mod
+
+    missing = tmp_path / "absent.db"
+    _inprocess_env(monkeypatch, missing, CHANNEL)
+    assert peek_mod.peek() == 0
+    assert capsys.readouterr().out == ""
+    assert not missing.exists()
+
+
+# --------------------------------------------------------------------------- #
+# QA finding A11 (mitigation) — a hook inside a harness-driven agent.
+# --------------------------------------------------------------------------- #
+def test_hook_skips_channels_its_own_harness_delivers(monkeypatch, capsys, tmp_path):
+    """`raven acp` marks its child's env with the consumer + channels it
+    serves; the hook skips exactly those (the harness injects them and
+    acks after the turn, so announcing them mid-turn is a double
+    delivery). Another consumer, or another channel, still gets its
+    notice."""
+    from raven_bus.adapters.hooks import peek as peek_mod
+
+    db_path = tmp_path / "bus.db"
+    other = "run/v0-2/other"
+    seed_channel(db_path, CHANNEL, [("a", "prompt", {})])
+    seed_channel(db_path, other, [("b", "prompt", {})])
+    _inprocess_env(monkeypatch, db_path, f"{CHANNEL},{other}")
+    monkeypatch.setenv("RAVEN_ACP_CONSUMER", CONSUMER)
+    monkeypatch.setenv("RAVEN_ACP_CHANNELS", CHANNEL)
+
+    assert peek_mod.peek() == 0
+    notice = additional_context(capsys.readouterr().out)
+    assert f"--channel {other} " in notice
+    assert f"--channel {CHANNEL} " not in notice
+
+    monkeypatch.setenv("RAVEN_ACP_CHANNELS", f"{CHANNEL},{other}")
+    assert peek_mod.peek() == 0
+    assert capsys.readouterr().out == ""  # everything is the harness's
+
+    monkeypatch.setenv("RAVEN_ACP_CONSUMER", "someone-else@run-a")
+    assert peek_mod.peek() == 0
+    assert f"--channel {CHANNEL} " in additional_context(capsys.readouterr().out)
+
+
+# --------------------------------------------------------------------------- #
+# QA finding A14 — the wrapper's interpreter choice and CRLF copies.
+# --------------------------------------------------------------------------- #
+def _shim(bin_dir: Path, name: str, body: str) -> None:
+    """A fake interpreter on PATH: a POSIX sh script (Git Bash runs a
+    shebang file without an extension)."""
+    shim = bin_dir / name
+    shim.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8", newline="\n")
+    shim.chmod(0o755)
+
+
+def _run_wrapper(tmp_path: Path, env: dict[str, str], wrapper: Path = WRAPPER):
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash not available — wrapper smoke is Git Bash/POSIX only")
+    return subprocess.run(
+        [bash, str(wrapper)], env=env, capture_output=True, text=True, timeout=60.0,
+        check=False,
+    )
+
+
+_REAL = Path(sys.executable).as_posix()
+
+
+def _wrapper_env(tmp_path: Path, bin_dir: Path) -> dict[str, str]:
+    db_path = tmp_path / "bus.db"
+    seed_channel(db_path, CHANNEL, [("steer", "prompt", {})])
+    env = _env(RAVEN_CONSUMER=CONSUMER, RAVEN_CHANNELS=CHANNEL, RAVEN_DB=str(db_path))
+    env.pop("RAVEN_PYTHON", None)
+    for key in ("RAVEN_ACP_CONSUMER", "RAVEN_ACP_CHANNELS"):
+        env.pop(key, None)
+    env["PATH"] = str(bin_dir)
+    return env
+
+
+def _one_notice(stdout: str) -> str:
+    assert stdout.count("\n") == 1, stdout  # exactly one JSON line — never two
+    return additional_context(stdout)
+
+
+@pytest.mark.parametrize(
+    "broken_python3",
+    [
+        "exit 49",  # the Windows Store stub: stderr-only, non-zero
+        f'exec "{_REAL}" -m raven_bus_no_such_module "$@"',  # no raven_bus there
+    ],
+    ids=["store-stub", "import-fails"],
+)
+def test_wrapper_falls_back_from_python3_to_python(tmp_path, broken_python3):
+    """No RAVEN_PYTHON: python3 first, then python. A python3 that can't
+    run peek writes nothing to stdout, so the fallback prints once."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _shim(bin_dir, "python3", broken_python3)
+    _shim(bin_dir, "python", f'exec "{_REAL}" "$@"')
+
+    result = _run_wrapper(tmp_path, _wrapper_env(tmp_path, bin_dir))
+
+    assert result.returncode == 0
+    assert f"--channel {CHANNEL} --as {CONSUMER}" in _one_notice(result.stdout)
+
+
+def test_wrapper_prefers_python3_and_never_runs_a_second_interpreter(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _shim(bin_dir, "python3", f'exec "{_REAL}" "$@"')
+    _shim(bin_dir, "python", 'echo "SECOND-INTERPRETER-RAN"')
+
+    result = _run_wrapper(tmp_path, _wrapper_env(tmp_path, bin_dir))
+
+    assert result.returncode == 0
+    assert "SECOND-INTERPRETER-RAN" not in result.stdout
+    _one_notice(result.stdout)
+
+
+def test_wrapper_does_not_second_guess_an_explicit_raven_python(tmp_path):
+    """RAVEN_PYTHON names THE interpreter: when it is wrong the hook stays
+    silent (exit 0) rather than quietly using some other python."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _shim(bin_dir, "python3", f'exec "{_REAL}" "$@"')
+    env = _wrapper_env(tmp_path, bin_dir)
+    env["RAVEN_PYTHON"] = (tmp_path / "no-such-python").as_posix()
+
+    result = _run_wrapper(tmp_path, env)
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+
+
+def test_wrapper_command_lines_are_crlf_safe():
+    """Every command line ends in ' #' and the command block has no blank
+    line, so a CRLF copy's stray \\r always lands in a comment. (Linux
+    bash exits 2 — PreToolUse's BLOCKING code — on `exit 0\\r`; Git
+    Bash hides this by stripping CRs, hence a structural check too.)"""
+    lines = WRAPPER.read_text(encoding="utf-8").splitlines()
+    first_cmd = next(i for i, line in enumerate(lines) if line and not line.startswith("#"))
+    block = lines[first_cmd:]
+    assert all(line.strip() for line in block), "blank line in the command block"
+    commands = [line for line in block if not line.lstrip().startswith("#")]
+    assert commands and all(line.endswith(" #") for line in commands), commands
+
+
+def test_wrapper_crlf_copy_still_exits_zero(tmp_path):
+    crlf = tmp_path / "raven-inbox-hook.sh"
+    crlf.write_bytes(WRAPPER.read_bytes().replace(b"\n", b"\r\n"))
+    env = _env()  # no RAVEN_CONSUMER: the silent path
+
+    result = _run_wrapper(tmp_path, env, crlf)
+
+    assert result.returncode == 0
+    assert result.stdout == ""
