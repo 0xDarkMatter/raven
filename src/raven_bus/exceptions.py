@@ -32,3 +32,9 @@ class ClaimDeniedError(RavenBusError):
 class WrongChannelKindError(RavenBusError):
     """Operation not valid for this channel kind (e.g. claim on a
     broadcast channel, cursor-ack on a queue)."""
+
+
+class InvalidBodyError(RavenBusError, ValueError):
+    """A message body the store refuses to write — today, one nested
+    deeper than ``log.MAX_BODY_DEPTH`` (readers could not re-serialise
+    it). A ``ValueError`` like :class:`InvalidAddressError`: bad input."""

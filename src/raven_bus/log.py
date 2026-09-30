@@ -20,6 +20,7 @@ from typing import Any
 from raven_bus import channels, consumers
 from raven_bus.exceptions import (
     InvalidAddressError,
+    InvalidBodyError,
     UnknownChannelError,
     UnknownMessageError,
 )
@@ -27,6 +28,52 @@ from raven_bus.models import URGENCY_RANK, Message, Urgency, parse_consumer_id, 
 
 _SELECT = "SELECT * FROM messages"
 _NOW_SQL = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+_MAX_SQLITE_INT = 2**63 - 1
+
+MAX_BODY_DEPTH = 64
+"""Deepest container nesting ``append`` accepts (the body dict itself is
+depth 1). WHY a cap at the single writer (QA store #12): ``json.dumps``
+takes ~1000 levels, but pydantic's JSON serializer — every HTTP reader,
+and the HTTP claim response — gives up at ~100 (the Message wrapper
+adds one more), so a deeper body was storable yet unreadable, and a
+claim leased a message it could not return. 64 leaves headroom under
+that limit; raising it past ~99 re-opens the bug."""
+
+
+def _check_body_depth(body: Any) -> None:
+    """Raise :class:`InvalidBodyError` if any dict/list/tuple in ``body``
+    sits deeper than :data:`MAX_BODY_DEPTH`. Iterative on purpose: a
+    recursive walk (or json.dumps) dies with RecursionError on the very
+    bodies this guards against."""
+    stack: list[tuple[Any, int]] = [(body, 1)]
+    while stack:
+        value, depth = stack.pop()
+        if isinstance(value, dict):
+            children: Any = value.values()
+        elif isinstance(value, list | tuple):
+            children = value
+        else:
+            continue
+        if depth > MAX_BODY_DEPTH:
+            raise InvalidBodyError(
+                f"message body is nested deeper than {MAX_BODY_DEPTH} levels"
+            )
+        stack.extend((child, depth + 1) for child in children)
+
+
+def _require_message(conn: sqlite3.Connection, message_id: int, what: str) -> sqlite3.Row:
+    """The referenced message's ``(id, thread_id)`` row, or
+    :class:`UnknownMessageError` naming ``what`` (reply_to / thread_id).
+    Ids outside SQLite's positive INTEGER range cannot exist; checking
+    that in Python keeps them from raising OverflowError on bind."""
+    row = None
+    if 0 < message_id <= _MAX_SQLITE_INT:
+        row = conn.execute(
+            "SELECT id, thread_id FROM messages WHERE id = ?", (message_id,)
+        ).fetchone()
+    if row is None:
+        raise UnknownMessageError(f"{what} {message_id!r}: message does not exist")
+    return row
 
 
 def _format_ts(dt: datetime) -> str:
@@ -89,7 +136,12 @@ def append(
     - ``thread_id`` inherits from the ``reply_to`` parent when unset
       (parent's thread_id, else the parent id itself) — v1's proven
       conversation rule.
-    - body is JSON-serialised ``sort_keys=True, ensure_ascii=False``.
+    - ``reply_to`` / explicit ``thread_id`` must name existing messages
+      (:class:`UnknownMessageError`; previously a raw FK IntegrityError —
+      QA store #4). Cross-channel references are allowed.
+    - body is JSON-serialised ``sort_keys=True, ensure_ascii=False``;
+      nesting deeper than :data:`MAX_BODY_DEPTH` raises
+      :class:`InvalidBodyError` before anything is written.
     """
     parse_consumer_id(sender)  # early ADR-002 validation
     if urgency not in URGENCY_RANK:
@@ -97,6 +149,7 @@ def append(
             f"urgency {urgency!r} must be one of {sorted(URGENCY_RANK)}"
         )
     clean_tags = validate_tags(tags)
+    _check_body_depth(body)
 
     consumers.touch(conn, sender)
 
@@ -110,12 +163,14 @@ def append(
         # ensure_channel is race-safe on its own regardless.
         chan = channels.ensure_channel(conn, channel)
 
+    # Checked under touch()'s write lock, so a referenced message can't be
+    # torn down between this check and the INSERT's FK check.
     resolved_thread_id = thread_id
-    if reply_to is not None and thread_id is None:
-        parent = conn.execute(
-            "SELECT id, thread_id FROM messages WHERE id = ?", (reply_to,)
-        ).fetchone()
-        if parent is not None:
+    if thread_id is not None:
+        _require_message(conn, thread_id, "thread_id")
+    if reply_to is not None:
+        parent = _require_message(conn, reply_to, "reply_to")
+        if thread_id is None:
             resolved_thread_id = (
                 parent["thread_id"] if parent["thread_id"] is not None else parent["id"]
             )
@@ -201,4 +256,4 @@ def read_thread(conn: sqlite3.Connection, thread_id: int) -> list[Message]:
     return messages
 
 
-__all__ = ["append", "read_after", "read_by_id", "read_thread"]
+__all__ = ["MAX_BODY_DEPTH", "append", "read_after", "read_by_id", "read_thread"]
