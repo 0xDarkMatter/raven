@@ -81,7 +81,7 @@ def acp(
         help=(
             "File whose contents are sent VERBATIM as the session's first "
             "prompt (the lane's task packet) before the bus loop starts. "
-            "Trusted spawner input — bus messages stay data-framed; a task "
+            "Trusted spawner input - bus messages stay data-framed; a task "
             "delivered as a bus message reads as data and a well-behaved "
             "agent refuses it."
         ),
@@ -92,7 +92,7 @@ def acp(
         help=(
             "Inactivity limit in seconds: exit 10 when the agent sends "
             "nothing for this long (every streamed update resets it). "
-            "Default: none — a healthy agent is silent while a long tool "
+            "Default: none - a healthy agent is silent while a long tool "
             "call runs, and a dead agent is detected without it."
         ),
     ),

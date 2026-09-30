@@ -342,7 +342,7 @@ def test_render_digest_line_truncates_long_body():
     m = _msg(1, body={"text": "x" * 500})
     line = render_digest_line(m)
     assert len(line) < 500
-    assert "…" in line
+    assert "..." in line
 
 
 def test_render_digest_line_includes_id_sender_type():
@@ -710,8 +710,8 @@ def test_huge_type_and_sender_render_is_bounded():
     )
     text = render(InjectionPlan(interrupt=[m]))
     assert len(text) < MAX_BODY_RENDER_CHARS + 4 * MAX_IDENT_RENDER_CHARS
-    assert "…[type truncated: 199800 chars omitted]" in text
-    assert "…[sender truncated: 8803 chars omitted]" in text
+    assert "...[type truncated: 199800 chars omitted]" in text
+    assert "...[sender truncated: 8803 chars omitted]" in text
 
 
 def test_digest_line_sender_is_bounded_and_clamped():
@@ -845,7 +845,7 @@ def test_hint_never_truncates_a_channel_inside_a_command():
     read_lines = [line for line in lines if " Read: " in line]
     assert len(read_lines) == 1 and "--channel run/demo/ok " in read_lines[0]
     assert any(line.startswith("- +1 more channel(s): run/aaa") for line in lines)
-    assert not any("…" in line for line in read_lines)
+    assert not any("..." in line for line in read_lines)
 
 
 def test_hint_uses_a_placeholder_for_a_consumer_it_cannot_embed():
@@ -860,7 +860,7 @@ def test_hint_more_line_is_bounded():
     spread = [_on(_msg(i), f"run/demo/{'c' * 100}{i}") for i in range(1, 40)]
     lines = render_hint(spread, consumer=_ME, now=_SOON).splitlines()
     more = [line for line in lines if line.startswith("- +")]
-    assert len(more) == 1 and more[0].endswith(" …")
+    assert len(more) == 1 and more[0].endswith(" ...")
     assert len(more[0]) <= 310
 
 

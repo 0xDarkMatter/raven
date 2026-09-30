@@ -101,7 +101,7 @@ class HarnessConfig(BaseModel):
         if self.reply_channel is not None and self.reply_channel in self.channels:
             raise ValueError(
                 f"reply_channel {self.reply_channel!r} is also a watched "
-                "channel — the harness would inject its own telemetry back "
+                "channel - the harness would inject its own telemetry back "
                 "into the agent"
             )
         return self

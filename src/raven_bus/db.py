@@ -93,7 +93,7 @@ def init_db(db_path: str | Path | None = None, *, force: bool = False) -> Path:
         raise SchemaMismatchError(
             f"{resolved} was created by schema version {stored!r}; this "
             f"raven_bus expects version {SCHEMA_VERSION!r} and does not "
-            "migrate old files — point RAVEN_DB/db_path at a fresh path"
+            "migrate old files - point RAVEN_DB/db_path at a fresh path"
         )
     # Unstamped but readable: only raven's own tables may be adopted.
     adopting = False
@@ -104,7 +104,7 @@ def init_db(db_path: str | Path | None = None, *, force: bool = False) -> Path:
             raise SchemaMismatchError(
                 f"{resolved} has no raven schema stamp but holds tables raven "
                 f"did not create ({', '.join(foreign)}); refusing to adopt it "
-                "— point RAVEN_DB/db_path at a fresh path"
+                "- point RAVEN_DB/db_path at a fresh path"
             )
         adopting = bool(tables)
 
@@ -132,7 +132,7 @@ def init_db(db_path: str | Path | None = None, *, force: bool = False) -> Path:
                     raise SchemaMismatchError(
                         f"{resolved} holds raven-named tables but no schema "
                         f"stamp, and the v2 schema does not apply over them "
-                        f"({exc}) — point RAVEN_DB/db_path at a fresh path"
+                        f"({exc}) - point RAVEN_DB/db_path at a fresh path"
                     ) from exc
                 raise
             # Another process is initialising the same file right now.
@@ -234,7 +234,7 @@ def _open_existing(resolved: Path, *, cross_thread: bool = False) -> sqlite3.Con
     except sqlite3.OperationalError as exc:
         raise StoreUnavailableError(
             f"{resolved} is missing or cannot be opened ({exc}); nothing was "
-            "created — re-initialise it (e.g. restart `raven serve`)"
+            "created - re-initialise it (e.g. restart `raven serve`)"
         ) from exc
 
 
@@ -263,7 +263,7 @@ def probe(db_path: str | Path | None = None) -> str:
         # 'no such table: bus_meta' / 'file is not a database': the file
         # opened but is not raven's.
         raise SchemaMismatchError(
-            f"{resolved} is not a raven store ({exc}) — point RAVEN_DB/db_path "
+            f"{resolved} is not a raven store ({exc}) - point RAVEN_DB/db_path "
             "at a raven v2 store"
         ) from exc
     finally:
@@ -464,7 +464,7 @@ def _teardown_blocked(
     return TeardownBlockedError(
         f"cannot tear down run {run!r}: {total} message(s) outside it reply to "
         f"or thread under its messages ({shown}{more}); deleting would orphan "
-        "them (the schema's foreign keys forbid it) — nothing was deleted",
+        "them (the schema's foreign keys forbid it) - nothing was deleted",
         blockers=blockers,
         total=total,
     )

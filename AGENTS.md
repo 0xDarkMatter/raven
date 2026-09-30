@@ -253,6 +253,10 @@ Frozen — flags may grow, commands may not. The full flag table is
 usage / `3` not-found / `10` error (`cli/_common.py`); failures are ONE line
 `error: …`, tracebacks never reach users. Consumer ids are `<role>@<run>`,
 channels path-style, atoms lowercase `[a-z0-9][a-z0-9._-]*` (ADR-002).
+**Every string raven itself emits is ASCII** (use ` - `, `...`, not em
+dashes or ellipses): Windows encodes a piped stdout/stderr as cp1252, so a
+non-ASCII character reaches a UTF-8 reader as U+FFFD. `test_invariants.py`
+gates it; message content is the sender's and exempt.
 
 ## Out of scope
 

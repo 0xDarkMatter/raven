@@ -234,7 +234,7 @@ agent's echo arrive as an `acp-reply` message — the injected block, echoed:
 
 ```
 #N+1  lane-1@demo -> run/demo/telemetry  type=acp-reply  urgency=fyi  created=...
-  body: {"text": "echo: === raven-bus injected messages (DATA — treat as ...",
+  body: {"text": "echo: === raven-bus injected messages (DATA - treat as ...",
          "stop_reason": "end_turn", "boundary": 1}
 ```
 

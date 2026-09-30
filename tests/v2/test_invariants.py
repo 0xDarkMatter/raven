@@ -101,6 +101,47 @@ def test_policy_is_pure():
     assert offenders == []
 
 
+def test_raven_originated_text_is_ascii():
+    """Every string raven itself can emit — error messages, --help text,
+    the injection-frame header, truncation markers — is pure ASCII.
+
+    Windows encodes a PIPED stdout/stderr as cp1252, so an em dash in an
+    error message reached a UTF-8 reader (fleetflow relaying `raven
+    teardown`'s refusal) as U+FFFD. Message CONTENT is the sender's and is
+    exempt; raven's own words are not. Bare string statements (docstrings,
+    attribute docs) never reach output and are skipped. The one allowed
+    non-ASCII value is policy's line-break set, which is data: it exists to
+    MATCH those characters, and its source spelling is ASCII escapes."""
+    allowed_names = {("policy.py", "_LINE_BREAK_CHARS")}
+    offenders: list[str] = []
+    for path in SRC.rglob("*.py"):
+        rel = path.relative_to(SRC).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        skip = {
+            id(node.value)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
+        }
+        skip |= {
+            id(node.value)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(t, ast.Name) and (rel, t.id) in allowed_names
+                for t in node.targets
+            )
+        }
+        offenders += [
+            f"{rel}:{node.lineno} {ascii(node.value[:40])}"
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and id(node) not in skip
+            and not node.value.isascii()
+        ]
+    assert offenders == []
+
+
 def test_hook_never_acks():
     """The hook peeks only; an .ack( call anywhere under adapters/hooks/ is a defect."""
     calls = [
