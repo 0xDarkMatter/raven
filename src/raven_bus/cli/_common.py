@@ -83,12 +83,30 @@ def echo_json(payload: Any) -> None:
 
 
 def echo_message_human(msg: Message) -> None:
+    """Human form of one message: exactly one header line (+ body/tags).
+
+    ``type`` is free text and ``sender`` is only grammar-checked at
+    append time, so both go through ``policy.single_line`` — printed raw,
+    a newline (or U+2028, NEL, …) in ``type`` forged a whole, fully
+    attributed message line in an agent's ``raven read`` (QA finding A3).
+    The body stays one line of ASCII-escaped JSON. Characters the stdout
+    encoding can't take (a cp1252 Windows pipe) print as backslash
+    escapes rather than raising."""
+    import sys
+
+    from raven_bus.policy import single_line
+
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+
+    def _field(value: str) -> str:
+        return single_line(value).encode(encoding, "backslashreplace").decode(encoding)
+
     typer.echo(
-        f"#{msg.id}  {msg.sender} -> {msg.channel}  "
-        f"type={msg.type}  urgency={msg.urgency}  "
+        f"#{msg.id}  {_field(msg.sender)} -> {msg.channel}  "
+        f"type={_field(msg.type)}  urgency={msg.urgency}  "
         f"created={msg.created_at.isoformat()}"
     )
-    typer.echo(f"  body: {json.dumps(msg.body, sort_keys=True)}")
+    typer.echo(f"  body: {json.dumps(msg.body, sort_keys=True, ensure_ascii=True)}")
     if msg.tags:
         typer.echo(f"  tags: {', '.join(msg.tags)}")
 

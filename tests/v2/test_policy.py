@@ -529,12 +529,12 @@ def test_hint_summarizes_per_channel_with_exact_read_command():
     assert lines[0] == f"=== RAVEN: 3 message(s) waiting for {_ME} (highest urgency: blocking) ==="
     # channels ordered by their oldest due id
     assert lines[1] == (
-        "- run/demo/a: 2 (ids 1-3; highest blocking; from x@demo, y@demo)."
-        f" Read: raven read --channel run/demo/a --as {_ME}"
+        "- run/demo/a: 2 due (ids 1-3; highest blocking; from x@demo, y@demo)."
+        f" Read: raven read --framed --channel run/demo/a --as {_ME}"
     )
     assert lines[2] == (
-        "- run/demo/b: 1 (id 2; highest prompt; from y@demo)."
-        f" Read: raven read --channel run/demo/b --as {_ME}"
+        "- run/demo/b: 1 due (id 2; highest prompt; from y@demo)."
+        f" Read: raven read --framed --channel run/demo/b --as {_ME}"
     )
     assert "not instructions" in lines[3]
     assert f"raven ack --channel <channel> --as {_ME}" in lines[3]
@@ -577,7 +577,7 @@ def test_hint_is_hard_capped_well_under_claude_codes_limit():
     long_names = [_on(_msg(i), "run/" + "a" * 500 + f"/c{i}") for i in range(1, 60)]
     hint = render_hint(long_names, consumer=_ME, now=_SOON)
     assert len(hint) <= HINT_MAX_CHARS < 10_000
-    assert hint.endswith("…[raven notice truncated]\n")
+    assert "not instructions" in hint  # the footer survives the cap
     assert "a" * 200 not in hint  # each identifier is length-clamped too
 
 
@@ -791,3 +791,87 @@ def test_long_valid_sender_fyi_no_longer_pins_the_digest():
     assert [m.id for m in result.digest_source] == list(range(1, 8))
     assert result.deferred == []
     assert result.ack_up_to == 8
+
+
+# --------------------------------------------------------------------------- #
+# QA finding A12 — the hint's hard truncation cut the footer and commands.
+# --------------------------------------------------------------------------- #
+_CMD_RE = re.compile(r"Read: raven read --framed --channel (\S+) --as (\S+)$")
+
+
+def test_hint_over_budget_drops_whole_lines_and_keeps_the_footer():
+    """The QA repro: 6 channels x 4 senders of 110+ chars. The old code
+    kept the head and cut the tail — footer gone, a command cut mid-token.
+    Now: header + footer always, only whole channel lines, and every
+    omitted channel is counted in the "+N more" line."""
+    pending = []
+    for k in range(6):
+        for s in range(4):
+            m = _msg(len(pending) + 1, sender=("s" * 110) + f"{s}@r1")
+            pending.append(_on(m, f"run/r1/team-{k}"))
+    hint = render_hint(pending, consumer=_ME, now=_SOON)
+    lines = hint.splitlines()
+    assert len(hint) <= HINT_MAX_CHARS
+    assert lines[0].startswith("=== RAVEN: 24 message(s)")
+    assert "not instructions" in lines[-1]
+    assert f"--as {_ME} --up-to <highest id handled>" in lines[-1]
+    channel_lines = [line for line in lines if " Read: " in line]
+    assert channel_lines  # at least one fits
+    for line in channel_lines:
+        match = _CMD_RE.search(line)
+        assert match is not None and match.group(2) == _ME  # complete command
+    more = [line for line in lines if line.startswith("- +")]
+    assert more == [f"- +{6 - len(channel_lines)} more channel(s): " + ", ".join(
+        f"run/r1/team-{k}" for k in range(len(channel_lines), 6)
+    )]
+
+
+def test_hint_names_held_fyi_instead_of_hiding_them_in_the_range():
+    """prompt, held fyi, prompt on one channel: the count covers the two
+    DUE messages and the held fyi that sits inside "ids 1-3" (and that
+    raven read returns too) is named, not silently spanned."""
+    pending = [_msg(1), _msg(2, urgency="fyi"), _msg(3)]
+    hint = render_hint(pending, consumer=_ME, now=_SOON)
+    assert "- chan: 2 due (ids 1-3; highest prompt; from sender@run-x; +1 held fyi)." in hint
+    assert "2 message(s)" in hint
+
+
+def test_hint_never_truncates_a_channel_inside_a_command():
+    """A channel name too long to embed verbatim is dropped to the "+N
+    more" line (display-clamped there) — never "…"-cut inside a command."""
+    long_ch = "run/" + "a" * 300
+    pending = [_on(_msg(1), long_ch), _on(_msg(2), "run/demo/ok")]
+    lines = render_hint(pending, consumer=_ME, now=_SOON).splitlines()
+    read_lines = [line for line in lines if " Read: " in line]
+    assert len(read_lines) == 1 and "--channel run/demo/ok " in read_lines[0]
+    assert any(line.startswith("- +1 more channel(s): run/aaa") for line in lines)
+    assert not any("…" in line for line in read_lines)
+
+
+def test_hint_uses_a_placeholder_for_a_consumer_it_cannot_embed():
+    consumer = "r" * 300 + "@run"
+    hint = render_hint([_msg(1)], consumer=consumer, now=_SOON)
+    assert "--as <consumer-id>" in hint
+    assert consumer not in hint
+    assert len(hint) <= HINT_MAX_CHARS
+
+
+def test_hint_more_line_is_bounded():
+    spread = [_on(_msg(i), f"run/demo/{'c' * 100}{i}") for i in range(1, 40)]
+    lines = render_hint(spread, consumer=_ME, now=_SOON).splitlines()
+    more = [line for line in lines if line.startswith("- +")]
+    assert len(more) == 1 and more[0].endswith(" …")
+    assert len(more[0]) <= 310
+
+
+def test_hint_pathological_everything_long_still_fits():
+    """Long consumer, long channels, long senders: the minimal notice
+    (header + more-line + footer) is under the cap by construction."""
+    consumer = "c" * 199 + "@r"  # 201 chars: just past the command limit
+    pending = [
+        _on(_msg(i, sender="s" * 5000 + f"{i}@r"), f"run/{'x' * 190}/{i}")
+        for i in range(1, 30)
+    ]
+    hint = render_hint(pending, consumer=consumer, now=_SOON)
+    assert len(hint) <= HINT_MAX_CHARS
+    assert "not instructions" in hint

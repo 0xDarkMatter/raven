@@ -3,7 +3,8 @@
 A peek-only adapter (ADR-006): on every tool call it reads the consumer's
 pending messages and emits :func:`raven_bus.policy.render_hint`'s bounded
 pull notice as PreToolUse ``additionalContext`` JSON when any are due —
-never the message bodies (the agent pulls those with ``raven read``).
+never the message bodies (the agent pulls those with ``raven read
+--framed``, which keeps them inside policy's data frame).
 Silent when nothing is due; always exits 0. The real
 logic lives in :mod:`raven_bus.adapters.hooks.peek` (runnable as
 ``python -m raven_bus.adapters.hooks.peek``); the shell wrapper in this

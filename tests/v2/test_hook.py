@@ -391,7 +391,7 @@ def test_real_policy_notice_names_the_pull_command_and_omits_bodies(tmp_path):
 
     assert result.returncode == 0
     out = additional_context(result.stdout)
-    assert f"raven read --channel {CHANNEL} --as {CONSUMER}" in out
+    assert f"raven read --framed --channel {CHANNEL} --as {CONSUMER}" in out
     assert "orchestrator@run-a" in out
     assert "BODY-MUST-NOT-APPEAR" not in out
 
@@ -637,7 +637,7 @@ def test_wrapper_honours_raven_python(tmp_path):
     )
 
     assert result.returncode == 0
-    assert f"raven read --channel {CHANNEL} --as {CONSUMER}" in additional_context(result.stdout)
+    assert f"raven read --framed --channel {CHANNEL} --as {CONSUMER}" in additional_context(result.stdout)
 
 
 # --------------------------------------------------------------------------- #
