@@ -44,9 +44,10 @@ src/raven_bus/
 │                 UnknownChannelError, UnknownMessageError, ClaimDeniedError,
 │                 WrongChannelKindError, InvalidBodyError (also ValueError),
 │                 SchemaMismatchError (also RuntimeError), TeardownBlockedError,
-│                 StoreUnavailableError}
+│                 StoreUnavailableError, InvalidDbPathError (also ValueError)}
 │                 — every subclass is exported from `raven_bus` (a test pins it)
-├── paths.py      resolve_db_path(): arg > RAVEN_DB > ~/.raven/bus.db
+├── paths.py      resolve_db_path(): arg > RAVEN_DB > ~/.raven/bus.db; a relative
+│                 RAVEN_DB raises InvalidDbPathError (ADR-002 amendment); --db may be relative
 ├── db.py         init_db() (idempotent, process-cached; SchemaMismatchError on a
 │                 foreign file), connection(create=True) ctx mgr (WAL + foreign_keys
 │                 + Row, commit/rollback; create=False never makes a file — ravend),

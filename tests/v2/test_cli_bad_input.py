@@ -205,6 +205,33 @@ def test_teardown_eof_at_an_interactive_prompt_refuses(db: Path) -> None:
         assert log.read_after(conn, "run/r1/a", 0) != []
 
 
+def _refuse_bind(host: str, port: int) -> None:
+    raise OSError("test never binds")
+
+
+@pytest.mark.parametrize("argv", [["channels"], ["doctor"], ["serve"]])
+def test_relative_raven_db_is_a_usage_error_and_creates_no_db(
+    argv: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """QA S13: a relative RAVEN_DB used to resolve per cwd, so commands run
+    from different worktrees silently created/used different DBs. Now every
+    command refuses it as a usage error before any file is touched. doctor
+    and serve resolve outside ``handle_errors``, hence one case each."""
+    from raven_bus.cli import serve as serve_cmd
+
+    # If the check regressed, serve's preflight would pass - refuse the bind
+    # so the test fails fast instead of serving forever.
+    monkeypatch.setattr(serve_cmd, "_probe_bind", _refuse_bind)
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, argv, env={"RAVEN_DB": "bus.db"})
+
+    assert result.exit_code == 2, result.output
+    assert result.output.startswith("error: RAVEN_DB must be an absolute path")
+    assert result.output.count("\n") == 1  # one line, no traceback
+    assert not (tmp_path / "bus.db").exists()
+
+
 def test_stdin_is_interactive_reads_isatty(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sys, "stdin", None)
     assert teardown_cmd._stdin_is_interactive() is False

@@ -66,6 +66,14 @@ class StoreUnavailableError(RavenBusError):
     must never silently create an empty, schema-less file in its place."""
 
 
+class InvalidDbPathError(RavenBusError, ValueError):
+    """``RAVEN_DB`` is not an absolute path. The variable is inherited by
+    every child process, so a relative value resolved against each one's
+    cwd and split one run across several DBs - the v1 per-cwd bug ADR-002
+    removed (QA S13). An explicit ``db_path`` / ``--db`` stays
+    cwd-relative: it is a per-invocation file argument, not inherited."""
+
+
 class InvalidBodyError(RavenBusError, ValueError):
     """A message body the store refuses to write — today, one nested
     deeper than ``log.MAX_BODY_DEPTH`` (readers could not re-serialise

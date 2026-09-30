@@ -4,6 +4,20 @@ All notable changes to **raven** are recorded here.
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **`RAVEN_DB` must be an absolute path.** A relative value used to resolve
+  against each process's working directory, and every process inherits the
+  variable, so lanes started in different worktrees silently used different
+  DBs - the per-cwd split ADR-002 removed. raven now refuses it: every CLI
+  command exits 2 with `error: RAVEN_DB must be an absolute path ...`, and
+  the PreToolUse hook stays silent with one stderr line. `~` is still
+  expanded, and `--db` / `db_path` may still be relative (to the current
+  directory), as any file argument. New exception `InvalidDbPathError`
+  (also a `ValueError`). ADR-002 amendment; QA finding S13.
+
 ## [0.2.1] — 2026-10-01
 
 ### Fixed

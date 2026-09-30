@@ -676,6 +676,25 @@ def test_inprocess_bad_grammar_is_silent(monkeypatch, capsys):
     assert "bad config" in captured.err
 
 
+def test_inprocess_relative_raven_db_is_bad_config_not_per_cwd(monkeypatch, capsys, tmp_path):
+    """QA S13: a relative RAVEN_DB used to resolve against the hook's cwd,
+    so the notice depended on which directory the tool call ran in. It is
+    now a config error - silent stdout, one breadcrumb naming RAVEN_DB,
+    exit 0 - even when a DB with pending messages sits in the cwd."""
+    from raven_bus.adapters.hooks import peek as peek_mod
+
+    seed_channel(tmp_path / "bus.db", CHANNEL, [("a", "prompt", {})])
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("RAVEN_CONSUMER", CONSUMER)
+    monkeypatch.setenv("RAVEN_CHANNELS", CHANNEL)
+    monkeypatch.setenv("RAVEN_DB", "bus.db")
+
+    assert peek_mod.peek() == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "bad config: RAVEN_DB must be an absolute path" in captured.err
+
+
 def test_inprocess_catchall_swallows_everything(monkeypatch, capsys, tmp_path):
     from raven_bus.adapters.hooks import peek as peek_mod
 

@@ -31,7 +31,8 @@ call and must stay cheap and dependency-light):
   A listed channel that doesn't exist or isn't ``broadcast`` is skipped
   (one stderr breadcrumb) — it must not silence the valid ones.
 - ``RAVEN_DB``        optional; the store's normal resolution otherwise.
-  A missing DB file means silence — the hook never creates one.
+  Must be absolute (a relative one is bad config: silence + breadcrumb,
+  QA S13). A missing DB file means silence — the hook never creates one.
 - ``RAVEN_ACP_CONSUMER`` / ``RAVEN_ACP_CHANNELS`` are set by ``raven acp``
   in the agent it spawns: channels that harness already delivers for the
   same consumer are skipped (see ``_harness_served``).
@@ -129,19 +130,20 @@ def _peek_inner() -> int:
         )
         return 0
 
-    db_path = os.environ.get("RAVEN_DB") or None
-
     # Validate the consumer id + every channel name with the frozen
-    # models helpers BEFORE touching the store (ADR-002 grammar). A bad
-    # grammar is a configuration mistake, not a runtime error — stay
+    # models helpers, and resolve RAVEN_DB, BEFORE touching the store
+    # (ADR-002 grammar; a relative RAVEN_DB is refused - QA S13). A bad
+    # config is a configuration mistake, not a runtime error — stay
     # silent on stdout, one stderr breadcrumb, exit 0.
     from raven_bus.exceptions import RavenBusError
     from raven_bus.models import parse_consumer_id, validate_channel_name
+    from raven_bus.paths import resolve_db_path
 
     try:
         parse_consumer_id(consumer)
         for ch in channels:
             validate_channel_name(ch)
+        db_path = resolve_db_path()  # RAVEN_DB, else the default
     except RavenBusError as exc:
         print(f"raven-inbox-hook: bad config: {exc}", file=sys.stderr)
         return 0
@@ -181,7 +183,7 @@ def _connect(path: Path) -> sqlite3.Connection:
     return conn
 
 
-def _read_pending(consumer: str, channels: list[str], db_path: str | None) -> list:
+def _read_pending(consumer: str, channels: list[str], path: Path) -> list:
     """Pending messages across ``channels``, merged id-ascending — a pure
     read (QA finding A10: this path used to write on every tool call).
 
@@ -201,9 +203,7 @@ def _read_pending(consumer: str, channels: list[str], db_path: str | None) -> li
     from raven_bus import channels as channels_mod
     from raven_bus import cursors, log
     from raven_bus.exceptions import UnknownChannelError
-    from raven_bus.paths import resolve_db_path
 
-    path = resolve_db_path(db_path)
     if not path.is_file():
         return []
 

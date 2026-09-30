@@ -25,6 +25,8 @@ raven acp       --as R@RUN --channel C [--channel C]... [--reply-to C]
 ```
 
 Every command also takes `--db P` (else `RAVEN_DB`, else `~/.raven/bus.db`).
+`--db` may be relative to the cwd; `RAVEN_DB` must be absolute after `~`
+expansion, or every command exits 2 (ADR-002 amendment).
 
 ## Bounds (out of range = usage error, exit 2)
 

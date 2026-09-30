@@ -39,6 +39,27 @@ cover every run; `raven teardown --run <name>` deletes `run/<name>/%`.
 - **Session fence on sends** — the v1 footgun; host-global channels with
   convention-scoped names replace it.
 
+## Amendment (2026-10-01, QA S13)
+
+**`RAVEN_DB` must be an absolute path** (after `~` expansion); a relative
+value raises `InvalidDbPathError` — a usage error (exit 2) on every CLI
+command, and silence plus one stderr breadcrumb in the hook. The variable is
+inherited by every child process, so a relative value resolved against each
+one's cwd: lanes in different worktrees silently used different DBs, which is
+the v1 per-cwd split this ADR exists to remove. Windows `C:x` / `\x` count as
+relative (they depend on the current drive/dir).
+
+An explicit `--db` / `db_path` stays cwd-relative: it is a per-invocation
+file argument, not inherited, and the docs rely on it
+(`raven tail --db incident.db`). `paths.resolve_db_path` is the single
+enforcement point.
+
+Rejected: **warn and continue** — no one would see it (the hook wrapper
+discards stderr; fleetflow lanes run headless); **resolve against a stable
+anchor** (home, git root) — a surprising rewrite of what the user typed;
+**reject a relative `--db` too** — breaks ordinary file-argument semantics
+and the documented examples.
+
 ## Consequences
 
 - A v1-compat shim maps `BusClient(session_id, role)` onto a 2-consumer

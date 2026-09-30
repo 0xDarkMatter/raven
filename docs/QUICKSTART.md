@@ -9,7 +9,7 @@ raven version
 ```
 
 There is no `init` step. The DB is created on first use at `~/.raven/bus.db`
-(override with `RAVEN_DB`, or pass `--db` to any command). One host DB holds
+(override with an absolute `RAVEN_DB`, or pass `--db` to any command). One host DB holds
 every run; runs are namespaced by channel prefix (ADR-002).
 
 That default may be a live bus other tools are using (fleetflow writes to it),

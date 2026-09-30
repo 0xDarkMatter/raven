@@ -31,7 +31,8 @@ from pathlib import Path
 import typer
 
 from raven_bus import db
-from raven_bus.cli._common import EXIT_ERROR, die
+from raven_bus.cli._common import EXIT_ERROR, EXIT_USAGE, die
+from raven_bus.exceptions import InvalidDbPathError
 
 
 def serve(
@@ -75,6 +76,9 @@ def serve(
 
     try:
         db.init_db(db_path)
+    except InvalidDbPathError as exc:  # a relative RAVEN_DB: usage, like handle_errors maps it
+        die(str(exc), EXIT_USAGE)
+        return  # pragma: no cover -- die always raises
     except Exception as exc:  # noqa: BLE001 -- any preflight failure renders as the one-line CLI error
         die(str(exc), EXIT_ERROR)
         return  # pragma: no cover -- die always raises

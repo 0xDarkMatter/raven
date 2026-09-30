@@ -22,7 +22,8 @@ Config via environment:
 - `RAVEN_CHANNELS`  (comma-separated; REQUIRED when a consumer is set — no
   `run/<run>/lane/<role>` derivation). A missing or non-broadcast channel
   is skipped (one stderr line), not fatal.
-- `RAVEN_DB`        (optional; the store's normal resolution otherwise)
+- `RAVEN_DB`        (optional; the store's normal resolution otherwise. Must be
+  absolute - a relative one is bad config: silence plus one stderr line)
 - `RAVEN_PYTHON`    (optional; the interpreter the wrapper runs — default
   `python3`, then `python`; it must be one `raven_bus` is installed into)
 - `RAVEN_ACP_CONSUMER` / `RAVEN_ACP_CHANNELS` are set by `raven acp` in its

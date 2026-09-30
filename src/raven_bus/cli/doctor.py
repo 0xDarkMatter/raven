@@ -15,7 +15,7 @@ from pathlib import Path
 import typer
 
 from raven_bus import db
-from raven_bus.cli._common import EXIT_ERROR, EXIT_OK
+from raven_bus.cli._common import EXIT_ERROR, EXIT_OK, handle_errors
 from raven_bus.exceptions import SchemaMismatchError
 from raven_bus.paths import resolve_db_path
 
@@ -26,7 +26,8 @@ def cmd_doctor(
     db_path: Path | None = typer.Option(None, "--db", help="DB path override."),  # noqa: B008
 ) -> None:
     """Run a small battery of operational checks."""
-    resolved = resolve_db_path(db_path)
+    with handle_errors():  # a relative RAVEN_DB is a usage error, not a failed check
+        resolved = resolve_db_path(db_path)
     existed = resolved.exists()
     checks: list[tuple[str, str, str]] = []  # (name, "ok"|"warn"|"fail", detail)
     try:

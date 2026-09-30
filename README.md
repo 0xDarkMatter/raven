@@ -19,7 +19,7 @@ lanes (fleetflow ADR-022/ADR-023 record that integration's contract).
 - **Python import:** `raven_bus` (ADR-004 — the package root is `raven_bus`;
   the v1 import root is gone, surviving one release only as `raven_bus.compat`)
 - **CLI:** `raven` (unchanged from v1)
-- **Store:** one SQLite (WAL) DB per host — `~/.raven/bus.db`, override `RAVEN_DB` (ADR-002)
+- **Store:** one SQLite (WAL) DB per host — `~/.raven/bus.db`, override `RAVEN_DB` with an absolute path (ADR-002)
 
 > **Distribution name is undecided.** Installing by the `raven` name on PyPI
 > would pull Sentry's legacy client — install from source until naming is
@@ -104,7 +104,10 @@ raven doctor
 ```
 
 The DB is created on first use — there is no `raven init` step. `RAVEN_DB`
-points it elsewhere; default is `~/.raven/bus.db`.
+points it elsewhere; default is `~/.raven/bus.db`. `RAVEN_DB` must be an
+absolute path (`~` is expanded): every process inherits it, so a relative one
+would resolve per working directory and split one run across several DBs.
+raven refuses it with a usage error (exit 2).
 
 ## Quickstart
 
@@ -414,7 +417,7 @@ Config is environment-only:
 |---|---|
 | `RAVEN_CONSUMER` | required to activate; absent → silent no-op |
 | `RAVEN_CHANNELS` | comma-separated channel names; required when a consumer is set (no `run/<run>/lane/<role>` derivation — explicit only) |
-| `RAVEN_DB` | optional; the store's normal resolution otherwise |
+| `RAVEN_DB` | optional, absolute; the store's normal resolution otherwise (a relative one keeps the hook silent) |
 | `RAVEN_PYTHON` | optional; interpreter the wrapper runs (default: `python3`, then `python`) |
 
 The wrapper runs `-m raven_bus.adapters.hooks.peek` under `$RAVEN_PYTHON` if set,
@@ -584,6 +587,8 @@ section points rather than restates:
   raises `WrongChannelKindError`. Kind is immutable after creation.
 - **`--db` override:** every CLI command accepts `--db PATH` to point at a
   different DB (tests use this); otherwise resolution is `RAVEN_DB` → `~/.raven/bus.db`.
+  `--db` may be relative (to the current directory); `RAVEN_DB` may not —
+  `error: RAVEN_DB must be an absolute path` means export a full path.
 
 ## License
 
