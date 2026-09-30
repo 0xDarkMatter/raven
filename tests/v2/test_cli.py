@@ -190,7 +190,7 @@ def test_send_unknown_channel_exits_not_found() -> None:
         patch("raven_bus.db.init_db"),
         patch("raven_bus.db.connection", return_value=_mock_connection(conn)),
         patch(
-            "raven_bus.channels.ensure_channel",
+            "raven_bus.log.append",
             side_effect=UnknownChannelError("no such channel"),
         ),
     ):
