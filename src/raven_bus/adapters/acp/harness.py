@@ -6,15 +6,19 @@ respawn nothing, exit when the child exits or the loop is stopped.
 Per boundary (the loop, roughly):
 
 1. read ``cursors.pending`` for the consumer on its channels
-   (``run/<run>/lane/<id>``-style names come from the caller);
-2. ``policy.plan`` → nothing to deliver? sleep ``poll_interval_s``
-   (data_version fast-poll allowed) and re-check;
+   (``run/<run>/lane/<id>``-style names come from the caller), paging
+   past ids this session already delivered (see _gather_pending);
+2. ``policy.plan`` over the NOT-yet-delivered ones → nothing to deliver?
+   ack any newly-coverable delivered prefix, sleep ``poll_interval_s``
+   and re-check;
 3. deliver: each ``interrupt`` alone via ``AcpClient.prompt``, then the
    batch+digest render as one prompt;
-4. AFTER the WHOLE boundary succeeds, one ``cursors.ack`` capped at the
-   plan's ack_up_to (per-prompt acking LOST messages — see _deliver);
-   an in-memory set of delivered ids stops same-session redelivery
-   where a deferred message pins the cursor;
+4. AFTER the WHOLE boundary succeeds, ack each channel up to the longest
+   prefix of its pending ids this session has delivered (per-prompt
+   acking LOST messages — see _deliver; the prefix rule is
+   _ack_delivered_prefixes). An in-memory per-channel set of delivered
+   ids stops same-session redelivery where an undelivered message pins
+   a channel's cursor;
 5. post the agent's reply text and stop_reason to the bus as telemetry
    (``log.append`` type='acp-reply' on the reply_channel), and each
    session/update batch count as type='acp-activity' heartbeats.
@@ -127,17 +131,15 @@ def run_harness(
         return 10
 
     # Ids delivered this SESSION but not (yet) coverable by the cursor (a
-    # lower-id deferred message pins ack_up_to) must not be re-planned
-    # every tick — that was a full-CPU byte-identical redelivery storm
-    # (verify finding). It MUST be a set of exact ids, never a per-channel
-    # max: a max hides lower-id DEFERRED messages from plan(), which then
-    # computes ack_up_to without them and the cursor jumps over messages
-    # injected zero times (issue #3 — message loss). Pruned to still-
-    # pending ids each tick (ack is monotonic, so an id that leaves
-    # pending never returns). Crash semantics unchanged: the set dies with
-    # the process, the cursor is the durable truth, redelivery after a
-    # crash is at-least-once.
-    delivered: set[int] = set()
+    # lower-id undelivered message pins that channel) must not be
+    # re-planned every tick — that was a full-CPU byte-identical
+    # redelivery storm (verify finding). Per channel, and exact ids, never
+    # a per-channel max: a max hides lower-id DEFERRED messages from
+    # plan(), and the cursor then jumps over messages injected zero times
+    # (issue #3 — message loss). Pruned by _prune_delivered. Crash
+    # semantics unchanged: the sets die with the process, the cursor is
+    # the durable truth, redelivery after a crash is at-least-once.
+    delivered: dict[str, set[int]] = {}
 
     boundary = 0
     while True:
@@ -145,19 +147,32 @@ def run_harness(
             return 0
 
         try:
-            gathered = _gather_pending(config)
-            delivered.intersection_update(m.id for m in gathered)
-            pending = [m for m in gathered if m.id not in delivered]
+            gathered = _gather_pending(config, delivered)
+            _prune_delivered(delivered, gathered)
+            pending = sorted(
+                (
+                    m
+                    for channel, msgs in gathered.items()
+                    for m in msgs
+                    if m.id not in delivered.get(channel, ())
+                ),
+                key=lambda m: m.id,
+            )
             plan_ = policy.plan(
                 pending, now=datetime.now(UTC), token_budget=config.token_budget
             )
 
             if not plan_.interrupt and not plan_.batch and not plan_.digest_source:
+                # Catch-up: a pin can clear without a delivery (the
+                # undelivered message expired, or another process acked
+                # past it); its channel's delivered prefix is ackable now.
+                # Opens a write only when there is such a prefix.
+                _ack_delivered_prefixes(config, gathered, delivered)
                 time.sleep(config.poll_interval_s)
                 continue
 
             boundary += 1
-            _deliver(config, acp, session_id, plan_, boundary, delivered)
+            _deliver(config, acp, session_id, plan_, boundary, gathered, delivered)
         except (AcpError, RavenBusError, sqlite3.Error) as exc:
             # Store errors (a 5s busy timeout under writer load is an
             # sqlite3.OperationalError) must exit like protocol errors —
@@ -171,14 +186,103 @@ def run_harness(
             return 0
 
 
-def _gather_pending(config: HarnessConfig) -> list[Message]:
-    """Pending messages across ``config.channels``, id-ascending merge."""
-    messages: list[Message] = []
+_GATHER_PAGE = 100
+"""Rows per pending read — cursors.pending's own default window."""
+
+_GATHER_MAX_PAGES = 10
+"""Per channel per tick. Bounds the extra reads while a pin holds many
+delivered-but-unackable ids below newer messages; past it, newer messages
+wait until the pin clears (a deferred fyi is due within
+DEFAULT_DIGEST_MAX_AGE_S, a budget-shed prompt goes next boundary), so the
+bound can delay, never stall."""
+
+
+def _gather_pending(
+    config: HarnessConfig, delivered: dict[str, set[int]]
+) -> dict[str, list[Message]]:
+    """Pending messages per channel, each id-ascending and CONTIGUOUS from
+    the cursor (the prefix-ack walk relies on that).
+
+    ``cursors.pending`` returns a 100-row window. When this session has
+    already delivered most of it (ids pinned behind an undelivered one),
+    the window alone hid everything newer — a later BLOCKING message
+    stayed invisible to plan() until the pin cleared, and forever when
+    the window was entirely delivered (QA findings A1/A6). So keep paging
+    with ``log.read_after`` (expiry-filtered, like pending) until a
+    page-worth of NOT-yet-delivered messages is in hand, the channel is
+    drained, or _GATHER_MAX_PAGES is hit. With nothing delivered this
+    stops after the first page, exactly as before."""
+    gathered: dict[str, list[Message]] = {}
     with db_connection(config.db_path) as conn:
         for channel in config.channels:
-            messages.extend(cursors.pending(conn, config.consumer, channel))
-    messages.sort(key=lambda m: m.id)
-    return messages
+            seen = delivered.get(channel, set())
+            page = cursors.pending(conn, config.consumer, channel, limit=_GATHER_PAGE)
+            msgs = list(page)
+            pages = 1
+            while (
+                len(page) == _GATHER_PAGE
+                and pages < _GATHER_MAX_PAGES
+                and sum(m.id not in seen for m in msgs) < _GATHER_PAGE
+            ):
+                page = log.read_after(conn, channel, msgs[-1].id, limit=_GATHER_PAGE)
+                msgs.extend(page)
+                pages += 1
+            gathered[channel] = msgs
+    return gathered
+
+
+def _prune_delivered(
+    delivered: dict[str, set[int]], gathered: dict[str, list[Message]]
+) -> None:
+    """Forget delivered ids that can never be pending again: those below
+    their channel's lowest pending id (acked — ack is monotonic — or
+    expired; expiry never reverses). Ids above the gathered window are
+    KEPT: they may still be pending beyond _GATHER_MAX_PAGES, and
+    forgetting them would re-inject them once the pin clears."""
+    for channel, ids in delivered.items():
+        msgs = gathered.get(channel)
+        if not msgs:
+            ids.clear()
+            continue
+        low = msgs[0].id
+        ids.difference_update([i for i in ids if i < low])
+
+
+def _ack_delivered_prefixes(
+    config: HarnessConfig,
+    gathered: dict[str, list[Message]],
+    delivered: dict[str, set[int]],
+) -> None:
+    """Ack each channel up to the LONGEST PREFIX of its pending ids that
+    this session has delivered (in completed boundaries only — ids enter
+    ``delivered`` after their boundary's prompts all succeeded).
+
+    Walks the channel's gathered ids ascending from the cursor and stops
+    at the first one NOT delivered, so the cursor-jump (ADR-001) can
+    never pass an undelivered or deferred id — the real invariant. It
+    replaced "ack only this boundary's ids, capped at the plan's GLOBAL
+    ack_up_to" (QA finding A1), which (a) left ids delivered under a pin
+    unacked even after the pin cleared, until the 100-row pending window
+    filled with them and the channel stalled for the session, (b) re-
+    injected them on every clean restart, and (c) let a deferred fyi on
+    one channel pin acks on every other channel."""
+    acks: dict[str, int] = {}
+    for channel, msgs in gathered.items():
+        ids = delivered.get(channel, set())
+        last: int | None = None
+        for m in msgs:
+            if m.id not in ids:
+                break
+            last = m.id
+        if last is not None:
+            acks[channel] = last
+    if not acks:
+        return
+    with db_connection(config.db_path) as conn:
+        for channel, up_to_id in acks.items():
+            cursors.ack(conn, config.consumer, channel, up_to_id)
+    for channel, up_to_id in acks.items():
+        delivered[channel] = {i for i in delivered[channel] if i > up_to_id}
 
 
 def _deliver(
@@ -187,21 +291,21 @@ def _deliver(
     session_id: str,
     plan_: policy.InjectionPlan,
     boundary: int,
-    delivered_ids: set[int],
+    gathered: dict[str, list[Message]],
+    delivered: dict[str, set[int]],
 ) -> None:
     """Interrupts alone, first (one prompt each); then one prompt for
     batch+digest if either is non-empty.
 
-    The cursor ack happens ONCE, after EVERY prompt of the boundary has
-    succeeded, capped at ``plan_.ack_up_to``. Per-prompt acking looked
-    crash-safer but caused MESSAGE LOSS (verify finding): an interrupt's
-    ack at ack_up_to could cover lower-id batch messages the failed
-    batch prompt never delivered. A crash mid-boundary now redelivers
-    already-prompted interrupts — at-least-once, the survivable
-    failure mode. ``delivered_ids`` records every injected id even where
-    the cursor cannot advance (a deferred message pinning ack_up_to), so
-    this session never re-delivers what it already injected — while
-    deferred ids stay OUT of it, so plan() keeps seeing them."""
+    Acking happens ONCE, after EVERY prompt of the boundary has
+    succeeded. Per-prompt acking looked crash-safer but caused MESSAGE
+    LOSS (verify finding): an interrupt's ack could cover lower-id batch
+    messages the failed batch prompt never delivered. A crash
+    mid-boundary now redelivers already-prompted interrupts —
+    at-least-once, the survivable failure mode. Every injected id is
+    recorded in ``delivered`` (per channel) even where its cursor cannot
+    advance yet, so this session never re-delivers it — while deferred
+    ids stay OUT of it, so plan() keeps seeing them."""
     for msg in plan_.interrupt:
         solo = policy.InjectionPlan(interrupt=[msg])
         result = acp.prompt(session_id, policy.render(solo))
@@ -212,28 +316,9 @@ def _deliver(
         result = acp.prompt(session_id, policy.render(solo))
         _post_telemetry(config, result, boundary)
 
-    delivered = (
-        list(plan_.interrupt) + list(plan_.batch) + list(plan_.digest_source)
-    )
-    with db_connection(config.db_path) as conn:
-        _ack_covered(conn, config.consumer, delivered, plan_.ack_up_to)
-    delivered_ids.update(msg.id for msg in delivered)
-
-
-def _ack_covered(
-    conn: object, consumer: str, messages: list[Message], ack_up_to: int
-) -> None:
-    """Ack each channel represented in ``messages`` up to the highest
-    covered id on that channel, never past ``ack_up_to`` (a message's
-    channel is on the Message; cursors are per-channel, so a
-    mixed-channel batch acks each once)."""
-    by_channel: dict[str, int] = {}
-    for msg in messages:
-        if msg.id > ack_up_to:
-            continue
-        by_channel[msg.channel] = max(by_channel.get(msg.channel, 0), msg.id)
-    for channel, up_to_id in by_channel.items():
-        cursors.ack(conn, consumer, channel, up_to_id)  # type: ignore[arg-type]
+    for msg in (*plan_.interrupt, *plan_.batch, *plan_.digest_source):
+        delivered.setdefault(msg.channel, set()).add(msg.id)
+    _ack_delivered_prefixes(config, gathered, delivered)
 
 
 def _post_telemetry(config: HarnessConfig, result: PromptResult, boundary: int) -> None:

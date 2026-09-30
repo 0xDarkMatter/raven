@@ -880,7 +880,7 @@ def test_store_error_exits_ten_not_traceback(
     escaped run_harness as a crash; it must exit 10 like AcpError."""
     import sqlite3 as sqlite3_mod
 
-    def _busy(_config):
+    def _busy(*_args):
         raise sqlite3_mod.OperationalError("database is locked")
 
     monkeypatch.setattr(harness, "_gather_pending", _busy)
@@ -900,3 +900,202 @@ def test_cli_unlaunchable_agent_is_one_line_error() -> None:
     assert "error:" in result.output
     assert "cannot launch agent" in result.output
     assert "Traceback" not in result.output
+
+
+# --------------------------------------------------------------------------- #
+# QA findings A1/A6 — per-channel prefix acking and gathering past a pin.
+#
+# The old ack acked only THIS boundary's ids, capped at the plan's GLOBAL
+# ack_up_to. Ids delivered under a pin (an undelivered lower id) were never
+# acked afterwards; once cursors.pending's 100-row window was all such ids
+# the channel stalled for the session (later BLOCKING messages included), a
+# clean restart re-injected them, and one channel's deferred fyi pinned
+# every other channel. These run the REAL policy against the real store.
+# --------------------------------------------------------------------------- #
+A_CH = "run/run1/a"
+B_CH = "run/run1/b"
+
+
+class _StagedChild(FakeChild):
+    """Alive for ``alive`` polls; runs ``hooks[n]`` on the n-th poll (a
+    sender publishing, a clock jump) before answering."""
+
+    def __init__(self, alive: int, hooks: dict[int, Callable[[], None]]) -> None:
+        super().__init__([None])
+        self.polls = 0
+        self._alive = alive
+        self._hooks = hooks
+
+    def poll(self) -> int | None:
+        self.polls += 1
+        if self.polls in self._hooks:
+            self._hooks[self.polls]()
+        return None if self.polls < self._alive else 0
+
+
+def _clock(monkeypatch: pytest.MonkeyPatch) -> dict:
+    """Fake harness clock; bump ``state['offset']`` to age fyi mid-run."""
+    from datetime import datetime as real_datetime
+    from datetime import timedelta
+
+    state = {"offset": timedelta(0)}
+
+    class _FakeDatetime:
+        @staticmethod
+        def now(tz=None):
+            return real_datetime.now(tz) + state["offset"]
+
+    monkeypatch.setattr(harness, "datetime", _FakeDatetime)
+    return state
+
+
+def _all_injected(client: FakeAcpClient) -> list[int]:
+    return [i for _, t in client.prompts for i in _injected_ids(t)]
+
+
+def _cursor(db: Path, channel: str) -> int | None:
+    with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+        cur = cursors.get_cursor(conn, CONSUMER, channel)
+    return None if cur is None else cur.last_ack_id
+
+
+def test_pin_on_one_channel_neither_stalls_nor_pins_another(db: Path) -> None:
+    """probe_stall: a held fyi on A + a 110-message burst on B + a later
+    BLOCKING on B, one session. Old code: B's window filled with
+    delivered-but-unackable ids and the blocking message was never seen."""
+    from raven_bus import channels
+
+    late: list[Message] = []
+    with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+        channels.ensure_channel(conn, A_CH)
+        fyi = _append(conn, urgency="fyi", channel=A_CH)
+        burst = [_append(conn, channel=B_CH) for _ in range(110)]
+
+    def _publish() -> None:
+        with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+            late.append(_append(conn, urgency="blocking", channel=B_CH))
+
+    client = FakeAcpClient()
+    code = run_harness(
+        _config(db_path=db, channels=(A_CH, B_CH)),
+        _StagedChild(40, {20: _publish}),
+        client=client,
+    )
+
+    assert code == 0
+    injected = _all_injected(client)
+    assert sorted(injected) == [m.id for m in burst] + [late[0].id]  # each once
+    assert _cursor(db, B_CH) == late[0].id  # B fully acked despite A's pin
+    assert _cursor(db, A_CH) is None  # the held fyi was never injected
+    with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+        assert [m.id for m in cursors.pending(conn, CONSUMER, A_CH)] == [fyi.id]
+
+
+def test_blocking_beyond_a_delivered_window_is_injected_promptly(db: Path) -> None:
+    """probe_starve1 (A6): ONE channel, a held fyi pinning 110 delivered
+    prompts. A blocking message landing past the 100-row window must be
+    injected at once, not after the fyi ages out."""
+    late: list[Message] = []
+    with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+        fyi = _append(conn, urgency="fyi")
+        prompts = [_append(conn) for _ in range(110)]
+
+    def _publish() -> None:
+        with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+            late.append(_append(conn, urgency="blocking"))
+
+    client = FakeAcpClient()
+    child = _StagedChild(40, {20: _publish})
+    code = run_harness(_config(db_path=db), child, client=client)
+
+    assert code == 0
+    injected = _all_injected(client)
+    assert sorted(injected) == [m.id for m in prompts] + [late[0].id]
+    assert fyi.id not in injected
+    assert _cursor(db, CHANNEL) is None  # pinned by the held fyi, correctly
+
+
+def test_cleared_pin_acks_the_whole_prefix_so_restart_reinjects_nothing(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """probe_followup: once the fyi pin is digested, every id delivered
+    under it is acked; a clean restart then injects nothing again."""
+    from datetime import timedelta
+
+    from raven_bus import channels
+
+    clock = _clock(monkeypatch)
+    with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+        channels.ensure_channel(conn, B_CH)
+        f = _append(conn, urgency="fyi", channel=A_CH)
+        pa = _append(conn, channel=A_CH)
+        pb = _append(conn, channel=B_CH)
+
+    def _age() -> None:
+        clock["offset"] = timedelta(minutes=10)
+
+    cfg = _config(db_path=db, channels=(A_CH, B_CH))
+    first = FakeAcpClient()
+    assert run_harness(cfg, _StagedChild(20, {10: _age}), client=first) == 0
+    assert [_injected_ids(t) for _, t in first.prompts] == [[pa.id, pb.id], [f.id]]
+    assert _cursor(db, A_CH) == pa.id
+    assert _cursor(db, B_CH) == pb.id
+
+    second = FakeAcpClient()
+    assert run_harness(cfg, _StagedChild(5, {}), client=second) == 0
+    assert second.prompts == []
+
+
+def test_idle_tick_acks_a_prefix_whose_pin_cleared_without_a_delivery(
+    db: Path,
+) -> None:
+    """The pin can leave pending with no delivery (another process acks
+    past it, or it expires): the next idle tick acks the delivered
+    prefix instead of waiting for some later message on the channel."""
+    with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+        fyi = _append(conn, urgency="fyi")
+        msg = _append(conn)
+
+    def _external_ack() -> None:
+        with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+            cursors.ack(conn, CONSUMER, CHANNEL, fyi.id)
+
+    client = FakeAcpClient()
+    code = run_harness(_config(db_path=db), _StagedChild(12, {6: _external_ack}), client=client)
+
+    assert code == 0
+    assert [_injected_ids(t) for _, t in client.prompts] == [[msg.id]]
+    assert _cursor(db, CHANNEL) == msg.id
+
+
+def test_gather_pages_past_delivered_ids_and_is_bounded(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(harness, "_GATHER_PAGE", 2)
+    monkeypatch.setattr(harness, "_GATHER_MAX_PAGES", 3)
+    with db_mod.connection(db) as conn:  # type: ignore[attr-defined]
+        ids = [_append(conn).id for _ in range(10)]
+    cfg = _config(db_path=db)
+
+    # nothing delivered: one page, as before
+    assert [m.id for m in harness._gather_pending(cfg, {})[CHANNEL]] == ids[:2]
+    # first 3 delivered: pages until a page-worth (2) is undelivered
+    got = harness._gather_pending(cfg, {CHANNEL: set(ids[:3])})[CHANNEL]
+    assert [m.id for m in got] == ids[:6][:len(got)] and len(got) == 6
+    # everything delivered: stops at the page bound, contiguous
+    got = harness._gather_pending(cfg, {CHANNEL: set(ids)})[CHANNEL]
+    assert [m.id for m in got] == ids[:6]
+
+
+def test_prune_forgets_only_ids_that_can_never_be_pending_again() -> None:
+    def _m(i: int) -> Message:
+        from datetime import UTC, datetime
+
+        return Message(id=i, channel=CHANNEL, sender="p@run1", type="t", body={},
+                       created_at=datetime.now(UTC))
+
+    delivered = {CHANNEL: {3, 10, 500}, A_CH: {7}}
+    harness._prune_delivered(delivered, {CHANNEL: [_m(10), _m(11)], A_CH: []})
+    # 3 is below the lowest pending id (acked/expired); 500 is past the
+    # gathered window and may still be pending — kept.
+    assert delivered == {CHANNEL: {10, 500}, A_CH: set()}
