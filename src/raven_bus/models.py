@@ -22,8 +22,12 @@ Urgency = Literal["blocking", "prompt", "fyi"]
 
 URGENCY_RANK: dict[str, int] = {"blocking": 0, "prompt": 1, "fyi": 2}
 
-_ATOM_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
-_TAG_RE = re.compile(r"^[a-zA-Z0-9._-]{1,32}$")
+# Whole-string grammars: ALWAYS apply with ``.fullmatch``. ``^...$`` with
+# ``.match`` let ``$`` match before a trailing newline, so "run/x<LF>"
+# passed and was stored as a distinct, invisible row that escapes
+# teardown's name scoping (QA store #5).
+_ATOM_RE = re.compile(r"[a-z0-9][a-z0-9._-]*")
+_TAG_RE = re.compile(r"[a-zA-Z0-9._-]{1,32}")
 
 
 def validate_atom(value: str, *, what: str) -> str:
@@ -34,7 +38,7 @@ def validate_atom(value: str, *, what: str) -> str:
     """
     from raven_bus.exceptions import InvalidAddressError
 
-    if not isinstance(value, str) or not _ATOM_RE.match(value):
+    if not isinstance(value, str) or not _ATOM_RE.fullmatch(value):
         raise InvalidAddressError(
             f"{what} {value!r} must match [a-z0-9][a-z0-9._-]* (ADR-002)"
         )
@@ -84,7 +88,7 @@ def validate_tags(tags: list[str] | None) -> list[str]:
     if not tags:
         return []
     for tag in tags:
-        if not _TAG_RE.match(tag):
+        if not _TAG_RE.fullmatch(tag):
             raise InvalidAddressError(
                 f"tag {tag!r} does not match ^[a-zA-Z0-9._-]{{1,32}}$"
             )
