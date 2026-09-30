@@ -190,7 +190,7 @@ def test_send_unknown_channel_exits_not_found() -> None:
         patch("raven_bus.db.init_db"),
         patch("raven_bus.db.connection", return_value=_mock_connection(conn)),
         patch(
-            "raven_bus.channels.ensure_channel",
+            "raven_bus.log.append",
             side_effect=UnknownChannelError("no such channel"),
         ),
     ):
@@ -539,7 +539,9 @@ def test_tail_no_follow_single_channel_drains_and_exits() -> None:
     assert result.exit_code == 0
     assert "#1" in result.stdout
     assert "#2" in result.stdout
-    read_after.assert_called_once_with(conn, "run/r1/team", 0, include_expired=True)
+    read_after.assert_called_once_with(
+        conn, "run/r1/team", 0, limit=100, include_expired=True
+    )
     list_channels.assert_not_called()
 
 
@@ -548,8 +550,7 @@ def test_tail_no_follow_all_channels_json() -> None:
     with (
         patch("raven_bus.db.init_db"),
         patch("raven_bus.db.connection", return_value=_mock_connection(conn)),
-        patch("raven_bus.channels.list_channels", return_value=[_channel()]),
-        patch("raven_bus.log.read_after", return_value=[_message()]),
+        patch("raven_bus.log.read_all_after", return_value=[_message()]),
     ):
         result = runner.invoke(app, ["tail", "--no-follow", "--json"])
     assert result.exit_code == 0
@@ -578,8 +579,7 @@ def test_tail_follow_sleeps_then_stops_on_ctrl_c() -> None:
     with (
         patch("raven_bus.db.init_db"),
         patch("raven_bus.db.connection", return_value=_mock_connection(conn)),
-        patch("raven_bus.log.read_after", return_value=[]),
-        patch("raven_bus.channels.list_channels", return_value=[]),
+        patch("raven_bus.log.read_all_after", return_value=[]),
         patch("time.sleep", side_effect=KeyboardInterrupt),
     ):
         result = runner.invoke(app, ["tail"])
@@ -711,6 +711,7 @@ def test_teardown_with_yes_skips_prompt() -> None:
 def test_teardown_confirm_yes() -> None:
     conn = MagicMock()
     with (
+        patch("raven_bus.cli.teardown._stdin_is_interactive", return_value=True),
         patch("raven_bus.db.init_db"),
         patch("raven_bus.db.connection", return_value=_mock_connection(conn)),
         patch("raven_bus.db.teardown_run", return_value=3),
@@ -721,7 +722,10 @@ def test_teardown_confirm_yes() -> None:
 
 
 def test_teardown_confirm_no_aborts() -> None:
-    with patch("raven_bus.db.teardown_run") as teardown_run:
+    with (
+        patch("raven_bus.cli.teardown._stdin_is_interactive", return_value=True),
+        patch("raven_bus.db.teardown_run") as teardown_run,
+    ):
         result = runner.invoke(app, ["teardown", "--run", "r1"], input="n\n")
     assert result.exit_code == 0
     assert "aborted" in result.stdout
@@ -748,6 +752,14 @@ def test_version_flag() -> None:
     result = runner.invoke(app, ["--version"])
     assert result.exit_code == 0
     assert "raven" in result.stdout
+
+
+def test_top_level_help_describes_v2() -> None:
+    """QA cli #6: the app help still carried v1's "role-addressable
+    message bus for agent sessions" wording."""
+    assert app.info.help is not None
+    assert "role-addressable" not in app.info.help
+    assert "coordination bus for multi-agent runs" in app.info.help
 
 
 # --------------------------------------------------------------------

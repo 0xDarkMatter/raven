@@ -267,6 +267,8 @@ def _mock_serve_runtime(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setitem(sys.modules, "uvicorn", SimpleNamespace(run=run))
     monkeypatch.setattr(http_app, "create_app", create_app)
     monkeypatch.setattr(serve_cmd.db, "init_db", init_db)
+    # No real bind: the probe is exercised in test_cli_serve_bind.py.
+    monkeypatch.setattr(serve_cmd, "_probe_bind", lambda host, port: None)
     return timeline, init_db, create_app, run
 
 

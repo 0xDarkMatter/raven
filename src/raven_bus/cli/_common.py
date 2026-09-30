@@ -34,6 +34,16 @@ EXIT_USAGE = 2
 EXIT_NOT_FOUND = 3
 EXIT_ERROR = 10
 
+# Integer bounds for CLI flags, enforced by typer ``min=``/``max=`` so an
+# out-of-range value is a usage error (exit 2) instead of an
+# OverflowError traceback from SQLite binding or datetime arithmetic.
+# MAX_ID is SQLite's INTEGER ceiling (message ids, cursor positions).
+# MAX_DURATION_S (30 days) bounds --lease and --expires-in; it mirrors
+# ravend's http.write.MAX_LEASE_S so both surfaces accept the same
+# range. Not imported from there: http/ needs the optional [http] extra.
+MAX_ID = 2**63 - 1
+MAX_DURATION_S = 30 * 24 * 3600
+
 
 def die(message: str, code: int = EXIT_ERROR) -> None:
     """Echo ``error: <message>`` to stderr and exit with ``code``."""
@@ -128,11 +138,19 @@ def echo_messages_human(msgs: list[Message]) -> None:
 
 
 def parse_body(body: str) -> dict[str, Any]:
-    """Parse ``--body`` as a JSON object, or exit with a usage error."""
+    """Parse ``--body`` as a JSON object, or exit with a usage error.
+
+    RecursionError is caught alongside JSONDecodeError: json.loads
+    recurses per nesting level and gives up at the interpreter limit
+    (~1000+ levels), which escaped as a traceback. Shallower bodies that
+    still exceed ``log.MAX_BODY_DEPTH`` are refused by the store."""
     try:
         parsed = json.loads(body)
     except json.JSONDecodeError as exc:
         die(f"body is not valid JSON: {exc}", EXIT_USAGE)
+        return {}  # pragma: no cover - die() always raises typer.Exit
+    except RecursionError:
+        die("body is nested too deeply to parse", EXIT_USAGE)
         return {}  # pragma: no cover - die() always raises typer.Exit
     if not isinstance(parsed, dict):
         die("body must be a JSON object", EXIT_USAGE)
