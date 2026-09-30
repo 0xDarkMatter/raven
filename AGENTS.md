@@ -236,93 +236,22 @@ decision text owns the *why*; treat each as a build-breaker.
 
 ## Testing patterns
 
-### Fixtures (tests/v2/conftest.py)
+Fixtures, sibling-stub and raw-SQL setup patterns live in
+[docs/TESTING.md](docs/TESTING.md). The one landmine-grade rule: **scope any
+stand-in for another module via `pytest.MonkeyPatch`, never bare assignment**
+— a bare `mod.attr = stub` leaks into every later test file (it caused 8
+cross-file failures at the wave-1 landing).
 
-Every test gets an isolated DB under `tmp_path` with the init cache reset:
+## CLI surface
 
-```python
-@pytest.fixture()
-def db(tmp_path):
-    from raven_bus.db import _reset_init_cache, init_db
-    _reset_init_cache()
-    path = tmp_path / "bus.db"
-    init_db(path, force=True)
-    return path
-```
+Frozen — flags may grow, commands may not. The full flag table is
+[docs/CLI.md](docs/CLI.md). Contract for every command: exit `0` ok / `2`
+usage / `3` not-found / `10` error (`cli/_common.py`); failures are ONE line
+`error: …`, tracebacks never reach users. Consumer ids are `<role>@<run>`,
+channels path-style, atoms lowercase `[a-z0-9][a-z0-9._-]*` (ADR-002).
 
-`init_db` is process-cached (`force=True` bypasses; `_reset_init_cache()` clears
-it for multi-DB-in-one-process tests). Add module-specific fixtures in your own
-test file, not in `conftest.py` (a frozen wave-0 artifact).
+## Out of scope
 
-### Landmine: scope sibling stubs via `monkeypatch`, never bare assignment
-
-Lanes call only sibling modules' public contracts. During the parallel build a
-lane's siblings may be stubs, so a test stands them in with faithful contract
-implementations. **Always do this through `pytest.MonkeyPatch`:**
-
-```python
-def _install_sibling_stubs(monkeypatch):
-    monkeypatch.setattr(cursors_mod.db, "sweep", lambda _conn: None)
-    monkeypatch.setattr(cursors_mod.channels, "get_channel", get_channel)
-    monkeypatch.setattr(cursors_mod.log, "read_after", read_after)
-```
-
-A bare `cursors_mod.db.sweep = ...` replaces the **real** module attribute for
-every later test file in the process — it caused **8 cross-file failures at the
-wave-1 landing**. `monkeypatch` auto-restores on teardown. (`tests/v2/test_cursors.py`
-documents this in `_install_sibling_stubs`.)
-
-### Raw-SQL data setup
-
-Sibling-lane stand-ins set up rows with direct SQL (e.g. `_insert_message`
-appends a `messages` row matching the `log.append` contract) so the code under
-test exercises real v2 semantics against a live schema.
-
-## CLI surface (frozen)
-
-```
-raven send      --channel C --from R@RUN -t TYPE --body JSON
-                [--urgency U] [--tag T]... [--reply-to ID] [--expires-in S]
-                [--kind broadcast|queue|stream]
-raven read      --channel C --as R@RUN [-m MAX≥1] [-j | --framed]
-                                                            (broadcast pending; --framed = the
-                                                             policy.render data frame)
-raven ack       --channel C --as R@RUN --up-to ID          (cursor jump)
-raven claim     --channel C --as R@RUN [--lease S] [-j]    (queue: claim next)
-raven done      --id ID --as R@RUN                         (complete claim)
-raven release   --id ID --as R@RUN
-raven tail      [--channel C] [--from ID] [--no-follow] [--json] [--interval S]
-raven channels  [--prefix P] [-j]
-raven doctor    [--db P]
-raven teardown  --run RUN [--yes]
-raven version
-raven serve    [--host 127.0.0.1] [--port 7713] [--db P] [--yes-expose]
-                                                            (run ravend under uvicorn; `[http]` extra;
-                                                             non-loopback --host needs --yes-expose)
-raven acp      --as R@RUN --channel C [--channel C]... [--reply-to C]
-               [--db P] [--poll-interval S] [--budget N] [--cwd .]
-               [--mode M] [--initial-prompt-file F] [--timeout S] -- <agent cmd...>
-                                                            (dumb-pipe ACP harness; ADR-006.
-                                                             --mode = session/set_mode after
-                                                             session/new; headless lanes need a
-                                                             non-prompting permission mode.
-                                                             --initial-prompt-file = the task
-                                                             packet, VERBATIM boundary 0 —
-                                                             trusted spawner input, never
-                                                             data-framed; bus messages are)
-```
-
-Exit codes (`cli/_common.py`): `0` ok / `2` usage / `3` not-found / `10` error.
-Failures render as one-line `error: …`; tracebacks never reach users. Consumer
-ids are `<role>@<run>`; channels are path-style; atoms are lowercase
-`[a-z0-9][a-z0-9._-]*` (ADR-002).
-
-## Out of scope (P4+, see the design doc)
-
-P3 shipped: `raven acp` + the Claude Code hook share `raven_bus.policy`
-(ADR-003/006 — injection lives in adapters, never the store; see the
-[adapters landmines](#landmines--adapters-adr-003006--the-p3-attention-layer)).
-P4 shipped: fleetflow heartbeats (ADR-022) + `ff-spawn --acp` (fleetflow
-ADR-023 — packet as trusted boundary 0 via `--initial-prompt-file`, mode via
-`--mode`, verdict from telemetry). Still out: Buzz bridge (P5). See
+P1-P4 shipped (store, ravend, adapters, fleetflow integration — fleetflow
+ADR-022/023). Still out: the Buzz bridge (P5). See
 [docs/design/raven2-architecture.md §8](docs/design/raven2-architecture.md#8-phasing).

@@ -10,6 +10,8 @@ to change code.
 | Doc | What / when to read |
 |---|---|
 | [QUICKSTART.md](QUICKSTART.md) | Hands-on walkthrough of every surface (CLI, Python, ravend, `raven acp`, the hook). Read to *use* raven. |
+| [CLI.md](CLI.md) | The frozen `raven` command surface — every command and flag. Read before adding a flag (commands may not be added). |
+| [TESTING.md](TESTING.md) | Test fixtures, sibling-stub and raw-SQL setup patterns. Read before writing tests. |
 | [adr/](adr/) | Decisions of record, one per file (`ls docs/adr/`). Read before changing anything an ADR names — the ADR owns the *why*. |
 | [design/raven2-architecture.md](design/raven2-architecture.md) | The v2 design and its phasing (§8). Written pre-build; inline notes mark where the shipped code differs. Read for the big picture. |
 | [plans/HANDOFF-2026-08-12.md](plans/HANDOFF-2026-08-12.md) | **Historical.** State at the end of the v2 build day. Superseded; kept for provenance. |
