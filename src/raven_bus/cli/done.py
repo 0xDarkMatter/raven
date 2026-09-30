@@ -7,11 +7,13 @@ from pathlib import Path
 import typer
 
 from raven_bus import claims, db, models
-from raven_bus.cli._common import EXIT_OK, handle_errors
+from raven_bus.cli._common import EXIT_OK, MAX_ID, handle_errors
 
 
 def cmd_done(
-    id_: int = typer.Option(..., "--id", help="Message id to complete."),
+    id_: int = typer.Option(
+        ..., "--id", min=1, max=MAX_ID, help="Message id to complete."
+    ),
     as_: str = typer.Option(
         ..., "--as", help="Claim-holding consumer id '<role>@<run>'."
     ),

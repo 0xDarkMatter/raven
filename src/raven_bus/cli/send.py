@@ -18,7 +18,15 @@ import click
 import typer
 
 from raven_bus import channels, db, log, models
-from raven_bus.cli._common import EXIT_OK, handle_errors, parse_body
+from raven_bus.cli._common import (
+    EXIT_OK,
+    EXIT_USAGE,
+    MAX_DURATION_S,
+    MAX_ID,
+    die,
+    handle_errors,
+    parse_body,
+)
 
 _KINDS = list(get_args(models.ChannelKind))
 
@@ -28,17 +36,19 @@ def cmd_send(
     from_: str = typer.Option(
         ..., "--from", help="Sender consumer id '<role>@<run>'."
     ),
-    type_: str = typer.Option(..., "--type", "-t", help="Message type."),
+    type_: str = typer.Option(..., "--type", "-t", help="Message type (non-empty)."),
     body: str = typer.Option(..., "--body", help="JSON body object."),
     urgency: str = typer.Option(
         "prompt", "--urgency", help="blocking|prompt|fyi (default prompt)."
     ),
     tag: list[str] = typer.Option([], "--tag", help="Repeatable tag."),  # noqa: B008
     reply_to: int | None = typer.Option(
-        None, "--reply-to", help="Id of the message this replies to."
+        None, "--reply-to", min=1, max=MAX_ID,
+        help="Id of the message this replies to (must exist).",
     ),
     expires_in: int | None = typer.Option(
-        None, "--expires-in", help="TTL in seconds."
+        None, "--expires-in", min=1, max=MAX_DURATION_S,
+        help="TTL in seconds (1 to 2592000 = 30 days).",
     ),
     kind: str | None = typer.Option(
         None,
@@ -51,6 +61,8 @@ def cmd_send(
     db_path: Path | None = typer.Option(None, "--db", help="DB path override."),  # noqa: B008
 ) -> None:
     """Send a message; prints the new message id."""
+    if not type_.strip():
+        die("--type must be non-empty", EXIT_USAGE)
     payload = parse_body(body)
     with handle_errors():
         models.parse_consumer_id(from_)

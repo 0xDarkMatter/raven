@@ -711,6 +711,7 @@ def test_teardown_with_yes_skips_prompt() -> None:
 def test_teardown_confirm_yes() -> None:
     conn = MagicMock()
     with (
+        patch("raven_bus.cli.teardown._stdin_is_interactive", return_value=True),
         patch("raven_bus.db.init_db"),
         patch("raven_bus.db.connection", return_value=_mock_connection(conn)),
         patch("raven_bus.db.teardown_run", return_value=3),
@@ -721,7 +722,10 @@ def test_teardown_confirm_yes() -> None:
 
 
 def test_teardown_confirm_no_aborts() -> None:
-    with patch("raven_bus.db.teardown_run") as teardown_run:
+    with (
+        patch("raven_bus.cli.teardown._stdin_is_interactive", return_value=True),
+        patch("raven_bus.db.teardown_run") as teardown_run,
+    ):
         result = runner.invoke(app, ["teardown", "--run", "r1"], input="n\n")
     assert result.exit_code == 0
     assert "aborted" in result.stdout

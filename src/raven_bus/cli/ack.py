@@ -7,7 +7,7 @@ from pathlib import Path
 import typer
 
 from raven_bus import cursors, db, models
-from raven_bus.cli._common import EXIT_OK, handle_errors
+from raven_bus.cli._common import EXIT_OK, MAX_ID, handle_errors
 
 
 def cmd_ack(
@@ -16,7 +16,8 @@ def cmd_ack(
         ..., "--as", help="Acking consumer id '<role>@<run>'."
     ),
     up_to: int = typer.Option(
-        ..., "--up-to", help="Advance the cursor to (at least) this message id."
+        ..., "--up-to", min=0, max=MAX_ID,
+        help="Advance the cursor to (at least) this message id (>= 0).",
     ),
     db_path: Path | None = typer.Option(None, "--db", help="DB path override."),  # noqa: B008
 ) -> None:

@@ -123,7 +123,12 @@ def cli_main() -> None:
     Individual commands map raven_bus's exception hierarchy to the
     frozen exit codes via ``cli._common.handle_errors``; this is a
     last-resort net for anything that slips through (Ctrl-C, an
-    unhandled RavenBusError) so users never see a traceback.
+    unhandled RavenBusError, or ANY other exception — e.g. sqlite3's
+    DatabaseError for ``--db`` pointing at a non-SQLite file or a
+    directory) so users never see a traceback: one ``error: <Type>:
+    <msg>`` line, exit 10. ``app()`` re-raises instead of printing
+    because typer only pretty-prints from its sys.excepthook, which
+    never runs once this handler catches.
     """
     try:
         app()
@@ -131,6 +136,9 @@ def cli_main() -> None:
         sys.exit(130)
     except RavenBusError as exc:
         typer.echo(f"error: {exc}", err=True)
+        sys.exit(EXIT_ERROR)
+    except Exception as exc:  # noqa: BLE001 -- the documented last-resort net
+        typer.echo(f"error: {type(exc).__name__}: {exc}", err=True)
         sys.exit(EXIT_ERROR)
 
 

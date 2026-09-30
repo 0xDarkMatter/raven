@@ -10,6 +10,7 @@ from raven_bus import claims, db, models
 from raven_bus.claims import DEFAULT_LEASE_S
 from raven_bus.cli._common import (
     EXIT_OK,
+    MAX_DURATION_S,
     echo_json,
     echo_message_human,
     handle_errors,
@@ -23,7 +24,8 @@ def cmd_claim(
         ..., "--as", help="Claiming consumer id '<role>@<run>'."
     ),
     lease: int = typer.Option(
-        DEFAULT_LEASE_S, "--lease", help="Lease duration in seconds."
+        DEFAULT_LEASE_S, "--lease", min=1, max=MAX_DURATION_S,
+        help="Lease duration in seconds (1 to 2592000 = 30 days).",
     ),
     json_out: bool = typer.Option(
         False, "-j", "--json", help="Emit JSON instead of text."
