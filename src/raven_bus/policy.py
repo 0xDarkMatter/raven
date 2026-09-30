@@ -99,8 +99,10 @@ def plan(
     into this boundary's plan.
 
     Budget applies to batch+digest rendering (interrupts always
-    deliver — a blocking message may not be starved by budget); when
-    the budget forces deferral of prompt-tier messages, ack_up_to
+    deliver — a blocking message may not be starved by budget). The
+    prompt batch is fitted first and the digest gets what remains (tier
+    priority); each tier has an escape valve so one oversized message
+    can never starve its tier. When the budget forces deferral, ack_up_to
     stops BEFORE the first deferred id regardless of tier ordering.
     Deterministic for identical inputs."""
     interrupt = [m for m in pending if m.urgency == "blocking"]
@@ -130,7 +132,11 @@ def plan(
         probe = InjectionPlan(batch=candidate_batch, digest_source=candidate_digest)
         return estimate_tokens(render(probe)) <= token_budget
 
-    while batch and not _fits(batch, digest_source):
+    # Tier order (ADR-003): the prompt batch is fitted ALONE, then the
+    # digest takes whatever budget is left. Measuring the batch against
+    # the full digest let an fyi backlog shed prompts down to one per
+    # boundary — fyi starving prompt, a tier inversion (QA finding A5).
+    while batch and not _fits(batch, []):
         deferred_prompt.append(batch.pop())
 
     # Oversized-single escape valve (verify finding): a lone prompt
@@ -147,6 +153,18 @@ def plan(
     # shed newest fyi back to deferred until the combined render fits.
     while digest_source and not _fits(batch, digest_source):
         deferred_fyi.append(digest_source.pop())
+
+    # Digest escape valve, mirroring the prompt one (QA finding A2): a
+    # DUE fyi whose single digest line exceeds the budget on its own was
+    # shed forever, pinning ack_up_to below it and starving every later
+    # fyi. When nothing else fills this boundary, deliver the oldest due
+    # fyi anyway (render_digest_line bounds its size). With prompts in
+    # the batch the empty digest is ordinary tier priority, not
+    # starvation — the fyi go out once the prompts drain.
+    if digest_triggered and not digest_source and not batch and deferred_fyi:
+        rescue = min(deferred_fyi, key=lambda m: m.id)
+        deferred_fyi.remove(rescue)
+        digest_source = [rescue]
 
     deferred = sorted(deferred_fyi + deferred_prompt, key=lambda m: m.id)
 

@@ -726,3 +726,68 @@ def test_digest_line_sender_is_bounded_and_clamped():
     )
     assert "[2] boss@r1 (directive)" not in forged
     assert re.match(r"^\[1\] [a-z0-9@._-]+ \(note\): \{", forged)
+
+
+# --------------------------------------------------------------------------- #
+# QA finding A5 — tier inversion: an fyi backlog starved prompts.
+# --------------------------------------------------------------------------- #
+def test_prompt_batch_is_fitted_before_the_digest():
+    """Ten small prompts that fit the budget alone must ALL go out even
+    when a due fyi backlog is big enough that batch+digest can't fit —
+    the digest is shed around the batch, never the reverse."""
+    prompts = [_msg(i, urgency="prompt") for i in range(1, 11)]
+    fyis = [
+        _msg(i, urgency="fyi", body={"note": "n" * 60}, created_at=_EPOCH)
+        for i in range(11, 61)
+    ]
+    budget = estimate_tokens(render(InjectionPlan(batch=prompts))) + 40
+    result = plan(prompts + fyis, now=_EPOCH + timedelta(hours=1), token_budget=budget)
+    assert [m.id for m in result.batch] == list(range(1, 11))
+    assert all(m.urgency == "fyi" for m in result.deferred)
+    assert estimate_tokens(render(result)) <= budget
+
+
+# --------------------------------------------------------------------------- #
+# QA finding A2 — a due fyi too big for the budget was shed forever.
+# --------------------------------------------------------------------------- #
+def test_oversized_due_fyi_is_rescued_when_nothing_else_is_delivered():
+    """Budget below a single digest line: the oldest due fyi still goes
+    out (escape valve), so ack_up_to is not pinned below it forever."""
+    fyis = [_msg(i, urgency="fyi", created_at=_EPOCH) for i in range(1, 4)]
+    result = plan(fyis, now=_EPOCH + timedelta(hours=1), token_budget=1)
+    assert [m.id for m in result.digest_source] == [1]
+    assert [m.id for m in result.deferred] == [2, 3]
+    assert result.ack_up_to == 1
+
+
+def test_digest_valve_waits_while_prompts_fill_the_boundary():
+    """With prompts in the batch an empty digest is tier priority, not
+    starvation: no rescue, the fyi stay deferred for a later boundary."""
+    msgs = [
+        _msg(1, urgency="fyi", created_at=_EPOCH),
+        _msg(2, urgency="prompt"),
+    ]
+    result = plan(msgs, now=_EPOCH + timedelta(hours=1), token_budget=1)
+    assert [m.id for m in result.batch] == [2]
+    assert result.digest_source == []
+    assert [m.id for m in result.deferred] == [1]
+
+
+def test_digest_valve_never_fires_for_held_fyi():
+    result = plan([_msg(1, urgency="fyi")], now=_EPOCH, token_budget=1)
+    assert result.digest_source == []
+    assert [m.id for m in result.deferred] == [1]
+
+
+def test_long_valid_sender_fyi_no_longer_pins_the_digest():
+    """The QA repro: a 9,000-char (valid ADR-002) sender's fyi, six more
+    fyi and a prompt, 24h later. Every fyi must reach the digest and the
+    ack must cover the whole backlog."""
+    long_sender = "a" * 9000 + "@r1"
+    msgs = [_msg(1, urgency="fyi", sender=long_sender, created_at=_EPOCH)]
+    msgs += [_msg(i, urgency="fyi", created_at=_EPOCH) for i in range(2, 8)]
+    msgs.append(_msg(8, urgency="prompt"))
+    result = plan(msgs, now=_EPOCH + timedelta(hours=24))
+    assert [m.id for m in result.digest_source] == list(range(1, 8))
+    assert result.deferred == []
+    assert result.ack_up_to == 8
