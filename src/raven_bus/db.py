@@ -22,7 +22,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-from raven_bus.exceptions import TeardownBlockedError
+from raven_bus.exceptions import SchemaMismatchError, TeardownBlockedError
 from raven_bus.models import SweepResult
 from raven_bus.paths import resolve_db_path
 
@@ -31,6 +31,19 @@ DEFAULT_BUSY_TIMEOUT_S: float = 5.0
 
 _MIGRATIONS_DIR = Path(__file__).with_name("migrations")
 _V2_MIGRATION = _MIGRATIONS_DIR / "0002_v2_schema.sql"
+
+# The tables 0002_v2_schema.sql creates. An UNSTAMPED file holding only
+# these (plus SQLite's internal sqlite_* tables) is a peer's first-create
+# in flight, or one that crashed before stamping — finishing it is safe.
+# Any other table means a foreign file, which init_db refuses rather than
+# stamping it '2' or half-migrating it (QA store #8).
+_V2_TABLES = frozenset(
+    {"bus_meta", "channels", "claims", "consumers", "cursors", "messages"}
+)
+
+# Primary result codes worth a retry (extended codes carry them in the
+# low byte, e.g. SQLITE_BUSY_SNAPSHOT = 517 -> 5).
+_BUSY_CODES = frozenset({sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED})
 
 _init_cache: set[Path] = set()
 
@@ -43,7 +56,13 @@ def _reset_init_cache() -> None:
 def init_db(db_path: str | Path | None = None, *, force: bool = False) -> Path:
     """Create the DB if missing, apply the v2 schema, record
     ``schema_version`` in ``bus_meta``. Idempotent, process-cached.
-    Creates parent directories. Returns the resolved absolute path."""
+    Creates parent directories. Returns the resolved absolute path.
+
+    Raises :class:`SchemaMismatchError` — leaving the file untouched —
+    for a file stamped with another schema version, an unstamped SQLite
+    file holding tables raven did not create, or unstamped raven-named
+    tables the v2 script cannot apply over. Only busy/locked errors are
+    retried; any other sqlite error surfaces at once."""
     resolved = resolve_db_path(db_path)
     if not force and resolved in _init_cache:
         return resolved
@@ -56,7 +75,8 @@ def init_db(db_path: str | Path | None = None, *, force: bool = False) -> Path:
     # actively writing raced into 'database is locked' at process
     # startup (finding verify-004). Only genuine first-creation runs
     # the script, and that residual race gets a bounded retry.
-    stored = _stored_schema_version(resolved)
+    probe = _probe(resolved)
+    stored = None if probe is None else probe[0]
     if not force and stored == SCHEMA_VERSION:
         _init_cache.add(resolved)
         return resolved
@@ -65,11 +85,23 @@ def init_db(db_path: str | Path | None = None, *, force: bool = False) -> Path:
     # place while marking the file current (re-verify wave finding).
     # v2 does not migrate foreign schemas — refuse loudly.
     if stored is not None and stored != SCHEMA_VERSION:
-        raise RuntimeError(
+        raise SchemaMismatchError(
             f"{resolved} was created by schema version {stored!r}; this "
             f"raven_bus expects version {SCHEMA_VERSION!r} and does not "
             "migrate old files — point RAVEN_DB/db_path at a fresh path"
         )
+    # Unstamped but readable: only raven's own tables may be adopted.
+    adopting = False
+    if probe is not None and stored is None:
+        tables = {name for name in probe[1] if not name.startswith("sqlite_")}
+        foreign = sorted(tables - _V2_TABLES)
+        if foreign:
+            raise SchemaMismatchError(
+                f"{resolved} has no raven schema stamp but holds tables raven "
+                f"did not create ({', '.join(foreign)}); refusing to adopt it "
+                "— point RAVEN_DB/db_path at a fresh path"
+            )
+        adopting = bool(tables)
 
     schema_sql = _V2_MIGRATION.read_text(encoding="utf-8")
     last_error: sqlite3.OperationalError | None = None
@@ -87,6 +119,17 @@ def init_db(db_path: str | Path | None = None, *, force: bool = False) -> Path:
             finally:
                 conn.close()
         except sqlite3.OperationalError as exc:
+            if not _is_busy(exc):
+                # Deterministic: five retries would only delay the same
+                # failure. Over pre-existing raven-named tables it means
+                # they are not v2's shape (e.g. 'no such column').
+                if adopting:
+                    raise SchemaMismatchError(
+                        f"{resolved} holds raven-named tables but no schema "
+                        f"stamp, and the v2 schema does not apply over them "
+                        f"({exc}) — point RAVEN_DB/db_path at a fresh path"
+                    ) from exc
+                raise
             # Another process is initialising the same file right now.
             # If it finished the job, the fast path accepts its work.
             last_error = exc
@@ -103,25 +146,57 @@ def init_db(db_path: str | Path | None = None, *, force: bool = False) -> Path:
     )  # pragma: no cover -- loop always sets last_error before exhausting
 
 
-def _stored_schema_version(resolved: Path) -> str | None:
-    """The schema version recorded in ``resolved``, or None.
+def _probe(resolved: Path) -> tuple[str | None, frozenset[str]] | None:
+    """``(schema_version stamp or None, table names)`` of ``resolved``,
+    or None when the file is missing or unreadable.
 
-    Read-only probe; never creates the file (sqlite3.connect would, so
-    check existence first) and treats any error as "not initialised".
-    """
+    Read-only; never creates the file (sqlite3.connect would, so check
+    existence first). Any sqlite error means "unreadable", never "no
+    stamp": only a SUCCESSFUL read that finds tables without a stamp may
+    lead init_db to refuse a file, so a transient error can't get a live
+    store refused as foreign."""
     if not resolved.exists():
         return None
     try:
         conn = sqlite3.connect(str(resolved), timeout=DEFAULT_BUSY_TIMEOUT_S)
         try:
-            row = conn.execute(
-                "SELECT value FROM bus_meta WHERE key = 'schema_version'"
-            ).fetchone()
+            tables = frozenset(
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            )
+            row = None
+            if "bus_meta" in tables:
+                row = conn.execute(
+                    "SELECT value FROM bus_meta WHERE key = 'schema_version'"
+                ).fetchone()
         finally:
             conn.close()
     except sqlite3.Error:
         return None
-    return None if row is None else str(row[0])
+    return (None if row is None else str(row[0])), tables
+
+
+def _stored_schema_version(resolved: Path) -> str | None:
+    """The schema version recorded in ``resolved``, or None (missing,
+    unreadable, or unstamped)."""
+    probe = _probe(resolved)
+    return None if probe is None else probe[0]
+
+
+def _is_busy(exc: sqlite3.OperationalError) -> bool:
+    """True for the transient lock errors worth retrying (SQLITE_BUSY /
+    SQLITE_LOCKED, incl. extended codes). Everything else — 'no such
+    column' from a foreign schema, disk I/O, read-only — is
+    deterministic. Hand-built errors carry no ``sqlite_errorcode``
+    (sqlite3 sets it only on errors it raises), so fall back to
+    sqlite's message wording."""
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is not None:
+        return (code & 0xFF) in _BUSY_CODES
+    message = str(exc).lower()
+    return "locked" in message or "busy" in message
 
 
 def _schema_current(resolved: Path) -> bool:

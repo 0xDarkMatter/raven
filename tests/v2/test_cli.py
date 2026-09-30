@@ -23,6 +23,7 @@ from raven_bus.cli.main import app, cli_main
 from raven_bus.exceptions import (
     ClaimDeniedError,
     RavenBusError,
+    SchemaMismatchError,
     UnknownChannelError,
     WrongChannelKindError,
 )
@@ -649,6 +650,18 @@ def test_doctor_all_ok() -> None:
         result = runner.invoke(app, ["doctor"])
     assert result.exit_code == 0
     assert "all checks passed" in result.stdout
+
+
+def test_doctor_reports_schema_mismatch_as_a_failed_check() -> None:
+    """init_db now REFUSES foreign/unstamped files (QA store #8); doctor
+    must report that as a failed check, not crash with a traceback."""
+    with patch(
+        "raven_bus.db.init_db", side_effect=SchemaMismatchError("foreign file here")
+    ):
+        result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 10
+    assert "foreign file here" in result.stdout
+    assert "one or more checks failed" in result.stdout
 
 
 def test_doctor_db_unreachable_exits_generic_error() -> None:

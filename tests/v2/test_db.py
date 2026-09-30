@@ -10,7 +10,11 @@ from pathlib import Path
 import pytest
 
 from raven_bus import db as bus_db
-from raven_bus.exceptions import InvalidAddressError, TeardownBlockedError
+from raven_bus.exceptions import (
+    InvalidAddressError,
+    SchemaMismatchError,
+    TeardownBlockedError,
+)
 
 
 def _iso(dt: datetime) -> str:
@@ -665,7 +669,141 @@ def test_init_db_refuses_foreign_schema_version(db: Path) -> None:
     with bus_db.connection(db) as conn:
         conn.execute("UPDATE bus_meta SET value = '1' WHERE key = 'schema_version'")
     bus_db._reset_init_cache()
-    with pytest.raises(RuntimeError, match="schema version '1'"):
+    with pytest.raises(SchemaMismatchError, match="schema version '1'") as info:
         bus_db.init_db(db)
+    # Still a RuntimeError: that is what init_db raised here before the
+    # typed error existed (QA store #8), so old callers keep working.
+    assert isinstance(info.value, RuntimeError)
     # The stamp must be untouched by the refusal.
     assert bus_db._stored_schema_version(db) == "1"
+
+
+def _tables(path: Path) -> set[str]:
+    conn = sqlite3.connect(path)
+    try:
+        return {
+            row[0]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+    finally:
+        conn.close()
+
+
+def _foreign_file(path: Path, *ddl: str) -> Path:
+    conn = sqlite3.connect(path)
+    for statement in ddl:
+        conn.execute(statement)
+    conn.commit()
+    conn.close()
+    return path
+
+
+@pytest.mark.parametrize(
+    "ddl",
+    [
+        ("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)",),
+        # v1-style: some raven-named tables plus foreign ones.
+        (
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, text TEXT)",
+            "CREATE TABLE aliases (name TEXT)",
+        ),
+    ],
+    ids=["user-table", "v1-like"],
+)
+def test_init_db_refuses_unstamped_file_with_foreign_tables(
+    tmp_path: Path, ddl: tuple[str, ...]
+) -> None:
+    """QA store #8: an unstamped SQLite file holding tables raven did not
+    create was silently adopted and stamped '2' (or half-migrated before
+    a raw OperationalError). It is refused untouched, with a typed error."""
+    bus_db._reset_init_cache()
+    target = _foreign_file(tmp_path / "foreign.db", *ddl)
+    before = _tables(target)
+
+    with pytest.raises(SchemaMismatchError, match="aliases|notes"):
+        bus_db.init_db(target)
+
+    assert _tables(target) == before
+    assert bus_db._stored_schema_version(target) is None
+
+
+def test_init_db_adopts_unstamped_raven_tables(tmp_path: Path) -> None:
+    """Only raven's own tables and no stamp = a peer's first-create in
+    flight (or one that crashed before stamping): finish it, as before."""
+    bus_db._reset_init_cache()
+    target = tmp_path / "half.db"
+    conn = sqlite3.connect(target)
+    conn.executescript(bus_db._V2_MIGRATION.read_text(encoding="utf-8"))
+    conn.close()
+
+    assert bus_db.init_db(target) == target.resolve()
+    assert bus_db._stored_schema_version(target) == bus_db.SCHEMA_VERSION
+
+
+def test_init_db_refuses_raven_named_tables_of_the_wrong_shape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Raven-named tables the v2 script cannot apply over fail
+    deterministically ('no such column'): a SchemaMismatchError at once,
+    never five busy-retries ending in a raw OperationalError."""
+    bus_db._reset_init_cache()
+    sleeps: list[float] = []
+    monkeypatch.setattr(bus_db.time, "sleep", sleeps.append)
+    target = _foreign_file(
+        tmp_path / "shape.db", "CREATE TABLE messages (id INTEGER PRIMARY KEY, text TEXT)"
+    )
+
+    with pytest.raises(SchemaMismatchError, match="no such column"):
+        bus_db.init_db(target)
+    assert sleeps == []
+
+
+class _BrokenConn:
+    """connect() stand-in whose script apply fails deterministically."""
+
+    def executescript(self, _sql: str) -> None:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    def close(self) -> None:  # pragma: no cover -- trivial stub
+        pass
+
+
+def test_init_db_does_not_retry_non_busy_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only busy/locked errors are worth a retry; anything else on a
+    fresh file surfaces immediately, unwrapped (it is not a schema
+    problem)."""
+    bus_db._reset_init_cache()
+    sleeps: list[float] = []
+    monkeypatch.setattr(bus_db.time, "sleep", sleeps.append)
+    monkeypatch.setattr(bus_db.sqlite3, "connect", lambda *_a, **_k: _BrokenConn())
+
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O") as info:
+        bus_db.init_db(tmp_path / "fresh.db")
+    assert not isinstance(info.value, SchemaMismatchError)
+    assert sleeps == []
+
+
+def _coded(message: str, code: int | None) -> sqlite3.OperationalError:
+    exc = sqlite3.OperationalError(message)
+    if code is not None:
+        exc.sqlite_errorcode = code  # set by sqlite3 on real errors (3.11+)
+    return exc
+
+
+@pytest.mark.parametrize(
+    ("exc", "busy"),
+    [
+        (_coded("database is locked", sqlite3.SQLITE_BUSY), True),
+        (_coded("database is locked", 517), True),  # SQLITE_BUSY_SNAPSHOT
+        (_coded("database table is locked", sqlite3.SQLITE_LOCKED), True),
+        (_coded("no such column: channel_id", 1), False),
+        (_coded("database is locked", None), True),  # hand-built: by message
+        (_coded("disk I/O error", None), False),
+    ],
+)
+def test_is_busy_classifies_retryable_errors(
+    exc: sqlite3.OperationalError, busy: bool
+) -> None:
+    assert bus_db._is_busy(exc) is busy

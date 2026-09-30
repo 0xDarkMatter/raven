@@ -34,6 +34,15 @@ class WrongChannelKindError(RavenBusError):
     broadcast channel, cursor-ack on a queue)."""
 
 
+class SchemaMismatchError(RavenBusError, RuntimeError):
+    """The file at the DB path is not a raven v2 store this code can use:
+    stamped with another ``schema_version``, or a SQLite file holding
+    tables raven did not create and no stamp. raven never migrates or
+    adopts such files. Also a ``RuntimeError`` because ``init_db`` raised
+    bare RuntimeError for the foreign-version case before this class
+    existed — callers catching that keep working."""
+
+
 class TeardownBlockedError(RavenBusError):
     """``db.teardown_run`` refused: messages OUTSIDE the run reference
     (reply_to/thread_id) messages inside it, and the schema's foreign
