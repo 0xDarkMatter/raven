@@ -27,6 +27,10 @@ lanes (fleetflow ADR-022/ADR-023 record that integration's contract).
 
 ## Recent Updates
 
+**v0.2.2** (October 2026)
+
+*   🧭 **One bus, whatever the directory** - a relative `RAVEN_DB` is now refused with a usage error. Every process inherits the variable, so a relative path resolved per working directory and quietly gave lanes in different worktrees different DBs. Export an absolute path (`~` is fine); `--db` may still be relative.
+
 **v0.2.1** (October 2026)
 
 *   🐛 **Clean output through Windows pipes** - raven's own text (errors, `--help`, the `raven read --framed` header, truncation markers) is now pure ASCII. Piped output on Windows is cp1252, so fleetflow was relaying raven's em dashes as `U+FFFD`; a test gate now keeps every string raven emits ASCII.

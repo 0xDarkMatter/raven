@@ -18,7 +18,7 @@ coordination.
 | **Python import** | `raven_bus` — `from raven_bus import db, log, ...`. The v1 import root is gone; v1 code uses `raven_bus.compat`. |
 | **CLI** | `raven` (entry point `raven_bus.cli.main:cli_main`) |
 | **pip dist name** | **UNDECIDED.** The `raven` PyPI name belongs to Sentry's legacy client. Install from source: `pip install -e .` |
-| **Version** | `0.2.1` (`raven_bus.__version__`; single source — pyproject reads it) |
+| **Version** | `0.2.2` (`raven_bus.__version__`; single source — pyproject reads it) |
 
 ## Run & test
 
